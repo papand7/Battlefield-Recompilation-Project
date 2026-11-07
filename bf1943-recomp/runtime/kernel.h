@@ -150,6 +150,7 @@ struct ScriptedPress {
 };
 extern std::vector<ScriptedPress> g_scripted_presses;  // save frames/frame_NNN.png this often (0 = off)
 extern std::atomic<bool> g_title_passed;      // xam.cpp: Start taken at the title screen (profile read)
+extern std::atomic<int64_t> g_pad_t0_ns;  // xam.cpp: time of the first pad read (ns, steady clock)
 extern std::atomic<bool> g_mainmenu_open;    // files.cpp: the main menu file has been opened
 extern std::atomic<uint16_t> g_auto_buttons;  // xam.cpp: buttons held by automation, added to pad 0
 

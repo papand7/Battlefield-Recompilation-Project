@@ -686,12 +686,33 @@ struct Director {
     static uint32_t mine = 0;
     bool all_found = true;
     for (const Bot& b : bots) all_found &= b.soldier != 0;
-    if (!mine && soldiers.size() == 1 && !Mapped(soldiers[0].obj)) mine = soldiers[0].obj;
-    if (!mine && all_found)
-      for (const Soldier& so : soldiers)
-        if (!Mapped(so.obj)) mine = so.obj;
+    // Ours: the server soldier nearest the camera (the bots' are elsewhere).
+    float eye[3];
+    if (!mine && xgpu::CameraEye(eye)) {
+      float best_d = 5.0f;
+      for (const Soldier& so : soldiers) {
+        float d = std::hypot(so.pos.x - eye[0], so.pos.y - eye[1], so.pos.z - eye[2]);
+        if (d < best_d) best_d = d, mine = so.obj;
+      }
+    }
+    (void)all_found;
     me = mine ? Find(mine) : nullptr;
     if (mine && !me) mine = 0;  // died
+    // Idle once seated (BF_SELF_TEST_IDLE): the keyboard has the pad, even if
+    // the soldier isn't found while in a vehicle.
+    if (state >= 1 && getenv("BF_SELF_TEST_IDLE")) {
+      out.active = 0;
+      if (me && now >= next_log) {
+        next_log = now + 1.0;
+        Vec p = me->pos;
+        for (uint32_t c : Scan(0x82007518)) {
+          uint32_t q = Ld32(c + 0x220), cv = Readable(q) ? Ld32(q + 0x130) : 0;
+          if (Readable(cv) && Ld32(cv) == 0x82006DC8) p = {LdF(c + 0x3D0), LdF(c + 0x3D4), LdF(c + 0x3D8)};
+        }
+        RT_INFO("selftest: idle at %.1f,%.1f,%.1f yaw %.2f", p.x, p.y, p.z, me->yaw);
+      }
+      return;
+    }
     if (!me) {  // spawn
       cmd.buttons = (int(now * 2) % 4 == 0) ? XINPUT_GAMEPAD_A : 0;
       Commit(out, cmd);
@@ -760,6 +781,7 @@ struct Director {
       if (++step >= n) step = n;
     }
     if (getenv("BF_SELF_TEST_IDLE")) step = n;  // the keyboard drives (BF_TEST_KEY)
+    bool idle = getenv("BF_SELF_TEST_IDLE") != nullptr;
     if (step < n && t > 2.0) {
       std::string k = kSteps[step];
       if (k == "ly+") cmd.ly = 1;
@@ -783,6 +805,10 @@ struct Director {
       }
       RT_INFO("selftest: step %s t %.0f seat %s veh %.1f,%.1f,%.1f yaw %.2f", step < n ? kSteps[step] : "done", t,
               in ? (v ? v->kind.c_str() : "vehicle") : "foot", p.x, p.y, p.z, me->yaw);
+    }
+    if (idle) {
+      out.active = 0;  // the keyboard has the pad now
+      return;
     }
     Commit(out, cmd);
   }

@@ -211,7 +211,7 @@ bool TestKeyDown(int vk) {
       }
     }
     for (const auto& [at, key] : live)
-      if (key == vk && now >= at && now < at + 0.2) return true;
+      if (key == vk && now >= at && now < at + 0.4) return true;
   }
   if (keys.empty()) return false;
   for (const auto& [at, key] : keys) {
@@ -520,14 +520,16 @@ static void AddKeyboard(XINPUT_GAMEPAD& g) {
   auto axis = [&](pcset::Action neg, pcset::Action pos) -> SHORT {
     return SHORT((held(pos) ? 32767 : 0) - (held(neg) ? 32767 : 0));
   };
+  bool forward = held(pcset::kForward), back = held(pcset::kBack);
+  bool driving = vehicle == kDriving || vehicle == kFlying;
   if (SHORT x = axis(pcset::kLeft, pcset::kRight)) g.sThumbLX = x;
-  if (SHORT y = axis(pcset::kBack, pcset::kForward)) g.sThumbLY = y;
   // Vehicles, as the game's first (default) vehicle and aircraft layouts
   // (objects/vehicles/common/input/*.dbx): LT is the throttle, LB the brake,
   // left stick X steers (cars, boats) or is the rudder (planes), the right
-  // stick aims or flies (pitch, roll). Forward/back also stay on the left
-  // stick, for the layouts that drive with it.
-  bool forward = held(pcset::kForward), back = held(pcset::kBack);
+  // stick aims or flies (pitch, roll). Not the left stick's Y there: in a
+  // landing craft it moves between seats.
+  if (!driving)
+    if (SHORT y = axis(pcset::kBack, pcset::kForward)) g.sThumbLY = y;
   if (vehicle == kDriving || vehicle == kFlying) {
     if (forward) g.bLeftTrigger = 255;
     if (back && vehicle == kDriving) g.wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
@@ -568,6 +570,42 @@ static void AddScripted(XINPUT_GAMEPAD& g) {
 
 namespace rt { bool AddBotInput(XINPUT_GAMEPAD& g); }  // bots.cpp
 
+// Input recording (BF_RECORD=<file>): writes "<ms since the main menu opened> <buttons>"
+// for each change of the player's pad buttons, so a run can be replayed (BF_REPLAY).
+// Time zero is the first pad read of the run (g_pad_t0_ns). Checkpoints ("cp title",
+// "cp menu") are written when the title is passed and when the main menu opens; press
+// times after a checkpoint count from it, so a replay waits for the game to reach each
+// checkpoint instead of depending on boot speed.
+namespace rt { std::atomic<int64_t> g_pad_t0_ns{0}; }  // declared in kernel.h
+static void RecordPad(uint16_t buttons) {
+  static const char* path = getenv("BF_RECORD");
+  static std::FILE* f = path ? std::fopen(path, "w") : nullptr;
+  static uint16_t last = 0;
+  static int64_t checkpoint_ns = 0;
+  static bool title_seen = false, menu_seen = false;
+  int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count();
+  int64_t zero = 0;
+  if (!rt::g_pad_t0_ns.compare_exchange_strong(zero, now_ns)) zero = rt::g_pad_t0_ns.load();
+  if (checkpoint_ns == 0) checkpoint_ns = zero;
+  if (!f) return;
+  if (!title_seen && rt::g_title_passed) {
+    title_seen = true;
+    std::fprintf(f, "cp title\n");
+    checkpoint_ns = now_ns;
+  }
+  if (!menu_seen && rt::g_mainmenu_open) {
+    menu_seen = true;
+    std::fprintf(f, "cp menu\n");
+    checkpoint_ns = now_ns;
+  }
+  if (buttons == last) return;
+  last = buttons;
+  double ms = double(now_ns - checkpoint_ns) / 1e6;
+  std::fprintf(f, "%.0f %u\n", ms, unsigned(buttons));
+  std::fflush(f);
+}
+
 // XamInputGetState(user, flags, state*)
 GUEST_IMPORT(XamInputGetState) {
   uint32_t user = ARG32(3) & 0xFF, state = ARG32(5);
@@ -580,16 +618,34 @@ GUEST_IMPORT(XamInputGetState) {
   }
   if (user == 0) {
     XINPUT_GAMEPAD before = s.Gamepad;
+    WORD stage[5];
+    stage[0] = s.Gamepad.wButtons;
     AddKeyboard(s.Gamepad);
+    stage[1] = s.Gamepad.wButtons;
     AddScripted(s.Gamepad);
+    stage[2] = s.Gamepad.wButtons;
     s.Gamepad.wButtons |= g_auto_buttons.load();
+    stage[3] = s.Gamepad.wButtons;
     AddBotInput(s.Gamepad);
+    stage[4] = s.Gamepad.wButtons;
     // The PC menus are up (or working the game's pause menu): the game gets
     // none of the pad, only the menus' own presses.
     if (pcset::ControlsPad()) {
       s.Gamepad = {};
       s.Gamepad.wButtons = pcset::PuppetButtons();
     }
+    static const bool pad_debug = std::getenv("BF_VEH_DEBUG") != nullptr;
+    if (pad_debug) {
+      static XINPUT_GAMEPAD logged{};
+      if (std::memcmp(&logged, &s.Gamepad, sizeof logged)) {
+        logged = s.Gamepad;
+        RT_INFO("pad: buttons %04X lt %u rt %u lx %d ly %d rx %d ry %d (pad %04X kb %04X script %04X auto %04X bot %04X)",
+                s.Gamepad.wButtons, s.Gamepad.bLeftTrigger, s.Gamepad.bRightTrigger, s.Gamepad.sThumbLX,
+                s.Gamepad.sThumbLY, s.Gamepad.sThumbRX, s.Gamepad.sThumbRY, stage[0], stage[1], stage[2], stage[3],
+                stage[4]);
+      }
+    }
+    RecordPad(s.Gamepad.wButtons);
     // Like XInput, a new packet number only when the state changes: a held key
     // must not look like repeated presses (the scoreboard toggles on each one).
     static std::mutex m;
