@@ -124,10 +124,17 @@ void Host(const std::string& map, int bots) {
   RequestHost();
 }
 
+void StartBeacon() {
+  static WSADATA wsa;
+  static bool started = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+  (void)started;
+  if (!g_beacon.exchange(true)) std::thread(Beacon).detach();
+}
+
 // JOIN GAME: the host's map loaded here, the client sent to the host.
-void Join(const std::string& address, const std::string& map) {
+bool PrepareJoin(const std::string& address, const std::string& map) {
   in_addr ip{};
-  if (inet_pton(AF_INET, address.c_str(), &ip) != 1) return;
+  if (inet_pton(AF_INET, address.c_str(), &ip) != 1) return false;
   g_host_map = map;
   g_lan_host = true;
   g_bot_count = 0;
@@ -136,7 +143,10 @@ void Join(const std::string& address, const std::string& map) {
   if (local && !g_port_offset) g_port_offset = 10;
   g_join_address = local ? htonl(INADDR_LOOPBACK) : ip.s_addr;
   RT_INFO("lan: joining %s (%s)%s", address.c_str(), map.c_str(), local ? " on this PC" : "");
-  RequestHost();
+  return true;
+}
+void Join(const std::string& address, const std::string& map) {
+  if (PrepareJoin(address, map)) RequestHost();
 }
 
 }  // namespace rt::lan

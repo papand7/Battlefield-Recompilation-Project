@@ -1,6 +1,7 @@
 // bf1943: native host for the recompiled Battlefield 1943 code.
 // Usage: bf1943 [--game <dir with default.xex>] [--user <writable dir>] [--trace]
 #include "kernel.h"
+#include "lan.h"
 #include "pc_settings.h"
 #include "texture_replacement.h"  // xenia_shims
 #include "pbr_shaders.h"          // xenia_shims
@@ -182,6 +183,7 @@ int main(int argc, char** argv) {
     argv = expanded_argv.data();
     break;
   }
+  std::string join_address;  // --join
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--game" && i + 1 < argc) g_game_root = argv[++i];
@@ -189,6 +191,23 @@ int main(int argc, char** argv) {
     else if (a == "--trace") g_trace_imports = true;
     else if (a == "--toy-gpu") g_use_xenia_gpu = false;   // count PM4 only, no Vulkan
     else if (a == "--headless") g_present = false;
+    else if (a == "--dedicated") {
+      g_dedicated = true;
+      g_present = false;
+      g_use_xenia_gpu = false;
+      g_lan_host = true;
+    }
+    else if (a == "--join" && i + 1 < argc) join_address = argv[++i];
+    else if (a == "--name" && i + 1 < argc) g_gamertag = std::string(argv[++i]).substr(0, 15);
+    else if (a == "--maps" && i + 1 < argc) {
+      std::string list = argv[++i];
+      for (size_t p = 0; p <= list.size();) {
+        size_t c = list.find(',', p);
+        if (c == std::string::npos) c = list.size();
+        if (c > p) g_map_rotation.push_back(list.substr(p, c - p));
+        p = c + 1;
+      }
+    }
     else if (a == "--press" && i + 1 < argc) ParsePresses(argv[++i]);
     else if (a == "--capture" && i + 1 < argc) g_capture_seconds = uint32_t(atoi(argv[++i]));
     else if (a == "--capture-burst" && i + 1 < argc) g_capture_burst = uint32_t(atoi(argv[++i]));
@@ -297,6 +316,16 @@ int main(int argc, char** argv) {
   xgpu::SetDisplayOptions(res_scale, present_effect, window_w, window_h, shadowmap ? shadowmap : 1024);
   g_shadow_size = uint32_t(shadowmap);
   if (!bot_ai.empty() && bot_slot >= 0) SetBotSlot(bot_ai, bot_slot);
+  if (!join_address.empty() && !rt::lan::PrepareJoin(join_address, g_host_map.empty() ? "Wake_island_s" : g_host_map))
+    RT_WARN("--join: not an IPv4 address: %s", join_address.c_str());
+  if (g_dedicated) {
+    if (g_host_map.empty()) g_host_map = g_map_rotation.empty() ? "Wake_island_s" : g_map_rotation[0];
+    if (g_gamertag.empty() || g_gamertag == "Player") g_gamertag = "Dedicated";
+    if (g_scripted_presses.empty()) ParsePresses("15:start,20:start,25:a,30:a");
+    rt::lan::StartBeacon();
+    RT_INFO("dedicated server '%s': hosting %s on UDP %d (browsers: UDP 19430)%s", g_gamertag.c_str(),
+            g_host_map.c_str(), 1003 + g_port_offset, g_bot_count ? ", with bots" : "");
+  }
   if (shadowmap && g_guest_args.find("Shadowmap") == std::string::npos)
     g_guest_args = "-WorldRender.ShadowmapWidth " + std::to_string(shadowmap) + " -WorldRender.ShadowmapHeight " +
                    std::to_string(shadowmap) + (g_guest_args.empty() ? "" : " ") + g_guest_args;

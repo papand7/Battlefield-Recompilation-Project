@@ -107,6 +107,10 @@ bool SimulatedKeyDown(int vk);  // xam.cpp: a key held by BF_TEST_KEY (tests)
 // The PC main and pause menus replace the game's (game_patches.cpp; false in
 // games without them), and the game's dialogs up now (-1 before it said).
 bool CustomMenus();
+// --dedicated: a console server (no window, GPU or menus) that hosts
+// g_host_map, then each map of --maps in turn when a round ends.
+extern bool g_dedicated;
+extern std::vector<std::string> g_map_rotation;
 int GameDialogs();
 extern double g_test_mouse_at;     // --test-mouse <s>
 // Mouse look for this poll, in right-stick units (1 = full deflection, may exceed 1).

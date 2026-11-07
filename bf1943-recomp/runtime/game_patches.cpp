@@ -165,7 +165,25 @@ GAME_PATCH(823CD3E8) {
 // HOST GAME / JOIN GAME (lan.cpp): host g_host_map from the main loop now.
 void rt::RequestHost() { g_host_state = 2; }
 
+bool rt::g_dedicated = false;
+std::vector<std::string> rt::g_map_rotation;
+
 static void HostFromMainLoop(PPCContext& ctx, uint8_t* base) {
+  // Dedicated server: back in the front end after a round, host the next map.
+  static bool was_in_level = false;
+  if (g_dedicated && g_host_state == 3) {
+    if (!g_in_menus) was_in_level = true;
+    if (was_in_level && g_in_menus && g_dialogs == 0) {
+      was_in_level = false;
+      if (!g_map_rotation.empty()) {
+        size_t i = 0;
+        while (i < g_map_rotation.size() && g_map_rotation[i] != g_host_map) ++i;
+        g_host_map = g_map_rotation[(i + 1) % g_map_rotation.size()];
+      }
+      RT_INFO("dedicated server: round over, hosting %s", g_host_map.c_str());
+      g_host_state = 2;
+    }
+  }
   if (g_host_state == 1 && !g_online_server.empty() && g_online_ready) g_host_state = 2;
   if (g_host_state != 2 || !g_ui_manager) return;
   g_host_state = 3;

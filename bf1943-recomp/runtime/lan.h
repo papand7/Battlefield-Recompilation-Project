@@ -19,6 +19,10 @@ bool Browsing();
 std::vector<Server> Found();
 // Hosts the map as a LAN server with bots joining it.
 void Host(const std::string& map, int bots);
+// Answers server browsers (the dedicated server, from the start).
+void StartBeacon();
+// --join: everything for joining but starting it (that follows the title).
+bool PrepareJoin(const std::string& address, const std::string& map);
 // Joins the host at the address (IPv4), which is on the map.
 void Join(const std::string& address, const std::string& map);
 

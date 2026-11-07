@@ -7,9 +7,11 @@
 #include <Xinput.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <vector>
 
 extern "C" const char* g_window_title;  // xenia_shims/bridge.cc
 static const bool g_title_set = (g_window_title = "Battlefield: Bad Company", true);
@@ -37,6 +39,8 @@ bool BotLookAxis(int, float&) { return false; }
 bool AddBotInput(XINPUT_GAMEPAD&) { return false; }
 int LocalVehicle() { return kOnFoot; }
 bool CustomMenus() { return false; }
+bool g_dedicated = false;
+std::vector<std::string> g_map_rotation;
 int GameDialogs() { return 0; }
 }  // namespace rt
 
@@ -93,3 +97,95 @@ GAME_PATCH(8228CCD8) {
   __imp__sub_8228CCD8(ctx, base);
 }
 
+
+// Test automation (BF_AUTO_MP=1): presses Start at the title until the profile
+// is read, then waits for the main menu file. After that it watches the file
+// BF_AUTO_MP_FILE (default auto_steps.txt in the run folder): each new line is one
+// button (up, down, left, right, a, b, start), pressed 1.5 s apart, so the menus
+// can be driven one step at a time while looking at screenshots.
+#include <thread>
+#include <string>
+#include <fstream>
+#include <cstdio>
+static const bool g_auto_mp_started = [] {
+  if (!getenv("BF_AUTO_MP")) return false;
+  const char* env_file = getenv("BF_AUTO_MP_FILE");
+  std::string path = env_file ? env_file : "auto_steps.txt";
+  std::thread([path] {
+    auto press = [](uint16_t buttons, int ms) {
+      g_auto_buttons = buttons;
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      g_auto_buttons = 0;
+    };
+    while (!g_title_passed) {
+      press(XINPUT_GAMEPAD_START, 200);
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    RT_INFO("auto mp: title passed, waiting for the main menu");
+    while (!g_mainmenu_open) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    RT_INFO("auto mp: main menu file open; reading %s", path.c_str());
+    size_t done = 0;
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      std::ifstream in(path);
+      std::vector<std::string> lines;
+      for (std::string line; std::getline(in, line);) lines.push_back(line);
+      while (done < lines.size()) {
+        const std::string& name = lines[done++];
+        uint16_t b = name == "down" ? XINPUT_GAMEPAD_DPAD_DOWN : name == "up" ? XINPUT_GAMEPAD_DPAD_UP
+                   : name == "right" ? XINPUT_GAMEPAD_DPAD_RIGHT : name == "left" ? XINPUT_GAMEPAD_DPAD_LEFT
+                   : name == "a" ? XINPUT_GAMEPAD_A : name == "b" ? XINPUT_GAMEPAD_B
+                   : name == "start" ? XINPUT_GAMEPAD_START : 0;
+        if (!b) continue;
+        press(b, 20);
+        RT_INFO("auto mp: pressed %s (step %zu)", name.c_str(), done);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+      }
+    }
+  }).detach();
+  return true;
+}();
+
+// Replay (BF_REPLAY=<file>): plays back a recording made with BF_RECORD. "cp title" and
+// "cp menu" lines wait until the game reaches that point; the press lines after a
+// checkpoint are timed from it (see RecordPad in xam.cpp).
+static const bool g_replay_started = [] {
+  const char* path = getenv("BF_REPLAY");
+  if (!path) return false;
+  std::string file = path;
+  std::thread([file] {
+    int64_t zero = 0;
+    RT_INFO("replay: thread started, reading %s", file.c_str());
+    while ((zero = g_pad_t0_ns.load()) == 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    RT_INFO("replay: first pad read seen, starting");
+    std::ifstream in(file);
+    int64_t base = zero;
+    for (std::string line; std::getline(in, line);) {
+      if (line.rfind("cp ", 0) == 0) {
+        // The menu checkpoint is set during boot in some runs, so only the title waits.
+        if (line == "cp title") {
+          RT_INFO("replay: waiting for the title");
+          // Start is pressed again every 2 s, so a press that lands during the intro is not lost.
+          while (!g_title_passed.load()) {
+            g_auto_buttons = XINPUT_GAMEPAD_START;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            g_auto_buttons = 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1800));
+          }
+        }
+        base = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count();
+        continue;
+      }
+      double ms;
+      unsigned buttons;
+      if (std::sscanf(line.c_str(), "%lf %u", &ms, &buttons) != 2) continue;
+      std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
+          std::chrono::nanoseconds(base + static_cast<int64_t>(ms * 1e6))));
+      g_auto_buttons = static_cast<uint16_t>(buttons);
+    }
+    g_auto_buttons = 0;
+    RT_INFO("replay: done");
+  }).detach();
+  return true;
+}();

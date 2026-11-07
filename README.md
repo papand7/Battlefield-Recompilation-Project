@@ -96,6 +96,18 @@ All keys can be changed under **Settings → Keys**.
 - **Join Game**: games on your network show up by themselves; for one further away, type its address.
 - The host's firewall needs to let the game through (UDP ports 1003 and 19430).
 
+### Run your own server
+
+A dedicated server runs in a console window, with no graphics, and shows up in everyone's
+**Join Game** list. Edit and run `start_server.bat` (name, maps to rotate through, bots), or:
+
+```
+bf1943.exe --game <your game files> --dedicated --name "My Server" --maps Wake_island_s,Iwo_Jima_s --bots 4
+```
+
+To join a server that isn't on your network: **Join Game → Address**, or start the game with
+`--join <address> --host-map <its map>`.
+
 ## Good to know
 
 - Ray-traced effects need a GPU with ray tracing (for example NVIDIA RTX or AMD RX 6000 and newer).
