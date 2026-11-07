@@ -1,0 +1,33 @@
+# Only the two recompilation projects (and this repo's own files) are tracked.
+/*
+!/.gitignore
+!/README.md
+!/docs/
+!/bf1943-recomp/
+!/bfbc1-recomp/
+
+# Copyrighted game data and anything derived from it never enters the repo.
+original/
+generated/
+*.xex
+*.fbrb
+*.pipelinecache
+*.pipelinecache.tmp
+
+# Local / build output
+build/
+out/
+.vs/
+frames/
+research/
+userdata/
+shader_cache/
+*.log
+*.wav
+*.out
+node_modules/
+**/launcher/dist/
+**/server/arcadia360/bin/
+**/server/arcadia360/obj/
+.git-upstream/
+__pycache__/

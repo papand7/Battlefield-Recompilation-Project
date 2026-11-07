@@ -1,0 +1,19 @@
+{
+  "name": "bf1943-launcher",
+  "productName": "BF1943 Launcher",
+  "version": "1.0.0",
+  "description": "Launcher for the Battlefield 1943 PC recompilation",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-packager . BF1943Launcher --platform=win32 --arch=x64 --out=dist --overwrite --asar --ignore=^/dist"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.3.6",
+    "electron": "^33.2.1"
+  },
+  "allowScripts": {
+    "electron@33.4.11": true
+  }
+}

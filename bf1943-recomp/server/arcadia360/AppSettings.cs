@@ -1,0 +1,65 @@
+using Arcadia.EA.Ports;
+
+namespace Arcadia;
+
+public record ArcadiaSettings
+{
+    public string ListenAddress { get; init; } = System.Net.IPAddress.Loopback.ToString();
+    public string? TheaterAddress { get; init; }
+    public string? MessengerAddress { get; init; }
+
+    public int[] ListenPorts { get; init; } = [
+        (int)TheaterGamePort.RomePS3,
+        (int)FeslGamePort.RomePS3,
+        (int)FeslGamePort.BeachPS3,
+        (int)FeslGamePort.Beach360,
+        (int)FeslGamePort.Mercenaries2,
+        (int)FeslGamePort.MoHAirborne,
+        (int)FeslGamePort.LotrConquest,
+        (int)FeslGamePort.CNCRA3,
+        (int)FeslGamePort.BadCompanyPS3
+    ];
+
+    public int MessengerPort { get; init; } = 42069;
+    public int NatPort { get; init; } = 42070;
+    public int ExternalServerPort { get; init; } = 42071;  // player-hosted game registration (bf1943 runtime)
+}
+
+public record FileServerSettings
+{
+    public bool EnableCdn { get; init; } = false;
+    public string ContentRoot { get; init; } = "static";
+    public string UrlPrefix { get; init; } = "http://0.0.0.0:8080/";
+}
+
+public record DnsSettings
+{
+    public bool EnableDns { get; init; }
+    public string ServerAddress { get; init; } = string.Empty;
+    public int DnsPort { get; init; } = 53;
+}
+
+public record DiscordSettings
+{
+    public bool EnableBot { get; init; } = false;
+    public string BotToken { get; init; } = string.Empty;
+
+    public ulong OngoingGamesChannel { get; init; }
+    public ulong OnslaughtStatsChannel { get; init; }
+
+    public bool PerformModeration { get; init; }
+    public bool ModerationDryRun { get; init; } = true;
+    public ulong NonEnglishChannel { get; init; }
+    public ulong ServerInfoChannel { get; init; }
+    public ulong MediaChannel { get; init; }
+}
+
+public record DebugSettings
+{
+    public bool WriteSslDebugKeys { get; init; }
+    public bool EnableFileLogging { get; init; }
+    public bool EnableDebugConsole { get; init; }
+    public bool DisableTheaterJoinTimeout { get; init; }
+    public bool ForcePlaintext { get; init; }
+    public bool DisableDatabase { get; init; }
+}

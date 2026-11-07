@@ -1,0 +1,877 @@
+using System.Collections.Frozen;
+using System.Net.Sockets;
+using Arcadia.EA;
+using Arcadia.EA.Constants;
+using Arcadia.Storage;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+
+namespace Arcadia.Handlers;
+
+public class TheaterHandler
+{
+    private readonly ILogger<TheaterHandler> _logger;
+    private readonly SharedCounters _sharedCounters;
+    private readonly ConnectionManager _sharedCache;
+    private readonly IEAConnection _conn;
+    private readonly DebugSettings _dbgSettings;
+    private readonly NatService _nat;
+
+    // All games are created in a single lobby
+    private const int LobbyId = 257;
+
+    private readonly FrozenDictionary<string, Func<Packet, Task>> _handlers;
+
+    private PlasmaSession? _session;
+    private string? _platform;
+    private long? _UBRA_TID = null;
+
+    public TheaterHandler(IEAConnection conn, ILogger<TheaterHandler> logger, SharedCounters sharedCounters, ConnectionManager sharedCache, IOptions<DebugSettings> dbgOptions, NatService nat)
+    {
+        _nat = nat;
+        _logger = logger;
+        _sharedCounters = sharedCounters;
+        _sharedCache = sharedCache;
+        _conn = conn;
+        _dbgSettings = dbgOptions.Value;
+
+        _handlers = new Dictionary<string, Func<Packet, Task>>
+        {
+            ["CONN"] = HandleCONN,
+            ["USER"] = HandleUSER,
+            ["ECNL"] = HandleECNL,
+            ["EGAM"] = HandleEGAM,
+            ["GDAT"] = HandleGDAT,
+            ["LLST"] = HandleLLST,
+            ["GLST"] = HandleGLST,
+            ["CGAM"] = HandleCGAM,
+            ["PENT"] = HandlePENT,
+            ["EGRS"] = HandleEGRS,
+            ["UBRA"] = HandleUBRA,
+            ["UGAM"] = HandleUGAM,
+            ["RGAM"] = HandleRGAM,
+            ["PLVT"] = HandlePLVT,
+            ["UGDE"] = HandleUGDE,
+            ["PING"] = HandlePING,
+            ["PCNT"] = HandlePCNT,
+            ["UPLA"] = HandleUPLA,
+        }.ToFrozenDictionary();
+    }
+
+    public async Task HandleClientConnection(NetworkStream network, string clientEndpoint, string serverEndpoint, CancellationToken ct)
+    {
+        try
+        {
+            _conn.Initialize(network, clientEndpoint, serverEndpoint, ct);
+            await foreach (var packet in _conn.ReceiveAsync(_logger))
+            {
+                await HandlePacket(packet);
+            }
+
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "Error in theater: {Message}", e.Message);
+        }
+
+        _logger.LogInformation("Closing Theater connection: {clientEndpoint} | {name}", clientEndpoint, _session?.User.Username);
+    }
+
+    public async Task HandlePacket(Packet packet)
+    {
+        var packetType = packet.Type;
+        _handlers.TryGetValue(packetType, out var handler);
+
+        if (handler is null)
+        {
+            _logger.LogWarning("Unknown packet type: {type}", packetType);
+            return;
+        }
+
+        await handler(packet);
+    }
+
+    private async Task HandleCONN(Packet request)
+    {
+        _platform = request["PLAT"]?.ToLower();
+
+        var tid = request["TID"];
+        var response = new Dictionary<string, string>
+        {
+            ["TIME"] = $"{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+            ["TID"] = $"{tid}",
+            ["activityTimeoutSecs"] = "0",
+            ["PROT"] = request.DataDict["PROT"]
+        };
+
+        var packet = new Packet("CONN", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    private async Task HandleUSER(Packet request)
+    {
+        var lkey = request["LKEY"];
+        _session = _sharedCache.PairTheaterConnection(_conn, lkey);
+
+        var response = new Dictionary<string, string>
+        {
+            ["NAME"] = _session.User.Username,
+            ["TID"] = request.DataDict["TID"]
+        };
+
+        var packet = new Packet("USER", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    // LeaveGame
+    private async Task HandleECNL(Packet request)
+    {
+        var response = new Dictionary<string, string>
+        {
+            ["TID"] = request["TID"],
+            ["LID"] = request["LID"],
+            ["GID"] = request["GID"],
+        };
+
+        var isGid = long.TryParse(request["GID"], out var gid);
+        var game = _sharedCache.GetGameByGid(_session!.PartitionId, gid);
+
+        if (game is not null && isGid && _session.User.UserId == game.UID)
+        {
+            await _sharedCache.RemoveGameListing(game);
+        }
+
+        var packet = new Packet("ECNL", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    // EnterGameRequest
+    private async Task HandleEGAM(Packet request)
+    {
+        if (_session is null) throw new NotImplementedException();
+
+        GameServerListing? game = null;
+
+        if (long.TryParse(request["GID"], out var gid) && gid > 0)
+        {
+            // Join by GameID
+            game = _sharedCache.GetGameByGid(_session.PartitionId, gid);
+        }
+        else if (request.DataDict.TryGetValue("UID", out var uid) && ulong.TryParse(uid, out var hostUid) && hostUid > 0)
+        {
+            // Join by PlayerID (R-U-invited?)
+            game = _sharedCache.FindGameWithPlayerByUid(_session.PartitionId, hostUid);
+        }
+        else if (request.DataDict.TryGetValue("USER", out var joinPlayerName))
+        {
+            // Join by player Username; BF1943 squad invites ask for the inviter's playgroup (TYPE=P), not their game
+            game = _sharedCache.FindGameWithPlayer(_session!.PartitionId, joinPlayerName, request["TYPE"]);
+        }
+
+        if (game is null)
+        {
+            _logger.LogError("EGAM resulting with NULL game!");
+
+            // BF1943 squad invites fall back to GDAT USER=<inviter> on 'ngam'
+            await _conn.SendPacket(TheaterError(request.Type, request["TID"], "ngam"));
+            return;
+        }
+
+        if (game.UID != _session.User.UserId)
+        {
+            var canJoin = await AwaitOpenGame(game);
+            if (!canJoin)
+            {
+                await _conn.SendPacket(TheaterError(request.Type, request["TID"], "jden"));
+                return;
+            }
+        }
+
+        _session.EGAM_TID = long.Parse(request["TID"]);
+        game.EnqueuePlayer(_session);
+
+        if (game.External)
+        {
+            // Ask the host's game over its own Theater login (it sets up its end of
+            // the connection on EGRQ); if it doesn't answer, let the player in anyway.
+            var pid = _session.PID;
+            if (game.TheaterConnection?.NetworkStream is not null)
+            {
+                await SendEGRQ_ToGameHost(request, _session, game, null);
+                await Task.Delay(5000);
+                if (!game.IsQueued(pid)) return;
+                _logger.LogWarning("Host of external game {gid} didn't answer EGRQ", game.GID);
+            }
+
+            await FinishPlayerEnterGameRequest(new("EGRS", TheaterTransmissionType.OkResponse, 0)
+            {
+                ["PID"] = $"{pid}",
+                ["ALLOWED"] = "1",
+            }, game.GID);
+            return;
+        }
+
+        if (!int.TryParse(request.DataDict.GetValueOrDefault("R-INT-PORT"), out var clientInternalPort))
+        {
+            _logger.LogWarning("R-INT-PORT is not a number");
+        }
+
+        var route = _nat.Enabled && game.UID != _session.User.UserId ? _nat.Route(game, _session, clientInternalPort) : null;
+        await SendEGRQ_ToGameHost(request, _session, game, route);
+    }
+
+    private async Task<bool> AwaitOpenGame(GameServerListing game)
+    {
+        if (_dbgSettings.DisableTheaterJoinTimeout) return true;
+
+        int retries = 0;
+        while (!game.CanJoin)
+        {
+            _logger.LogDebug("Waiting for host game to open...");
+
+            retries++;
+            await Task.Delay(1000);
+
+            if (!game.HostConnected)
+            {
+                _logger.LogError("Not connecting to game, host not connected");
+                return false;
+            }
+
+            if (retries == 15)
+            {
+                _logger.LogWarning("Timeout reached");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static async Task SendEGRQ_ToGameHost(Packet request, PlasmaSession player, GameServerListing server, NatRoute? route)
+    {
+        if (player.TheaterConnection is null) throw new NotImplementedException();
+        if (server.TheaterConnection is null) throw new NotImplementedException();
+
+        var gameId = server.GID;
+        var response = new Dictionary<string, string>
+        {
+            ["R-INT-PORT"] = $"{request["R-INT-PORT"]}",
+            ["R-INT-IP"] = $"{request["R-INT-IP"]}",
+            ["PORT"] = $"{request["PORT"]}",
+            ["NAME"] = player.User.Username,
+            ["PTYPE"] = $"{request["PTYPE"]}",
+            ["TICKET"] = $"{server.Data["TICKET"]}",
+            ["PID"] = $"{player.PID}",
+            ["UID"] = $"{player.User.UserId}",
+            ["LID"] = $"{server.LID}",
+            ["GID"] = $"{gameId}",
+            ["IP"] = player.TheaterConnection.RemoteAddress,
+        };
+
+        if (route is not null)
+        {
+            response["IP"] = route.ForHost.Address.ToString();
+            response["PORT"] = $"{route.ForHost.Port}";
+
+            if (route.Relayed)
+            {
+                response["R-INT-IP"] = response["IP"];
+                response["R-INT-PORT"] = response["PORT"];
+            }
+        }
+
+        if (request.DataDict.TryGetValue("R-U-passkey", out var passkey) && !string.IsNullOrWhiteSpace(passkey))
+        {
+            response.Add("R-U-passkey", passkey);
+        }
+
+        if (request.DataDict.TryGetValue("R-U-invited", out var invited) && !string.IsNullOrWhiteSpace(invited))
+        {
+            response.Add("R-U-invited", invited);
+        }
+
+        var enterGameRequestPacket = new Packet("EGRQ", TheaterTransmissionType.OkResponse, 0, response);
+        await server.TheaterConnection.SendPacket(enterGameRequestPacket);
+    }
+
+    private async Task HandleGDAT(Packet request)
+    {
+        if (!string.IsNullOrEmpty(request["USER"]))
+        {
+            // Game a friend is in (BF1943 squad invite fallback); the lookup only completes after GDAT, GDET and one PDAT per player
+            var friendGame = _sharedCache.FindGameWithPlayer(_session!.PartitionId, request["USER"], request["TYPE"]);
+            if (friendGame is null || !friendGame.HostConnected || !friendGame.CanJoin)
+            {
+                await _conn.SendPacket(TheaterError(request.Type, request["TID"], "ngam"));
+                return;
+            }
+
+            await SendGameData(request, friendGame);
+            await SendGDET(request, friendGame);
+            foreach (var player in friendGame.ConnectedPlayers.Values)
+            {
+                await _conn.SendPacket(new("PDAT", TheaterTransmissionType.OkResponse, 0)
+                {
+                    ["TID"] = request["TID"],
+                    ["LID"] = $"{friendGame.LID}",
+                    ["GID"] = $"{friendGame.GID}",
+                    ["PID"] = $"{player.PID}",
+                    ["NAME"] = player.User.Username,
+                    ["UID"] = $"{player.User.UserId}",
+                });
+            }
+            return;
+        }
+
+        if (!long.TryParse(request["GID"], out var serverGid))
+        {
+            if (request["TYPE"] == "G")
+            {
+                await HandleGLST(request);
+                return;
+            }
+        }
+
+        var game = _sharedCache.GetGameByGid(_session!.PartitionId, serverGid);
+
+        if (game is null || !game.HostConnected)
+        {
+            await _conn.SendPacket(TheaterError(request.Type, request["TID"], "ngam"));
+            return;
+        }
+
+        await SendGameData(request, game);
+        await SendGDET(request, game);
+    }
+
+    private async Task SendGDET(Packet request, GameServerListing game)
+    {
+        var response = new Dictionary<string, string>
+        {
+            ["LID"] = $"{game.LID}",
+            ["GID"] = $"{game.GID}",
+            ["TID"] = $"{request["TID"]}",
+            ["UGID"] = $"{game.UGID}"
+        };
+
+        var maxPlayers = int.Parse(game.Data["MAX-PLAYERS"]);
+        for (var i = 0; i < maxPlayers; i++)
+        {
+            var pdatId = $"D-pdat{i:D2}";
+            var validId = game.Data.TryGetValue(pdatId, out var pdat);
+            if (!validId | string.IsNullOrEmpty(pdat)) break;
+            response.Add(pdatId, pdat!);
+        }
+
+        var packet = new Packet("GDET", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    private async Task FinishPlayerEnterGameRequest(Packet serverResponse, long gid)
+    {
+        var server = _sharedCache.GetGameByGid(_session!.PartitionId, gid) ?? throw new NotImplementedException();
+        if (!server.HostConnected) throw new NotImplementedException();
+
+        var pid = int.Parse(serverResponse["PID"]);
+        var player = server.DequeuePlayer(pid);
+        if (player?.TheaterConnection is null) return;
+
+        if (serverResponse["ALLOWED"] != "1")
+        {
+            _logger.LogWarning("Host refused join from player '{Name}'", player.User.Username);
+
+            // player is likely banned by the host, fail the EGAM
+            if (server.PartitionId.EndsWith("/BEACH"))
+            {
+                await player.TheaterConnection.SendPacket(TheaterError("EGAM", $"{player.EGAM_TID}", "jden"));
+                return;
+            }
+
+            // For other games, send it anyway...
+        }
+
+        var egamResp = new Dictionary<string, string>
+        {
+            ["TID"] = $"{player.EGAM_TID}",
+            ["LID"] = $"{server.LID}",
+            ["GID"] = $"{server.GID}",
+            ["ALLOWED"] = serverResponse["ALLOWED"],
+        };
+
+        if (serverResponse["ALLOWED"] != "1") egamResp.Add("REASON", serverResponse["REASON"]);
+        await player.TheaterConnection.SendPacket(new("EGAM", TheaterTransmissionType.OkResponse, 0, egamResp));
+
+        server.ConnectedPlayers.TryAdd(player.User.UserId, player);
+
+        var serverData = server.Data;
+        var egegResp = new Dictionary<string, string>
+        {
+            ["PL"] = server.Platform,
+            ["TICKET"] = $"{serverData["TICKET"]}",
+            ["PID"] = $"{serverResponse["PID"]}",
+            ["P"] = $"{serverData["PORT"]}",
+            ["HUID"] = $"{server.UID}",
+            ["INT-PORT"] = $"{serverData["INT-PORT"]}",
+            ["EKEY"] = $"{server.EKEY}",
+            ["INT-IP"] = $"{serverData["INT-IP"]}",
+            ["UGID"] = $"{server.UGID}",
+            ["I"] = server.HostAddress,
+            ["LID"] = $"{server.LID}",
+            ["GID"] = $"{server.GID}"
+        };
+
+        if (_nat.RouteFor(player.User.UserId, server.GID) is { } route)
+        {
+            egegResp["I"] = route.ForClient.Address.ToString();
+            egegResp["P"] = $"{route.ForClient.Port}";
+
+            if (route.Relayed)
+            {
+                egegResp["INT-IP"] = egegResp["I"];
+                egegResp["INT-PORT"] = egegResp["P"];
+            }
+        }
+
+        if (server.External)
+        {
+            // 360 clients reach the host through its XNADDR (XNetXnAddrToInAddr), base64 like R-XNADDR
+            egegResp["XNADDR"] = ExternalXnAddr(egegResp["I"]);
+            egegResp["XNKID"] = Convert.ToBase64String(BitConverter.GetBytes(server.GID));
+            egegResp["XNKEY"] = Convert.ToBase64String(new byte[16]);
+        }
+
+        await player.TheaterConnection.SendPacket(new("EGEG", TheaterTransmissionType.OkResponse, 0, egegResp));
+    }
+
+    // XNADDR (36 bytes) as the bf1943 runtime builds it: ina, inaOnline, be16 port
+    // 3074, MAC 00:22 + ina, abOnline starting with ina.
+    private static string ExternalXnAddr(string address)
+    {
+        var ip = System.Net.IPAddress.TryParse(address, out var parsed) ? parsed.MapToIPv4().GetAddressBytes() : new byte[4];
+        var xn = new byte[36];
+        ip.CopyTo(xn, 0);
+        ip.CopyTo(xn, 4);
+        xn[8] = 3074 >> 8;
+        xn[9] = 3074 & 0xFF;
+        xn[11] = 0x22;
+        ip.CopyTo(xn, 12);
+        ip.CopyTo(xn, 16);
+        return Convert.ToBase64String(xn);
+    }
+
+    private async Task HandleLLST(Packet request)
+    {
+        if (_session is null) throw new NotImplementedException();
+
+        var lobbyList = new Dictionary<string, string>
+        {
+            ["TID"] = $"{request["TID"]}",
+            ["NUM-LOBBIES"] = $"{1}"
+        };
+
+        await _conn.SendPacket(new Packet("LLST", TheaterTransmissionType.OkResponse, 0, lobbyList));
+
+        var lobbyData = new Dictionary<string, string>
+        {
+            ["TID"] = $"{request["TID"]}",
+            ["LID"] = $"{LobbyId}",
+            ["PASSING"] = $"{1}",
+            ["NAME"] = _session.PartitionId.Split('/', StringSplitOptions.TrimEntries).LastOrDefault()?.ToLower() ?? "arcadia",
+            ["LOCALE"] = $"{"en_US"}",
+            ["MAX-GAMES"] = $"{1000}",
+            ["FAVORITE-GAMES"] = $"{0}",
+            ["FAVORITE-PLAYERS"] = $"{0}",
+            ["NUM-GAMES"] = $"{_sharedCache.GetPartitionServers(_session.PartitionId).Length}"
+        };
+        
+        await _conn.SendPacket(new Packet("LDAT", TheaterTransmissionType.OkResponse, 0, lobbyData));
+    }
+
+    public async Task HandleGLST(Packet request)
+    {
+        if (_session is null) throw new NotImplementedException();
+
+        var games = _sharedCache
+                .GetPartitionServers(_session.PartitionId)
+                .Where(x => x.CanJoin && x.Data.GetValueOrDefault("TYPE") != "P")
+                .OrderByDescending(x => x.ConnectedPlayers.Count)
+                .ToList();
+
+        if (_session.PartitionId.EndsWith("LOTR"))
+        {
+            games = [.. games.Where(x => x.Data["B-U-FriendsOnly"] == request["FILTER-ATTR-U-FriendsOnly"])];
+        }
+
+        await _conn.SendPacket(new("GLST", TheaterTransmissionType.OkResponse, 0)
+        {
+            ["TID"] = request["TID"],
+            ["LID"] = request["LID"],
+            ["LOBBY-NUM-GAMES"] = $"{games.Count}",
+            ["LOBBY-MAX-GAMES"] = "100",
+            ["FAVORITE-GAMES"] = "0",
+            ["FAVORITE-PLAYERS"] = "0",
+            ["NUM-GAMES"] = $"{games.Count}"
+        });
+
+        foreach (var game in games)
+        {
+            await SendGameData(request, game);
+        }
+    }
+
+    private async Task SendGameData(Packet request, GameServerListing game)
+    {
+        if (!game.HostConnected) return;
+        if (_session is null) return;
+
+        var response = new Dictionary<string, string>
+        {
+            ["TID"] = request["TID"],
+            ["LID"] = string.IsNullOrEmpty(request["LID"]) ? $"{game.LID}" : request["LID"],
+            ["GID"] = $"{game.GID}",
+            ["HU"] = $"{game.UID}",
+            ["HN"] = game.NAME,
+            ["I"] = game.HostAddress,
+            ["P"] = $"{game.Data["PORT"]}",
+            ["N"] = game.NAME.Replace("\"", string.Empty),
+            ["AP"] = $"{game.ConnectedPlayers.Count}",
+            ["MP"] = $"{game.Data["MAX-PLAYERS"]}",
+            ["JP"] = "0",
+            ["PL"] = game.Platform,
+            ["PW"] = "0",
+            ["QP"] = "0",
+            ["TYPE"] = $"{game.Data["TYPE"]}",
+            ["J"] = $"{game.Data["JOIN"]}",
+            ["B-version"] = $"{game.Data["B-version"]}",
+            ["B-numObservers"] = $"{game.Data["B-numObservers"]}",
+            ["B-maxObservers"] = $"{game.Data["B-maxObservers"]}",
+            ["F"] = "0",
+            ["NF"] = "0",
+        };
+
+        var subdomain = game.PartitionId.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Last();
+        switch (subdomain)
+        {
+            case "MERCS2":
+                response.Add("B-U-Oil", game.Data["B-U-Oil"] ?? "0");
+                response.Add("B-U-Money", game.Data["B-U-Money"] ?? "0");
+                response.Add("B-U-Duration", game.Data["B-U-Duration"] ?? "0");
+                response.Add("B-U-Character", game.Data["B-U-Character"] ?? "0");
+                response.Add("B-U-Mission", game.Data["B-U-Mission"] ?? string.Empty);
+                break;
+            case "GODFATHER2":
+                response.Add("B-U-DonFlow", game.Data["B-U-DonFlow"] ?? "0");
+                response.Add("B-U-DonMode", game.Data["B-U-DonMode"] ?? "0");
+                response.Add("B-U-DonWager", game.Data["B-U-DonWager"] ?? "0");
+                response.Add("B-U-IsStrictNAT", game.Data["B-U-IsStrictNAT"] ?? "0");
+                response.Add("B-U-MapHash", game.Data["B-U-MapHash"] ?? "0");
+                response.Add("B-U-MatchTypeIndex", game.Data["B-U-MatchTypeIndex"] ?? "0");
+                response.Add("B-U-ModeIdx", game.Data["B-U-ModeIdx"] ?? "0");
+                response.Add("B-U-ModeRequested", game.Data["B-U-ModeRequested"] ?? "0");
+                response.Add("B-U-PackedAttributes", game.Data["B-U-PackedAttributes"] ?? "0");
+                response.Add("B-U-RoundScore", game.Data["B-U-RoundScore"] ?? "0");
+                response.Add("B-U-ScoreLimit", game.Data["B-U-ScoreLimit"] ?? "0");
+                response.Add("B-U-WeaponIdx", game.Data["B-U-WeaponIdx"] ?? "0");
+                break;
+            case "LOTR":
+                response.Add("B-U-LevelKey", game.Data["B-U-LevelKey"]);
+                response.Add("B-U-LevelName", game.Data["B-U-LevelName"]);
+                response.Add("B-U-Mode", game.Data["B-U-Mode"]);
+                break;
+            case "AO3":
+                if (game.Data["B-U-Mode"] == "CAMPAIGN")
+                {
+                    response.Add("B-U-Difficulty", game.Data["B-U-Difficulty"]);
+                    response.Add("B-U-Friendly", game.Data["B-U-Friendly"]);
+                    response.Add("B-U-PlayerSkin", game.Data["B-U-PlayerSkin"]);
+                }
+                else
+                {
+                    response.Add("B-U-BucketSessionCalibre", game.Data["B-U-BucketSessionCalibre"]);
+                    response.Add("B-U-FirewallStrict", game.Data["B-U-FirewallStrict"]);
+                    response.Add("B-U-RealSessionCalibre", game.Data["B-U-RealSessionCalibre"]);
+                    response.Add("B-U-RoundLength", game.Data["B-U-RoundLength"]);
+                    response.Add("B-U-PlayerCount", game.Data["B-U-PlayerCount"]);
+                    response.Add("B-U-MapPlaylist", game.Data["B-U-MapPlaylist"]);
+                    response.Add("B-U-MaxPlayers", game.Data["B-U-MaxPlayers"]);
+                    response.Add("B-U-MinPlayers", game.Data["B-U-MinPlayers"]);
+                    response.Add("B-U-GameType", game.Data["B-U-GameType"]);
+                }
+
+                response.Add("B-U-ChangeList", game.Data["B-U-ChangeList"]);
+                response.Add("B-U-DLC", game.Data["B-U-DLC"]);
+                response.Add("B-U-Map", game.Data["B-U-Map"]);
+                response.Add("B-U-Mode", game.Data["B-U-Mode"]);
+                response.Add("B-U-NAT", game.Data["B-U-NAT"]);
+                response.Add("B-U-Private", game.Data["B-U-Private"]);
+                response.Add("B-U-RB", game.Data["B-U-RB"]);
+                response.Add("B-U-RBHost", game.Data["B-U-RBHost"]);
+                response.Add("B-U-RBState", game.Data["B-U-RBState"]);
+                response.Add("B-U-ping_site", game.Data["B-U-ping_site"]);
+                break;
+            case "BEACH":
+                foreach (var (key, value) in game.Data)
+                {
+                    if (key.StartsWith("B-U-") && value is not null) response[key] = value;
+                }
+                break;
+        }
+
+        var packet = new Packet("GDAT", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    // CreateGame
+    private async Task HandleCGAM(Packet request)
+    {
+        if (_session is null) throw new NotImplementedException();
+        if (_platform is null) throw new Exception("Cannot create game with null platform!");
+
+        if (_session!.PartitionId.EndsWith("MERCS2") || _session.PartitionId.EndsWith("GODFATHER2"))
+        {
+            request["NAME"] = _session.User.Username;
+        }
+
+        if (request["RESERVE-HOST"] == "1")
+        {
+            _logger.LogWarning("Client creating game in '{PartitionId}' with RESERVE-HOST=1", _session.PartitionId);
+        }
+
+        // BF1943 "create private match" playgroups rely on host migration, which isn't supported; squads have 4 players
+        if (_session.PartitionId.EndsWith("/BEACH") && request["TYPE"] == "P" && int.TryParse(request["MAX-PLAYERS"], out var maxPlayers) && maxPlayers > 4)
+        {
+            await _conn.SendPacket(TheaterError(request.Type, request["TID"], "ngam"));
+            return;
+        }
+
+        if (_sharedCache.GetServerByHostPlayer(_session.User.UserId) is not null)
+        {
+            throw new("Disconnecting client trying to host two game servers!");
+        }
+
+        var game = new GameServerListing()
+        {
+            PartitionId = _session.PartitionId,
+            TheaterConnection = _conn,
+            UID = _session.User.UserId,
+            GID = _sharedCounters.GetNextGameId(),
+            Platform = _platform,
+            LID = LobbyId,
+            UGID = "NOGUID",
+            EKEY = "NOENCYRPTIONKEY",
+            SECRET = "NOSECRET",
+            NAME = request["NAME"],
+            Data = new()
+            {
+                ["RESERVE-HOST"] = "0",
+                ["NAME"] = request["NAME"],
+                ["PORT"] = request["PORT"],
+                ["HTTYPE"] = request["HTTYPE"],
+                ["TYPE"] = request["TYPE"],
+                ["QLEN"] = request["QLEN"],
+                ["DISABLE-AUTO-DEQUEUE"] = request["DISABLE-AUTO-DEQUEUE"],
+                ["HXFR"] = "0",
+                ["INT-PORT"] = request["INT-PORT"],
+                ["INT-IP"] = request["INT-IP"],
+                ["MAX-PLAYERS"] = request["MAX-PLAYERS"],
+                ["B-maxObservers"] = request["B-maxObservers"],
+                ["B-numObservers"] = request["B-numObservers"],
+                ["B-version"] = request["B-version"],
+                ["JOIN"] = request["JOIN"],
+                ["RT"] = request["RT"],
+                ["TICKET"] = $"{_sharedCounters.GetNextTicket()}"
+            }
+        };
+
+        if (string.IsNullOrWhiteSpace(game.NAME))
+        {
+            await _conn.SendPacket(TheaterError(request.Type, request["TID"], "bpar"));
+            return;
+        }
+
+        await _sharedCache.AddGameListing(game, request.DataDict);
+
+        var response = new Dictionary<string, string>
+        {
+            ["TID"] = $"{request["TID"]}",
+            ["MAX-PLAYERS"] = $"{game.Data["MAX-PLAYERS"]}",
+            ["EKEY"] = $"{game.EKEY}",
+            ["UGID"] = $"{game.UGID}",
+            ["JOIN"] = $"{game.Data["JOIN"]}",
+            ["LID"] = $"{game.LID}",
+            ["SECRET"] = $"{game.SECRET}",
+            ["J"] = $"{game.Data["JOIN"]}",
+            ["GID"] = $"{game.GID}",
+            ["HXFR"] = "0"
+        };
+
+        var packet = new Packet("CGAM", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    private async Task HandlePENT(Packet request)
+    {
+        var response = new Dictionary<string, string>
+        {
+            ["TID"] = request["TID"],
+            ["PID"] = request["PID"]
+        };
+
+        if (long.TryParse(request["GID"], out var gid) &&
+            int.TryParse(request["PID"], out var pid) &&
+            _sharedCache.GetGameByGid(_session!.PartitionId, gid) is { } game &&
+            game.ConnectedPlayers.Values.FirstOrDefault(x => x.PID == pid) is { } player)
+        {
+            _nat.Joined(player.User.UserId, gid);
+        }
+
+        var packet = new Packet("PENT", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    private async Task HandleEGRS(Packet request)
+    {
+        var response = new Dictionary<string, string>
+        {
+            ["TID"] = request["TID"]
+        };
+
+        var packet = new Packet("EGRS", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+
+        var gid = int.Parse(request["GID"]);
+        await FinishPlayerEnterGameRequest(request, gid);
+    }
+
+    private async Task HandleUBRA(Packet request)
+    {
+        var tid = long.Parse(request["TID"]);
+
+        if (request["START"] == "1")
+        {
+            _UBRA_TID = tid;
+        }
+        else
+        {
+            if (1 > _UBRA_TID) throw new NotImplementedException("Tried to UBRA without START");
+
+            for (var i = _UBRA_TID; i < tid + 1; i++)
+            {
+                await _conn.SendPacket(new(request.Type, TheaterTransmissionType.OkResponse, 0)
+                {
+                    ["TID"] = $"{i}"
+                });
+            }
+
+            _UBRA_TID = null;
+        }
+    }
+
+    private Task HandleUGDE(Packet request)
+    {
+        var gid = long.Parse(request["GID"]);
+        var game = _sharedCache.GetGameByGid(_session!.PartitionId, gid) ?? throw new NotImplementedException();
+
+        _sharedCache.UpsertGameServerDataByGid(gid, request.DataDict);
+
+        if (!string.IsNullOrWhiteSpace(request["B-U-level"]))
+        {
+            game.CanJoin = true;
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task HandleUGAM(Packet request)
+    {
+        var gid = long.Parse(request["GID"]);
+        var game = _sharedCache.GetGameByGid(_session!.PartitionId, gid) ?? throw new NotImplementedException();
+
+        if (game.UID == _session.User.UserId)
+        {
+            _sharedCache.UpsertGameServerDataByGid(gid, request.DataDict);
+
+            if (!string.IsNullOrWhiteSpace(request["JOIN"]))
+            {
+                game.CanJoin = true;
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private async Task HandleRGAM(Packet request)
+    {
+        var gid = long.Parse(request["GID"]);
+        var game = _sharedCache.GetGameByGid(_session!.PartitionId, gid) ?? throw new NotImplementedException();
+
+        var response = new Dictionary<string, string>
+        {
+            ["TID"] = request["TID"]
+        };
+
+        var packet = new Packet("RGAM", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+
+        await _sharedCache.RemoveGameListing(game);
+    }
+
+    private async Task HandlePLVT(Packet request)
+    {
+        var gid = long.Parse(request["GID"]);
+        var game = _sharedCache.GetGameByGid(_session!.PartitionId, gid) ?? throw new NotImplementedException();
+
+        var pid = int.Parse(request["PID"]);
+        var player = game.ConnectedPlayers.Values.FirstOrDefault(x => x.PID == pid);
+        if (player is not null)
+        {
+            game.ConnectedPlayers.Remove(player.User.UserId, out var _);
+        }
+
+        var response = new Dictionary<string, string>
+        {
+            ["TID"] = request["TID"]
+        };
+
+        var packet = new Packet("PLVT", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    private async Task HandlePCNT(Packet request)
+    {
+        if (_session is null) throw new NotImplementedException();
+
+        var response = new Dictionary<string, string>
+        {
+            ["TID"] = request["TID"],
+            ["LID"] = request["LID"],
+            ["COUNT"] = $"{_sharedCache.GetPartitionPlayerCount(_session.PartitionId)}"
+        };
+
+        var packet = new Packet("PCNT", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    private async Task HandleUPLA(Packet request)
+    {
+        var response = new Dictionary<string, string>
+        {
+            ["TID"] = request["TID"],
+        };
+
+        var packet = new Packet("UPLA", TheaterTransmissionType.OkResponse, 0, response);
+        await _conn.SendPacket(packet);
+    }
+
+    private Task HandlePING(Packet _)
+    {
+        return Task.CompletedTask;
+    }
+
+    private static Packet TheaterError(string type, string tid, string code)
+    {
+        var id = ((uint)code[1] << 16) | ((uint)code[2] << 8) | code[3];
+        return new(type, (uint)code[0] << 24, id, new() { ["TID"] = tid });
+    }
+}

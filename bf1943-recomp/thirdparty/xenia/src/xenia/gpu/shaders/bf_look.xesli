@@ -1,0 +1,27 @@
+// bf1943 looks for the final frame (HUD included), in the gamma pass of the
+// swap (apply_gamma_*.ps): toon, noir (black, white and red) and ww2 (1940s
+// colour newsreel film). Parameters
+// from VulkanCommandProcessor::IssueSwap (xenia/gpu/vulkan/bf_look.h).
+push_const_begin_xe(b0, space0)
+  // x: look (0 the game's, 1 toon, 2 noir, 3 ww2), y: HDR white nits (0 SDR),
+  // z: seconds, w: HDR peak nits.
+  float4_xe bf_look;
+  // xy: frame size, zw: 1 / size.
+  float4_xe bf_size;
+push_const_end_xe
+
+float BfHash(float2_xe p) {
+  float h = sin(dot(p, float2_xe(12.9898f, 78.233f))) * 43758.5453f;
+  return h - floor(h);
+}
+
+float BfNoise(float2_xe p) {
+  float2_xe i = floor(p);
+  float2_xe f = p - i;
+  float2_xe u = f * f * (3.0f - 2.0f * f);
+  float a = BfHash(i), b = BfHash(i + float2_xe(1.0f, 0.0f));
+  float c = BfHash(i + float2_xe(0.0f, 1.0f)), d = BfHash(i + float2_xe(1.0f, 1.0f));
+  return a + (b - a) * u.x + (c - a) * u.y + (a - b - c + d) * u.x * u.y;
+}
+
+float BfLuma(float3_xe c) { return dot(c, float3_xe(0.299f, 0.587f, 0.114f)); }

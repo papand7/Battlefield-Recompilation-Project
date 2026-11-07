@@ -1,0 +1,15 @@
+# Copyrighted game data and anything derived from it never enters the repo.
+original/
+generated/
+*.xex
+*.pipelinecache
+*.pipelinecache.tmp
+
+# Upstream sources kept locally for reference / vendoring (fetched, not committed).
+research/
+
+# Build output
+build/
+out/
+.vs/
+frames/

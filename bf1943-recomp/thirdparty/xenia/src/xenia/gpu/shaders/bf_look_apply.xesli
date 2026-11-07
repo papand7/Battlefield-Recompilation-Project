@@ -1,0 +1,102 @@
+// bf1943 looks (bf_look.xesli) on apply_gamma_output.rgb, inside the gamma
+// pass's pixel shader (pixel_index, xe_apply_gamma_source).
+{
+  float3_xe look_color = apply_gamma_output.rgb;
+  float2_xe look_pixel = float2_xe(pixel_index) + 0.5f;
+  float2_xe look_uv = look_pixel * push_const_xe(bf_size).zw;
+  float look_mode = push_const_xe(bf_look).x;
+  if (look_mode > 0.5f && look_mode < 1.5f) {
+    // Toon: flat colour bands with the hue kept, and dark outlines where the
+    // brightness changes sharply.
+    float luma = BfLuma(look_color);
+    // Four bands with short soft steps between them.
+    float steps = luma * 4.0f;
+    float band = (floor(steps) + smoothstep(0.4f, 0.6f, steps - floor(steps))) / 4.0f;
+    band = max(band, 0.08f);
+    float3_xe flat_color = look_color * (band / max(luma, 0.02f));
+    float3_xe grey = float3_xe(band, band, band);
+    // A bit more saturated, like painted.
+    flat_color = saturate_xe(grey + (flat_color - grey) * 1.35f);
+    int2_xe size_max = int2_xe(push_const_xe(bf_size).xy) - 1;
+    int2_xe p = int2_xe(pixel_index);
+    float l_l = BfLuma(texel_fetch_2d_xe(xe_apply_gamma_source, clamp(p + int2_xe(-1, 0), int2_xe(0, 0), size_max), 0).rgb);
+    float l_r = BfLuma(texel_fetch_2d_xe(xe_apply_gamma_source, clamp(p + int2_xe(1, 0), int2_xe(0, 0), size_max), 0).rgb);
+    float l_u = BfLuma(texel_fetch_2d_xe(xe_apply_gamma_source, clamp(p + int2_xe(0, -1), int2_xe(0, 0), size_max), 0).rgb);
+    float l_d = BfLuma(texel_fetch_2d_xe(xe_apply_gamma_source, clamp(p + int2_xe(0, 1), int2_xe(0, 0), size_max), 0).rgb);
+    float edge = abs(l_r - l_l) + abs(l_d - l_u);
+    float line_amount = smoothstep(0.12f, 0.3f, edge);
+    look_color = flat_color * (1.0f - 0.85f * line_amount);
+  } else if (look_mode > 2.5f) {
+    // WW2: 1940s colour newsreel film. Muted warm colour (reds and skin kept,
+    // greens and blues faded), soft contrast with lifted blacks and rolled-off
+    // whites, and per film frame (24 a second) grain, a slight flicker, now
+    // and then a scratch, and a vignette.
+    float seconds = push_const_xe(bf_look).z;
+    float film_frame = floor(seconds * 24.0f);
+    float luma = BfLuma(look_color);
+    float3_xe grey = float3_xe(luma, luma, luma);
+    // Blues (the sky, the sea) faded the most: the warm tint below turns a
+    // half-faded blue teal.
+    float blue = saturate_xe((look_color.b - max(look_color.r, look_color.g)) * 4.0f);
+    float3_xe muted = grey + (look_color - grey) * (0.55f - 0.4f * blue);
+    // Warm sepia stock: red up, green a little and blue more down (equal
+    // red and green reads olive), the shadows browner.
+    muted *= float3_xe(1.1f, 0.98f, 0.78f);
+    muted += float3_xe(0.012f, 0.0f, -0.01f) * (1.0f - luma);
+    // Soft S curve between a lifted black and a dim white.
+    float3_xe curve = muted * muted * (3.0f - 2.0f * muted);
+    float3_xe film = saturate_xe(0.06f + (muted + (curve - muted) * 0.5f) * 0.88f);
+    // Grain in 2x2 clumps, stronger in the mid-tones.
+    float grain = BfHash(floor(look_pixel * 0.5f) + film_frame * 31.0f) - 0.5f;
+    film += grain * (0.05f + 0.06f * luma * (1.0f - luma));
+    // Flicker.
+    film *= 1.0f + (BfHash(float2_xe(film_frame, 7.0f)) - 0.5f) * 0.05f;
+    // A thin pale scratch in about one film frame in eight.
+    float scratch_x = BfHash(float2_xe(film_frame, 3.0f));
+    if (BfHash(float2_xe(film_frame, 11.0f)) > 0.875f) {
+      float width = 1.5f * push_const_xe(bf_size).z;
+      film += 0.12f * (1.0f - smoothstep(0.0f, width, abs(look_uv.x - scratch_x))) *
+              BfNoise(float2_xe(look_uv.y * 40.0f, film_frame));
+    }
+    float2_xe from_center = look_uv - 0.5f;
+    film *= 1.0f - 0.7f * dot(from_center, from_center);
+    look_color = saturate_xe(film);
+  } else if (look_mode > 1.5f) {
+    // Noir: hard black and white, only strong reds stay (deep red).
+    float luma = BfLuma(look_color);
+    // Pure reds only: skin and orange wood have too much green.
+    float other = max(look_color.g, look_color.b) / max(look_color.r, 0.001f);
+    float red_amount = (1.0f - smoothstep(0.25f, 0.42f, other)) *
+                       smoothstep(0.18f, 0.35f, look_color.r);
+    float g = saturate_xe((luma - 0.45f) * 1.45f + 0.5f);
+    // Film grain and a dark vignette.
+    g += (BfHash(look_pixel + floor(push_const_xe(bf_look).z * 24.0f) * 17.0f) - 0.5f) * 0.07f;
+    float2_xe from_center = look_uv - 0.5f;
+    float vignette = 1.0f - 0.9f * dot(from_center, from_center);
+    float3_xe grey = float3_xe(g, g, g) * vignette;
+    float3_xe red = float3_xe(saturate_xe(0.22f + luma * 1.7f), 0.02f, 0.03f) * vignette;
+    look_color = saturate_xe(grey + (red - grey) * red_amount);
+  }
+  // HDR10 output (xenia/ui/vulkan/bf_hdr.h): y the game's white in nits (0 when
+  // the swapchain is SDR), w the peak. The frame is taken as gamma 2.2, its
+  // top end (brightest component above 0.55 linear) stretched smoothly up to
+  // the peak, then BT.709 to BT.2020 and the PQ curve.
+  float hdr_white = push_const_xe(bf_look).y;
+  if (hdr_white > 0.0f) {
+    float3_xe lin = pow(max(look_color, float3_xe(0.0f, 0.0f, 0.0f)),
+                        float3_xe(2.2f, 2.2f, 2.2f));
+    float top = max(max(lin.r, lin.g), lin.b);
+    float t = saturate_xe((top - 0.55f) / 0.45f);
+    float stretch = 1.0f + (push_const_xe(bf_look).w / hdr_white - 1.0f) * (t * t * t);
+    lin *= max(stretch, 1.0f);
+    float3_xe wide = float3_xe(
+        dot(lin, float3_xe(0.6274f, 0.3293f, 0.0433f)),
+        dot(lin, float3_xe(0.0691f, 0.9195f, 0.0114f)),
+        dot(lin, float3_xe(0.0164f, 0.0880f, 0.8956f)));
+    float3_xe y_m1 = pow(max(wide * (hdr_white / 10000.0f), float3_xe(0.0f, 0.0f, 0.0f)),
+                         float3_xe(0.1593017578125f, 0.1593017578125f, 0.1593017578125f));
+    look_color = pow((0.8359375f + 18.8515625f * y_m1) / (1.0f + 18.6875f * y_m1),
+                     float3_xe(78.84375f, 78.84375f, 78.84375f));
+  }
+  apply_gamma_output.rgb = look_color;
+}

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'">
+  <title>Battlefield 1943</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="teams"><span class="us"></span><span class="jp"></span></div>
+  <header class="titlebar">
+    <nav class="games" aria-label="Game">
+      <button class="game on" id="tab-bf1943" data-game="bf1943"><span class="mark">43</span>Battlefield 1943</button>
+      <button class="game" id="tab-bfbc1" data-game="bfbc1"><span class="mark bc">BC</span>Bad Company<span class="soon" hidden>Not found</span></button>
+    </nav>
+    <div class="chrome">
+      <button id="min" title="Minimise" aria-label="Minimise">
+        <svg viewBox="0 0 10 10"><path d="M1 5h8"/></svg>
+      </button>
+      <button id="close" class="close" title="Close" aria-label="Close">
+        <svg viewBox="0 0 10 10"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="left">
+      <div class="logo">
+        <div class="word">BATTLEFIELD</div>
+        <div class="year" id="year">1943</div>
+        <div class="hint">PC edition</div>
+      </div>
+      <div class="launch">
+        <label class="hint" for="name">Player name</label>
+        <input id="name" maxlength="15" spellcheck="false" autocomplete="off">
+        <button id="play" class="play">PLAY</button>
+        <div id="status" class="hint status"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Graphics</h2>
+      <div id="rows"></div>
+      <div class="line"></div>
+      <div class="toggle-row">
+        <div><div class="label">HD textures</div><div id="texhint" class="hint">AI-upscaled texture pack</div></div>
+        <label class="switch"><input type="checkbox" id="textures"><span></span></label>
+      </div>
+      <div class="toggle-row" id="bloodrow">
+        <div><div class="label" id="bloodlabel">Blood on hit</div><div class="hint">Blood where soldiers are hit; explosions tear bodies apart, gore stays on the ground</div></div>
+        <label class="switch"><input type="checkbox" id="blood"><span></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><div class="label">HDR</div><div class="hint">HDR10 output; needs HDR on in the Windows display settings</div></div>
+        <label class="switch"><input type="checkbox" id="hdr"><span></span></label>
+      </div>
+    </section>
+  </main>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

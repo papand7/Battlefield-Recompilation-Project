@@ -1,0 +1,43 @@
+# PBR lighting table for --pbr (see runtime/xenia_shims/pbr_shaders.h).
+# <pixel shader hash> taps...
+# First-person weapons (Thompson). Specular power 119.
+49750AD0B93EF9C5 pom=0 rm=10 n=r3.yzw@47 v=r9.xyz@35 a=r6.yzw@63 lit=r2.x@74 env=r5.xyz@55 so=r5.w@56 out=r0.xyz@99 env_scale=8 rough=0.36
+# Carrier deck (wood). Specular power 37.6.
+48CB57AA0A76347C rm=9 n=r5.xyz@32 v=r10.yzw@19 a=r6.xyz@52 lit=r0.w@71 env=r8.xyz@46 ao=r2.x@44 out=r0.xyz@86 env_scale=1 rough=0.47 rough_scale=0.9 bump=12
+60630F0318B38A81 rm=9 n=r5.xyz@32 v=r10.yzw@19 a=r6.xyz@52 lit=r0.w@71 env=r8.xyz@46 ao=r2.x@44 out=r0.xyz@86 env_scale=1 rough=0.47 rough_scale=0.9 bump=12
+7FFFE83F48D4076F rm=9 n=r5.xyz@32 v=r10.yzw@19 a=r6.xyz@52 lit=r0.w@71 env=r8.xyz@46 ao=r2.x@44 out=r0.xyz@86 env_scale=1 rough=0.47 rough_scale=0.9 bump=12
+B48AEBA71BEBE3D4 rm=9 n=r5.xyz@32 v=r10.yzw@19 a=r6.xyz@52 lit=r0.w@71 env=r8.xyz@46 ao=r2.x@44 out=r0.xyz@86 env_scale=1 rough=0.47 rough_scale=0.9 bump=12
+# Everything else on Wake Island: written by tools/pbr_taps.py from the
+# --dump-shaders disassembly (shaders it could not follow are left out).
+161F32064BE82C1C rm=6 n=r6.xyz@20 v=r11.xyz@13 a=r7.yxz@7 out=r0.xyz@60 pow=c251.z rough_scale=0.66 bump=5
+27FA59C1C3837C59 rm=8 n=r9.xyz@31 v=r14.xyz@13 a=r4.ywz@50 lit=r2.w@66 env=r3.xyz@44 ao=r1.z@43 out=r0.xyz@81 pow=c249.y rough_scale=0.66 bump=5
+3AD78610BDC2D232 rm=9 n=r3.xyz@46 v=r3.xyz@11 a=r4.xyz@60 lit=r2.w@72 env=r0.xyz@54 out=r0.xyz@90 pow=c251.x rough_scale=0.66 bump=5
+3C32B3D828F2D2B6 rm=9 n=r6.xyz@36 v=r12.xyz@10 a=r3.xzy@69 env=r9.xyz@45 ao=r0.x@52 out=r0.xzy@77 pow=c251.x rough_scale=0.66 bump=5
+3CECC81AA0BD32F6 rm=12 n=r12.xyz@35 v=r10.xyz@15 a=r1.ywz@93 ao=r9.w@11 out=r0.xzy@96 rough_scale=0.66 bump=5
+410B9B9C2AD7E422 rm=9 n=r3.xyz@46 v=r3.xyz@11 a=r7.xyz@62 lit=r0.w@72 env=r4.xyz@55 out=r0.xyz@91 pow=c251.x rough_scale=0.66 bump=5
+4FF3074BF8AEB01C rm=12 n=r11.xyz@52 v=r3.xyz@40 a=r6.xyz@84 lit=r2.w@61 env=r5.xyz@73 ao=r12.x@11 out=r0.xzy@100 rough_scale=0.66 bump=5
+5183C3AF6E336794 rm=10 n=r2.xyz@75 v=r3.xyz@12 a=r1.xyz@57 lit=r4.w@74 env=r8.xyz@50 out=r0.xyz@95 pow=c251.x rough_scale=0.66 bump=5
+54BAC0594E8A60B6 n=r4.xyz@s v=r10.xyz@10 a=r5.xzy@43 lit=r1.w@62 env=r0.xyz@35 ao=r3.w@33 out=r0.xyz@76 pow=c251.y rough_scale=0.66 bump=5
+560DAF673AF554F2 rm=48 n=r5.xyz@78 v=r2.xzw@59 a=r1.xzy@123 lit=r2.w@80 env=r6.yzw@91 ao=r12.x@46 out=r0.xyz@129 pow=c248.w rough_scale=0.66 bump=5
+5AA25E51C86D714B rm=25 n=r3.xzw@63 v=r3.xyz@33 a=r1.xyz@70 lit=r0.z@69 ao=r2.x@27 out=r0.xyz@82 pow=c248.x rough_scale=0.66 bump=5
+5FF5D62B23BD8A2D rm=9 n=r7.xyz@34 v=r3.xyz@10 a=r2.yzw@54 lit=r2.x@73 env=r4.xyz@52 out=r0.xyz@80 pow=c250.x rough_scale=0.66 bump=5
+63DE01DB41B02E12 rm=10 n=r6.yzw@27 v=r3.xzw@11 a=r4.xyz@55 ao=r8.x@7 out=r0.xyz@70 pow=c251.x rough_scale=0.66 bump=5
+63E723B912B04D74 rm=10 n=r3.xyz@47 v=r3.xyz@12 a=r7.xyz@63 lit=r0.w@73 env=r4.xyz@56 out=r0.xyz@93 pow=c251.y rough_scale=0.66 bump=5
+664F6BFA613A502B rm=9 n=r3.xyz@32 v=r14.xyz@14 a=r4.xzy@50 lit=r2.w@69 env=r6.xyz@46 ao=r0.x@44 out=r0.xyz@89 pow=c250.y rough_scale=0.66 bump=5
+6C1133AF9ADE2053 rm=10 n=r9.xyz@42 v=r9.xyw@14 a=r8.xyz@34 lit=r0.w@80 env=r1.xyz@63 ao=r0.w@12 out=r0.xzy@91 rough_scale=0.66 bump=5
+6DA6713934A8AD0D rm=10 n=r4.yzw@47 v=r8.xyz@16 a=r5.xzy@87 lit=r0.w@90 env=r3.xyz@70 ao=r12.z@13 out=r0.xzy@101 rough_scale=0.66 bump=5
+72216AD55AC9D629 rm=9 n=r3.xyz@32 v=r14.xyz@14 a=r4.xzy@50 lit=r2.w@70 env=r6.xyz@46 ao=r0.x@44 out=r0.xyz@90 pow=c249.y rough_scale=0.66 bump=5
+772CE9710BAC1DD1 rm=8 n=r8.xyz@21 v=r10.xyz@13 a=r5.xyz@53 lit=r3.w@57 env=r0.xyz@37 ao=r5.x@38 out=r0.xyz@74 pow=c249.y rough_scale=0.66 bump=5
+83AC8129EB2DBFBA rm=11 n=r11.xyz@34 v=r10.xyz@14 a=r4.xzy@95 lit=r2.x@79 ao=r0.w@13 out=r0.xzy@100 rough_scale=0.66 bump=5
+845B10E43CE9C576 rm=6 n=r8.xyz@28 v=r3.xzw@11 a=r7.xyz@13 ao=r10.x@10 out=r0.xyz@65 pow=c250.x rough_scale=0.66 bump=5
+89182740C4DC7376 rm=8 n=r9.xyz@31 v=r14.xyz@13 a=r4.ywz@51 lit=r2.w@67 env=r3.xyz@44 ao=r1.z@43 out=r0.xyz@82 pow=c248.y rough_scale=0.66 bump=5
+9EEEE9E597003670 rm=25 n=r1.yzw@48 v=r7.xyz@28 a=r7.xyz@56 lit=r0.w@58 ao=r8.x@20 out=r0.xyz@70 pow=c249.y rough_scale=0.66 bump=5
+B7850C7794F9AE73 rm=10 n=r9.xyz@35 v=r9.xyz@12 a=r3.ywz@68 env=r4.xyz@44 ao=r6.x@49 out=r0.xyz@78 pow=c248.z rough_scale=0.66 bump=5
+B93354271643C388 rm=9 n=r3.xyz@32 v=r14.xyz@14 a=r4.xzy@50 lit=r2.w@70 env=r6.xyz@46 ao=r0.x@44 out=r0.xyz@90 pow=c250.y rough_scale=0.66 bump=5
+BAAA7268AA0DB8C4 rm=9 n=r3.xyz@32 v=r14.xyz@14 a=r4.xzy@50 lit=r2.w@70 env=r6.xyz@46 ao=r0.x@44 out=r0.xyz@90 pow=c250.w rough_scale=0.66 bump=5
+C3ECBF2B3C51075F rm=25 n=r3.yzw@45 v=r2.xyz@27 a=r1.xyz@31 out=r0.xyz@61 pow=c248.y rough_scale=0.66 bump=5
+C586D000EC8A98D8 rm=14 n=r1.xyz@60 v=r10.xyz@17 a=r5.xzy@86 lit=r3.y@92 env=r2.xyz@68 ao=r13.z@12 out=r0.xzy@107 rough_scale=0.66 bump=5
+D345A3E209A6EC3E rm=9 n=r3.xyz@32 v=r14.xyz@14 a=r4.xzy@50 lit=r2.w@70 env=r6.xyz@46 ao=r0.x@44 out=r0.xyz@90 pow=c250.y rough_scale=0.66 bump=5
+E1BD3A8372B650F9 rm=9 n=r3.xyz@46 v=r3.xyz@11 a=r4.xyz@60 lit=r2.w@72 env=r0.xyz@54 out=r0.xyz@90 pow=c251.x rough_scale=0.66 bump=5
+E1DDBEB4C6A4863D rm=14 n=r5.yzw@49 v=r9.xyz@17 a=r7.xzy@89 lit=r0.y@95 env=r4.xyz@77 ao=r13.x@11 out=r0.xzy@113 rough_scale=0.66 bump=5
+E5EC72E84D469891 rm=9 n=r3.xyz@32 v=r14.xyz@14 a=r4.xzy@50 lit=r2.w@70 env=r6.xyz@46 ao=r0.x@44 out=r0.xyz@90 pow=c248.y rough_scale=0.66 bump=5
