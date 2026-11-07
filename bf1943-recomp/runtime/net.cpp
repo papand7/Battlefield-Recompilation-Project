@@ -14,10 +14,16 @@
 
 #include <atomic>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
+constexpr int kSelectNfds = 0;  // ignored by Winsock
+#else
+#include "posix_net.h"
+constexpr int kSelectNfds = FD_SETSIZE;
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -111,8 +117,18 @@ void FdsToHost(uint32_t guest, fd_set* out) {
 }
 void FdsToGuest(const fd_set& in, uint32_t guest) {
   if (!guest) return;
+#ifdef _WIN32
   St32(guest, in.fd_count);
   for (u_int i = 0; i < in.fd_count; ++i) St32(guest + 4 + i * 4, uint32_t(in.fd_array[i]));
+#else
+  // The guest's own list, kept where the host set has the socket.
+  uint32_t n = std::min<uint32_t>(Ld32(guest), 64), kept = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t s = Ld32(guest + 4 + i * 4);
+    if (FD_ISSET(Host(s), &in)) St32(guest + 4 + kept++ * 4, s);
+  }
+  St32(guest, kept);
+#endif
 }
 
 // The engine sends to its own server as ":port" (0.0.0.0), which Winsock won't
@@ -197,10 +213,16 @@ GUEST_IMPORT(NetDll_setsockopt) {
   int level = int(ARG32(5)), name = int(ARG32(6)), len = int(ARG32(8));
   uint32_t val = ARG32(7);
   char buf[16] = {};
-  if (level == SOL_SOCKET && name == SO_LINGER && len >= 4) {
+  if (level == 0xFFFF && name == 0x80 && len >= 4) {  // SOL_SOCKET, SO_LINGER (Windows numbers)
+#ifdef _WIN32
     u_short l[2] = {Ld16(val), Ld16(val + 2)};
     memcpy(buf, l, 4);
     len = 4;
+#else
+    linger l{Ld16(val), Ld16(val + 2)};
+    memcpy(buf, &l, sizeof(l));
+    len = sizeof(l);
+#endif
   } else if (len == 4) {
     uint32_t v = Ld32(val);
     memcpy(buf, &v, 4);
@@ -210,6 +232,12 @@ GUEST_IMPORT(NetDll_setsockopt) {
     len = std::min(len, int(sizeof(buf)));
     memcpy(buf, G(val), len);
   }
+#ifndef _WIN32
+  if (!posixnet::MapSockOpt(level, name)) {
+    RT_WARN("net: setsockopt(level %X, option %X): no such option here, ignored", int(ARG32(5)), int(ARG32(6)));
+    RETURN(0);
+  }
+#endif
   int r = ::setsockopt(Host(ARG32(4)), level, name, buf, len);
   if (r != 0) {
     // Xbox-only options (e.g. 0x5801 SO_NONBLOCK-style, VDP/security ones): ignore.
@@ -222,7 +250,14 @@ GUEST_IMPORT(NetDll_setsockopt) {
 GUEST_IMPORT(NetDll_getsockopt) {
   char buf[16] = {};
   int len = sizeof(buf);
-  int r = ::getsockopt(Host(ARG32(4)), int(ARG32(5)), int(ARG32(6)), buf, &len);
+  int level = int(ARG32(5)), name = int(ARG32(6));
+#ifndef _WIN32
+  if (!posixnet::MapSockOpt(level, name)) {
+    WSASetLastError(WSAENOPROTOOPT);
+    RETURN(Fail());
+  }
+#endif
+  int r = ::getsockopt(Host(ARG32(4)), level, name, buf, &len);
   if (r == 0 && ARG32(7) && ARG32(8)) {
     uint32_t room = Ld32(ARG32(8));
     if (len == 4 && room >= 4) {
@@ -300,11 +335,12 @@ GUEST_IMPORT(NetDll_select) {
     ptv = &tv;
   }
   int n = 0;
-  if (r.fd_count + w.fd_count + e.fd_count == 0) {
+  uint32_t total = (ARG32(5) ? Ld32(ARG32(5)) : 0) + (ARG32(6) ? Ld32(ARG32(6)) : 0) + (ARG32(7) ? Ld32(ARG32(7)) : 0);
+  if (total == 0) {
     // Winsock rejects empty sets; the console just waits.
     if (ptv) std::this_thread::sleep_for(std::chrono::microseconds(tv.tv_sec * 1000000ll + tv.tv_usec));
   } else {
-    n = ::select(0, ARG32(5) ? &r : nullptr, ARG32(6) ? &w : nullptr, ARG32(7) ? &e : nullptr, ptv);
+    n = ::select(kSelectNfds, ARG32(5) ? &r : nullptr, ARG32(6) ? &w : nullptr, ARG32(7) ? &e : nullptr, ptv);
     if (n < 0) RETURN(Fail());
   }
   FdsToGuest(r, ARG32(5));
@@ -586,7 +622,7 @@ void StartPending(PendingRecv p) {
       FD_SET(p.s, &r);
       FD_SET(p.s, &e);
       timeval tv{1, 0};
-      int n = ::select(0, &r, nullptr, &e, &tv);
+      int n = ::select(kSelectNfds, &r, nullptr, &e, &tv);
       if (n == 0) continue;
       int err = 0, got = n < 0 ? (err = WSAGetLastError(), -1) : RecvInto(p.s, p.bufs, p.count, p.from, p.from_len, &err);
       if (got < 0 && err == WSAEWOULDBLOCK) continue;

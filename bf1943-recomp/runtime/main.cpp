@@ -10,12 +10,17 @@ namespace xe::gpu::scenefx { void Configure(const char* settings); }  // xenia g
 
 #include "../tools/msvc_compat/crash_diag.h"  // symbolised stack on crash
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <timeapi.h>
+#else
+#include <arpa/inet.h>
+#include <csignal>
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -23,13 +28,11 @@ namespace xe::gpu::scenefx { void Configure(const char* settings); }  // xenia g
 
 using namespace rt;
 
-static LONG WINAPI GuestFaultReporter(EXCEPTION_POINTERS* ep) {
-  auto* rec = ep->ExceptionRecord;
-  if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
-    auto addr = reinterpret_cast<uint8_t*>(rec->ExceptionInformation[1]);
+// A fault in guest memory: what and where, with the guest registers.
+static void ReportGuestFault(uint8_t* addr, bool write) {
     if (addr >= g_base && addr < g_base + PPC_MEMORY_SIZE + 0x10000) {
       RT_ERROR("guest memory fault: %s of guest address %08llX (thread %u)",
-               rec->ExceptionInformation[0] ? "write" : "read", uint64_t(addr - g_base),
+               write ? "write" : "read", (unsigned long long)(addr - g_base),
                CurrentThreadId());
       RT_ERROR("  page %scommitted; physical heap %X in use, virtual heap %X in use",
                IsCommitted(uint32_t(addr - g_base)) ? "" : "not ", g_physical_heap->used_bytes(),
@@ -44,16 +47,30 @@ static LONG WINAPI GuestFaultReporter(EXCEPTION_POINTERS* ep) {
                    i + 2, r[i + 2]->u32, i + 3, r[i + 3]->u32);
         for (const PPCRegister* reg : {&c->r3, &c->r30, &c->r31}) {
           uint32_t a = reg->u32 & ~3u;
-          if (a < 0x10000 || IsBadReadPtr(g_base + a, 64)) continue;
+          if (a < 0x10000 || !IsCommitted(a) || !IsCommitted(a + 63)) continue;
           RT_ERROR("  [%08X] %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X", a,
                    Ld32(a), Ld32(a + 4), Ld32(a + 8), Ld32(a + 12), Ld32(a + 16), Ld32(a + 20),
                    Ld32(a + 24), Ld32(a + 28), Ld32(a + 32), Ld32(a + 36), Ld32(a + 40), Ld32(a + 44));
         }
       }
     }
-  }
+}
+#ifdef _WIN32
+static LONG WINAPI GuestFaultReporter(EXCEPTION_POINTERS* ep) {
+  auto* rec = ep->ExceptionRecord;
+  if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
+    ReportGuestFault(reinterpret_cast<uint8_t*>(rec->ExceptionInformation[1]), rec->ExceptionInformation[0] != 0);
   return EXCEPTION_CONTINUE_SEARCH;
 }
+#else
+// Linux: report, then let the default action end the process (core dump).
+static void GuestFaultSignal(int sig, siginfo_t* info, void*) {
+  ReportGuestFault(static_cast<uint8_t*>(info->si_addr), false);
+  bf_crash_diag::PrintStack(nullptr);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+#endif
 
 // "12:start,15.5:a,20:down,30:back*3,40:ly+*2" -> scripted virtual pad presses
 // (held 150 ms, or the seconds after '*'). Sticks: lx+ lx- ly+ ly- rx+ rx- ry+
@@ -100,6 +117,11 @@ void rt::LaunchBots() {
   static bool launched = false;
   if (launched || !g_bot_count) return;
   launched = true;
+#ifndef _WIN32
+  RT_WARN("bots: not on Linux yet (--bots %d ignored)", g_bot_count);
+  StartBotDirector(g_bot_count);
+}
+#else
   std::string ai = StartBotDirector(g_bot_count);
   HANDLE job = CreateJobObjectW(nullptr, nullptr);
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
@@ -133,6 +155,7 @@ void rt::LaunchBots() {
     ::CloseHandle(out);
   }
 }
+#endif
 
 int main(int argc, char** argv) {
   g_argv.assign(argv, argv + argc);
@@ -279,9 +302,13 @@ int main(int argc, char** argv) {
       std::filesystem::path table;
       if (i + 1 < argc && std::strncmp(argv[i + 1], "--", 2)) table = argv[++i];
       else {
+#ifdef _WIN32
         wchar_t exe[MAX_PATH];
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         table = std::filesystem::path(exe).parent_path() / "pbr_shaders.txt";
+#else
+        table = std::filesystem::canonical("/proc/self/exe").parent_path() / "pbr_shaders.txt";
+#endif
       }
       RT_INFO("pbr: %zu shaders", xe::gpu::pbr::Load(std::filesystem::absolute(table)));
     }
@@ -333,7 +360,16 @@ int main(int argc, char** argv) {
   g_user_root = std::filesystem::absolute(g_user_root);
   std::filesystem::create_directories(g_user_root);
   rt::pcset::Load();  // pc_settings.cpp: the PC settings page's saved choices
+#ifdef _WIN32
   AddVectoredExceptionHandler(1, GuestFaultReporter);
+#else
+  struct sigaction sa{};
+  sa.sa_sigaction = GuestFaultSignal;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGSEGV, &sa, nullptr);
+  sigaction(SIGBUS, &sa, nullptr);
+  signal(SIGPIPE, SIG_IGN);  // a closed socket must not end the server
+#endif
 
   if (!MemoryInit()) Fatal("could not reserve the 4 GB guest address space");
   RT_INFO("guest memory at %p, game root %s", g_base, g_game_root.string().c_str());

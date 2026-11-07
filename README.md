@@ -105,6 +105,10 @@ A dedicated server runs in a console window, with no graphics, and shows up in e
 bf1943.exe --game <your game files> --dedicated --name "My Server" --maps Wake_island_s,Iwo_Jima_s --bots 4
 ```
 
+**Linux server (experimental):** a native Linux build of the dedicated server
+(`bf1943_server`) is written but hasn't been built or tested yet. See
+[the developer guide](docs/DEVELOPERS.md) to try it.
+
 To join a server that isn't on your network: **Join Game → Address**, or start the game with
 `--join <address> --host-map <its map>`.
 

@@ -4,9 +4,14 @@
 #include "kernel.h"
 #include "xenia_bridge.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include "posix_files.h"  // the Win32 file calls below, on POSIX
+#define GetLastError() GetLastErrorFile()
+#endif
 
 #include <algorithm>
 #include <mutex>
@@ -17,6 +22,7 @@ namespace rt {
 std::filesystem::path g_game_root;
 std::filesystem::path g_user_root;
 std::atomic<bool> g_in_menus{true};
+std::atomic<bool> g_mainmenu_open{false};  // set once the main menu (mainmenu-00) file is opened
 std::atomic<bool> g_level_menu{false};
 }  // namespace rt
 
@@ -174,7 +180,7 @@ uint32_t OpenFile(uint32_t handle_out, uint32_t access, uint32_t attrs, uint32_t
   // The front end's menus load mainmenu-00, a level loads reduced-level-00
   // (bf1943) or levels\<name>\level-00 (bfbc1).
   std::string low = Lower(guest);
-  if (low.find("\\menu\\main\\mainmenu-00.fbrb") != std::string::npos) g_in_menus = true;
+  if (low.find("\\menu\\main\\mainmenu-00.fbrb") != std::string::npos) g_in_menus = true, g_mainmenu_open = true;
   if (low.find("reduced-level-00.fbrb") != std::string::npos || low.find("\\level-00.fbrb") != std::string::npos) {
     g_in_menus = false;
     ApplyShadowSettings();

@@ -5,10 +5,14 @@
 #include "xenia_bridge.h"
 #include "pc_settings.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <xinput.h>
+#else
+#include "posix_input.h"  // XInput types, no pads; keyboard and mouse below are Windows-only
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -161,6 +165,7 @@ bool g_plane_mouse_invert = false;
 double g_test_mouse_at = 0;        // --test-mouse <s>: synthetic look input for tests
 }
 
+#ifdef _WIN32
 namespace {
 HWND OurForegroundWindow() {
   HWND w = GetForegroundWindow();
@@ -548,6 +553,18 @@ static void AddKeyboard(XINPUT_GAMEPAD& g) {
     if (held(pcset::kZoom) && !buttons_held && vehicle != kFlying) g.bLeftTrigger = 255;
   }
 }
+#else
+// Linux (the console server): no keyboard, mouse or window; the pad is the
+// scripted presses and the bots'.
+namespace rt { bool BotLookAxis(int axis, float& value); }  // bots.cpp
+namespace rt { std::atomic<bool> g_title_passed{false}; }  // declared in kernel.h
+bool rt::SimulatedKeyDown(int) { return false; }
+float rt::MouseLookAxis(int axis) {
+  if (float v; BotLookAxis(axis, v)) return v;
+  return 0.0f;
+}
+static void AddKeyboard(XINPUT_GAMEPAD&) {}
+#endif
 
 // Scripted presses (--press "12:start,15:a,30:back*3"): held 150 ms or as given.
 static void AddScripted(XINPUT_GAMEPAD& g) {

@@ -8,10 +8,14 @@
 #include "kernel.h"
 #include "lan.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include "posix_net.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -65,7 +69,11 @@ void Refresh() {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     BOOL yes = TRUE;
     setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char*)&yes, sizeof(yes));
+#ifdef _WIN32
     DWORD timeout = 200;
+#else
+    timeval timeout{0, 200000};
+#endif
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     sockaddr_in to{};
     to.sin_family = AF_INET;

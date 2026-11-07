@@ -100,3 +100,22 @@ Project code: as noted per directory. Third-party: XenonRecomp (MIT), Xenia (BSD
 VulkanMemoryAllocator (MIT), FFmpeg subset (LGPL-2.1), Arcadia (GPL-2.0).
 Fonts in `bf1943-recomp/data/fonts`: Stardos Stencil (SIL OFL 1.1), Special Elite (Apache 2.0).
 Battlefield is a trademark of Electronic Arts; this project is not affiliated with EA or DICE.
+
+## Linux dedicated server (written, not yet built)
+
+`bf1943-recomp/game/linux/CMakeLists.txt` builds `bf1943_server`: the recompiled game and the
+runtime with clang on Linux, without GPU, audio, window, PC menus or bots
+(`runtime/linux_server.cpp` has their stand-ins). The runtime's Windows calls have POSIX
+versions: memory (`mmap`/`mprotect`, the physical views through `memfd`), threads,
+files (`posix_files.h`, case-insensitive paths), sockets (`posix_net.h`, Winsock error
+codes and option numbers mapped), time and SHA-1 (`posix_compat.h`, `sha1.h`).
+
+```
+cmake -S bf1943-recomp/game/linux -B build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release       -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build/linux
+build/linux/bf1943_server --game <your dump> --dedicated --name "My Server" --maps Wake_island_s
+```
+
+Not built on Linux yet: expect compile errors to fix. Known gaps: no bots (shared memory and
+process launch), silent XMA (the stand-in reports every buffer consumed; the game's mixer
+may not like that), and no full Linux client (Vulkan presenter, input, audio).

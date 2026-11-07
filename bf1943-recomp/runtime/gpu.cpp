@@ -10,9 +10,11 @@
 #include "kernel.h"
 #include "xenia_bridge.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -382,6 +384,16 @@ std::vector<uint32_t> FindHealthObjects(const SoldierKind& kind) {
   std::vector<uint32_t> found;
   const uint32_t vtable = _byteswap_ulong(kind.part);
   // The heaps (0xC0000000 and up mirror 0xA0000000).
+#ifndef _WIN32
+  // Linux: committed pages, from the runtime's own record of them.
+  for (uint64_t a = 0x40000000; a < 0xC0000000ull; a += 0x1000) {
+    if (!IsCommitted(uint32_t(a))) continue;
+    const uint32_t* p = reinterpret_cast<const uint32_t*>(g_base + a);
+    for (uint32_t i = 0; i + 3 < 1024; ++i)
+      if (p[i] == vtable && HealthObject(uint32_t(a + i * 4 + 8), kind)) found.push_back(uint32_t(a + i * 4 + 8));
+  }
+  return found;
+#else
   for (uint64_t a = 0x40000000; a < 0xC0000000ull;) {
     MEMORY_BASIC_INFORMATION mi;
     if (!VirtualQuery(g_base + a, &mi, sizeof(mi))) break;
@@ -396,6 +408,7 @@ std::vector<uint32_t> FindHealthObjects(const SoldierKind& kind) {
     a = end;
   }
   return found;
+#endif
 }
 
 float HealthAt(uint32_t address) {

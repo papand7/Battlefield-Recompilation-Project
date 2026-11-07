@@ -8,11 +8,13 @@
 //            +0x68 tls_address, +0x14C thread_id
 #include "kernel.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -107,13 +109,21 @@ std::shared_ptr<GuestThread> NewThread(uint32_t stack_size, const char* name) {
 }
 
 void SetHostThreadName(const std::string& name) {
+#ifdef _WIN32
   std::wstring w(name.begin(), name.end());
   SetThreadDescription(GetCurrentThread(), w.c_str());
+#else
+  pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+#endif
 }
 
 void AttachHostThread(GuestThread& t) {
+#ifdef _WIN32
   ::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(), ::GetCurrentProcess(), &t.host,
                   THREAD_ALL_ACCESS, FALSE, 0);
+#else
+  (void)t;
+#endif
 }
 
 void ThreadMain(std::shared_ptr<GuestThread> t) {
@@ -194,6 +204,7 @@ uint32_t ResumeThread(GuestThread* t) {
   return uint32_t(prev);
 }
 
+#ifdef _WIN32
 // --dump-threads: native call stacks of every guest thread, symbolised from the
 // PDB, so a hang shows which recompiled sub_ functions each thread sits in.
 // Native call stack of a suspended-able thread, symbolised ("a < b < c").
@@ -349,6 +360,11 @@ void StartWriteWatch(uint32_t addr, uint32_t size, double at) {
     RT_INFO("watch: %08X+%u from %.1f s", addr, size, at);
   }).detach();
 }
+#else
+// --dump-threads and --watch-write are Windows debugging aids (DbgHelp, SEH).
+void DumpGuestThreads() { RT_WARN("--dump-threads: Windows only"); }
+void StartWriteWatch(uint32_t, uint32_t, double) { RT_WARN("--watch-write: Windows only"); }
+#endif
 
 }  // namespace rt
 

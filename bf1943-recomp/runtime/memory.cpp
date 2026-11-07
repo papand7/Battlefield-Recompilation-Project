@@ -1,9 +1,13 @@
 // Guest address space, guest heaps, logging and guest-call helpers.
 #include "guest.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 #include <bitset>
 #include <chrono>
@@ -31,6 +35,7 @@ std::bitset<(1ull << 32) / kPage>* g_committed = nullptr;  // one bit per 4 KB p
 // where D3D reads resources back through either. Pages are committed through
 // the 0xA0000000 view (SEC_RESERVE), which commits them for both.
 // (The 0xE0000000 view has a 4 KB offset on the console and is not mapped.)
+#ifdef _WIN32
 uint8_t* ReservePhysicalViews(uint64_t reserve) {
   using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
   using MapViewOfFile3Fn = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
@@ -62,13 +67,36 @@ uint8_t* ReservePhysicalViews(uint64_t reserve) {
   }
   return base;
 }
+#else
+// Linux: the whole range reserved (no access), then the 512 MB physical RAM as
+// one memfd mapped shared at both 0xA0000000 and 0xC0000000. Commit = make
+// pages readable and writable (the kernel backs them on first touch).
+uint8_t* ReservePhysicalViews(uint64_t reserve) {
+  constexpr uint64_t kPhys = 0x20000000;
+  void* p = mmap(nullptr, reserve, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (p == MAP_FAILED) return nullptr;
+  auto* base = static_cast<uint8_t*>(p);
+  int fd = memfd_create("guest-physical", 0);
+  if (fd < 0 || ftruncate(fd, off_t(kPhys)) != 0) {
+    RT_WARN("memory: no memfd, 0xC0000000 view unavailable");
+    return base;
+  }
+  for (uint64_t view : {0xA0000000ull, 0xC0000000ull})
+    if (mmap(base + view, kPhys, PROT_NONE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
+      RT_WARN("memory: physical view %llX not mapped", (unsigned long long)view);
+  close(fd);
+  return base;
+}
+#endif
 
 bool MemoryInit() {
   // 4 GB plus room after the top so a guest access that straddles 0xFFFFFFFF
   // does not touch host memory. Reserve only: pages are committed on demand.
   constexpr uint64_t kReserve = PPC_MEMORY_SIZE + 0x10000;
   g_base = ReservePhysicalViews(kReserve);
+#ifdef _WIN32
   if (!g_base) g_base = static_cast<uint8_t*>(VirtualAlloc(nullptr, kReserve, MEM_RESERVE, PAGE_NOACCESS));
+#endif
   if (!g_base) return false;
   if (reinterpret_cast<uintptr_t>(g_base) & 0x1F) return false;  // PPC_FUNC_PROLOGUE assumes it
   g_committed = new std::bitset<(1ull << 32) / kPage>();
@@ -108,9 +136,18 @@ void Commit(uint32_t guest, uint32_t size) {
     bool need = p <= last && !g_committed->test(p);
     if (need) continue;
     if (p > run) {
+#ifdef _WIN32
       if (!VirtualAlloc(g_base + run * kPage, (p - run) * kPage, MEM_COMMIT, PAGE_READWRITE))
+#else
+      if (mprotect(g_base + run * kPage, (p - run) * kPage, PROT_READ | PROT_WRITE) != 0)
+#endif
         Fatal("commit failed at %08llX (+%llX), error %lu", run * kPage, (p - run) * kPage,
-              GetLastError());
+              (unsigned long)GetLastError());
+#ifndef _WIN32
+      // The physical RAM's second view (0xC0000000) shows the same pages.
+      if (run * kPage >= 0xA0000000ull && run * kPage < 0xC0000000ull)
+        mprotect(g_base + run * kPage + 0x20000000ull, (p - run) * kPage, PROT_READ | PROT_WRITE);
+#endif
       for (uint64_t q = run; q < p; ++q) g_committed->set(q);
     }
     run = p + 1;
@@ -280,14 +317,12 @@ namespace rt {
 
 uint64_t HostTicksPerSecond() {
   static const uint64_t rate = [] {
-    LARGE_INTEGER f, a, b;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&a);
+    auto a = std::chrono::steady_clock::now();
     uint64_t t0 = __rdtsc();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    QueryPerformanceCounter(&b);
+    auto b = std::chrono::steady_clock::now();
     uint64_t t1 = __rdtsc();
-    double secs = double(b.QuadPart - a.QuadPart) / double(f.QuadPart);
+    double secs = std::chrono::duration<double>(b - a).count();
     uint64_t r = uint64_t(double(t1 - t0) / secs);
     g_bf_timebase_scale = double(kGuestTimebase) / double(r);
     return r;

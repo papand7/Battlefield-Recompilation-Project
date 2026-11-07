@@ -8,10 +8,12 @@
 
 #include <unordered_map>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <dbghelp.h>
+#endif
 #include "../tools/msvc_compat/crash_diag.h"
 #include <unordered_set>
 

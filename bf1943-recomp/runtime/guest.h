@@ -12,6 +12,8 @@
 #include <mutex>
 #include <string>
 
+#include "posix_compat.h"  // Win32 names on Linux (empty on Windows)
+
 namespace rt {
 
 // ---- guest memory ----------------------------------------------------------

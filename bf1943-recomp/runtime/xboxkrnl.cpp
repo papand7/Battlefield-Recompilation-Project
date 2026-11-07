@@ -2,10 +2,15 @@
 // time, module queries and the kernel data exports.
 #include "kernel.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <bcrypt.h>
+#else
+#include <immintrin.h>
+#include "sha1.h"
+#endif
 
 #include <chrono>
 #include <thread>
@@ -632,14 +637,21 @@ GUEST_IMPORT(ExGetXConfigSetting) {
 // XeCryptSha(in1, size1, in2, size2, in3, size3, out, out_size): SHA-1 of the three inputs.
 GUEST_IMPORT(XeCryptSha) {
   uint8_t digest[20] = {};
+  const uint32_t in[3][2] = {{ARG32(3), ARG32(4)}, {ARG32(5), ARG32(6)}, {ARG32(7), ARG32(8)}};
+#ifdef _WIN32
   BCRYPT_HASH_HANDLE h = nullptr;
   if (BCryptCreateHash(BCRYPT_SHA1_ALG_HANDLE, &h, nullptr, 0, nullptr, 0, 0) == 0) {
-    const uint32_t in[3][2] = {{ARG32(3), ARG32(4)}, {ARG32(5), ARG32(6)}, {ARG32(7), ARG32(8)}};
     for (auto& [p, n] : in)
       if (p && n) BCryptHashData(h, G<uint8_t>(p), n, 0);
     BCryptFinishHash(h, digest, 20, 0);
     BCryptDestroyHash(h);
   }
+#else
+  rt::Sha1 sha;
+  for (auto& [p, n] : in)
+    if (p && n) sha.Update(G<uint8_t>(p), n);
+  sha.Finish(digest);
+#endif
   if (ARG32(9)) memcpy(G(ARG32(9)), digest, std::min<uint32_t>(ARG32(10), 20));
   RETURN(0);
 }

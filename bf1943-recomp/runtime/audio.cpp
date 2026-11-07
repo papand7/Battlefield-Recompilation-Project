@@ -8,10 +8,12 @@
 #include "kernel.h"
 #include "xenia_bridge.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <timeapi.h>
+#endif
 
 #include <algorithm>
 #include <bit>

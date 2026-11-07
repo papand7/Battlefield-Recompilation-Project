@@ -90,4 +90,14 @@ inline const bool kInstalled = [] {
 }();
 
 }  // namespace bf_crash_diag
+#elif defined(__linux__) && defined(__cplusplus)
+// Linux: the native stack from glibc's backtrace (symbols with -rdynamic).
+#include <execinfo.h>
+namespace bf_crash_diag {
+inline void PrintStack(void*) {
+  void* frames[64];
+  int n = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, n, 2);
+}
+}  // namespace bf_crash_diag
 #endif
