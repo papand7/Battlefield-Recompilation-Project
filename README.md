@@ -23,6 +23,17 @@ Left: the game's own rendering (`--preset stock`, 1280×720). Right: this projec
 | ![Wake Island stock](docs/images/wake_before.jpg) | ![Wake Island enhanced](docs/images/wake_after.jpg) |
 | ![Iwo Jima stock](docs/images/iwo_before.jpg) | ![Iwo Jima enhanced](docs/images/iwo_after.jpg) |
 
+## Menus
+
+The game's own intro and title screen are kept; from the main menu on, the PC menus
+take over: a WW2 field-orders look (aged paper, olive drab, stencil and typewriter
+type), animated, for mouse, keyboard and controller alike.
+
+| | |
+|---|---|
+| ![Main menu](docs/images/menu_main.jpg) | ![Settings](docs/images/menu_settings.jpg) |
+| ![Host game](docs/images/menu_host.jpg) | ![Pause menu over the game](docs/images/menu_pause.jpg) |
+
 ## Features (Battlefield 1943)
 
 ### Port
@@ -59,20 +70,26 @@ Left: the game's own rendering (`--preset stock`, 1280×720). Right: this projec
 - **Vehicle keys**: W/S throttle and brake, A/D steering or rudder, arrow keys pitch and
   roll planes, separate **plane mouse sensitivity** and invert.
 - **PRESS ANY KEY** title; any key or mouse button starts.
-- **Mouse in menus**: hover highlights rows, click selects, right click or the Back prompt goes back.
-- **PC SETTINGS page** (Help & Options, or F10 anywhere): every graphics option and effect,
-  mouse, key bindings, multiplayer name; most apply live.
-- Trimmed **main menu** (online-only entries removed), HDR-friendly menu brightness.
+- **New main menu** (HOST GAME, JOIN GAME, SETTINGS, QUIT) replacing the game's: its
+  buttons call the game's own code directly (`hostMultiplayerLocal`), the game's front end
+  runs hidden underneath.
+- **New pause menu** (Esc / Start in a level: RESUME, SETTINGS, SUICIDE, QUIT TO MENU) over
+  the live game; suicide and quit work the game's own menu unseen behind a STAND BY screen.
+- **Settings** (also F10 anywhere): every graphics option and effect, mouse, plane mouse,
+  key bindings, multiplayer name; most apply live.
+- Menus answer the mouse (hover, click, right click = back), keyboard and controller
+  (D-pad / stick, A, B, LB/RB for pages); `BF_STOCK_MENUS=1` brings back the game's own.
 
 ### Multiplayer
 - **HOST GAME**: pick the map (Wake Island, Iwo Jima, Guadalcanal, Coral Sea air
   superiority) and bot count; no sign-in needed.
-- **JOIN GAME**: LAN server browser in the game's menu style, or join by address.
+- **JOIN GAME**: LAN server browser, or join by address.
 - **Bots**: AI players for hosted games (control-point strategy, combat, swimming ashore).
 - Optional EA-server emulator (`server/arcadia360`, Arcadia, GPL-2.0).
 
 ## Layout
 - `bf1943-recomp/runtime/`: the native host (kernel/XAM, memory, threads, input, network, PC menus, bots), shared with bfbc1.
+  The menus: `pc_settings.cpp` (screens and input), `pc_menu.cpp` (the look, GDI+ on its own thread).
 - `bf1943-recomp/thirdparty/xenia/`: the GPU backend with all render features (`gpu/vulkan/scene_fx*`, `gpu/shaders/`).
 - `bf1943-recomp/tools/`: XenonRecomp helpers, texture pack builder, menu patcher, PBR table generator.
 - `bf1943-recomp/launcher/`: the launcher.
@@ -81,4 +98,5 @@ Left: the game's own rendering (`--preset stock`, 1280×720). Right: this projec
 ## Licences
 Project code: as noted per directory. Third-party: XenonRecomp (MIT), Xenia (BSD-3),
 VulkanMemoryAllocator (MIT), FFmpeg subset (LGPL-2.1), Arcadia (GPL-2.0).
+Fonts in `bf1943-recomp/data/fonts`: Stardos Stencil (SIL OFL 1.1), Special Elite (Apache 2.0).
 Battlefield is a trademark of Electronic Arts; this project is not affiliated with EA or DICE.

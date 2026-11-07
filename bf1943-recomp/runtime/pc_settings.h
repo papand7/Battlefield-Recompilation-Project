@@ -4,6 +4,8 @@
 // PC SETTINGS) or with F10, drawn over the game (xgpu::SetOverlay).
 #pragma once
 
+#include <cstdint>
+
 // No <windows.h> here: kernel.h users include it after their own macros.
 struct HWND__;
 
@@ -27,6 +29,12 @@ void OpenHost();
 void OpenJoin();
 // Every pad poll (the game window in front, or null): F10, and the page's own
 // input while it is open. True while it is open (the game gets no input).
-bool Update(HWND__* window);
+// title_passed: the game has taken Start at its title screen (the main menu
+// comes up after it).
+bool Update(HWND__* window, bool title_passed);
+// The menus have the pad: the game gets none of it, only PuppetButtons (the
+// presses that work the game's own pause menu for suicide and quit).
+bool ControlsPad();
+uint16_t PuppetButtons();
 
 }  // namespace rt::pcset

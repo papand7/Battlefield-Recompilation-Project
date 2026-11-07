@@ -7,6 +7,7 @@
 #include <Xinput.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <string>
 
@@ -35,6 +36,8 @@ void SetBotSlot(const std::string&, int) {}
 bool BotLookAxis(int, float&) { return false; }
 bool AddBotInput(XINPUT_GAMEPAD&) { return false; }
 int LocalVehicle() { return kOnFoot; }
+bool CustomMenus() { return false; }
+int GameDialogs() { return 0; }
 }  // namespace rt
 
 
@@ -48,6 +51,7 @@ using namespace rt;
 GAME_PATCH(82181390) {
   uint32_t input = ctx.r4.u32, pad = ctx.r3.u32;
   __imp__sub_82181390(ctx, base);
+  { if (input < 8 && Ld32(pad + 8) == 1 && ctx.f1.f64 != 0.0) { static int nz = 0; if (nz++ < 40) RT_INFO("TEMP player axis in=%u f1=%f", input, ctx.f1.f64); } }
   if (input < 4 || input > 7 || Ld32(pad + 8) != 1) return;
   float v = MouseLookAxis(input >= 6);
   if (input & 1) v = -v;
@@ -88,3 +92,4 @@ GAME_PATCH(8228CCD8) {
   if (!g_vsync) ctx.r4.u64 = 0;
   __imp__sub_8228CCD8(ctx, base);
 }
+

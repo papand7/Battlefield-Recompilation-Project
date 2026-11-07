@@ -86,3 +86,5 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/xenia_gpu.cmake)
 # --pbr reads its shader table from next to the exe.
 add_custom_command(TARGET bf1943 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ROOT}/data/pbr_shaders.txt $<TARGET_FILE_DIR:bf1943>/pbr_shaders.txt)
+add_custom_command(TARGET bf1943 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory ${ROOT}/data/fonts $<TARGET_FILE_DIR:bf1943>/fonts)

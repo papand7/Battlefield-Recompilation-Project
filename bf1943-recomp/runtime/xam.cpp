@@ -186,14 +186,39 @@ bool TestKeyDown(int vk) {
     }
     return out;
   }();
-  if (keys.empty()) return false;
   double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  // BF_TEST_KEY_FILE: a file a test appends virtual keys to (one per line),
+  // each held 0.2 s from when it is read (checked every 50 ms).
+  static const char* file = std::getenv("BF_TEST_KEY_FILE");
+  if (file) {
+    static std::mutex m;
+    static std::vector<std::pair<double, int>> live;
+    static size_t offset = 0;
+    static double next_read = 0;
+    std::lock_guard l(m);
+    if (now >= next_read) {
+      next_read = now + 0.05;
+      if (FILE* f = std::fopen(file, "rb")) {
+        std::fseek(f, long(offset), SEEK_SET);
+        char line[64];
+        while (std::fgets(line, sizeof line, f)) {
+          if (!std::strchr(line, 10)) break;  // not written out yet (no newline)
+          offset += std::strlen(line);
+          if (int key = std::atoi(line)) live.emplace_back(now, key);
+        }
+        std::fclose(f);
+      }
+    }
+    for (const auto& [at, key] : live)
+      if (key == vk && now >= at && now < at + 0.2) return true;
+  }
+  if (keys.empty()) return false;
   for (const auto& [at, key] : keys) {
     if (key == vk && now >= at && now < at + 0.2) return true;
   }
   return false;
 }
-bool TestKeysActive() { return std::getenv("BF_TEST_KEY") != nullptr; }
+bool TestKeysActive() { return std::getenv("BF_TEST_KEY") != nullptr || std::getenv("BF_TEST_KEY_FILE") != nullptr; }
 bool Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0 || TestKeyDown(vk); }
 
 // Raw mouse movement, collected on a hidden message-only window.
@@ -315,6 +340,7 @@ MouseLook SampleMouse() {
 
 namespace rt { bool BotLookAxis(int axis, float& value); }  // bots.cpp
 static std::atomic<bool> g_local_flying{false};
+bool rt::SimulatedKeyDown(int vk) { return TestKeyDown(vk); }
 float rt::MouseLookAxis(int axis) {
   if (float v; BotLookAxis(axis, v)) return v;
   if (Down(VK_MENU) && g_test_mouse_at <= 0) return 0;
@@ -343,7 +369,7 @@ static void AddKeyboard(XINPUT_GAMEPAD& g) {
   if (buttons_held && !Down(VK_LBUTTON) && !Down(VK_RBUTTON)) buttons_held = false;
   menus_before = menus;
   // The PC settings page takes all input while it is open (F10 opens it).
-  bool page = pcset::Update(w);
+  bool page = pcset::Update(w, g_title_passed);
   bool free_cursor = Down(VK_MENU) || menus || page;
   CaptureCursor(w, w && !free_cursor && g_present);
   MouseLook look = SampleMouse();
@@ -555,6 +581,12 @@ GUEST_IMPORT(XamInputGetState) {
     AddKeyboard(s.Gamepad);
     AddScripted(s.Gamepad);
     AddBotInput(s.Gamepad);
+    // The PC menus are up (or working the game's pause menu): the game gets
+    // none of the pad, only the menus' own presses.
+    if (pcset::ControlsPad()) {
+      s.Gamepad = {};
+      s.Gamepad.wButtons = pcset::PuppetButtons();
+    }
     // Like XInput, a new packet number only when the state changes: a held key
     // must not look like repeated presses (the scoreboard toggles on each one).
     static std::mutex m;

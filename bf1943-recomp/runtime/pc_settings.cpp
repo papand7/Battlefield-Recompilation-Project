@@ -10,10 +10,12 @@
 #include "xenia_bridge.h"
 #include "pbr_shaders.h"
 #include "lan.h"
+#include "pc_menu.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <Xinput.h>
 
 #include <algorithm>
 #include <chrono>
@@ -54,12 +56,13 @@ struct Setting {
   std::string text;                  // kText
   int button = 0;                    // kButton: what it does (Button)
   std::string address, map;          // kButton on the join page: the server
+  bool touched = false;              // changed on the page this run (only those go to the launcher)
 };
 enum Button { kHostStart = 1, kJoinServer, kJoinAddress, kRefresh };
 
 std::vector<Setting> g_settings;
 // HOST GAME and JOIN GAME use the page too (lan.cpp does the networking).
-enum Mode { kModeSettings, kModeHost, kModeJoin };
+enum Mode { kModeSettings, kModeHost, kModeJoin, kModeMain, kModePause };
 Mode g_mode = kModeSettings;
 std::vector<Setting> g_host_rows, g_join_rows;
 std::vector<Setting>& Page() {
@@ -312,7 +315,9 @@ void Save() {
   if (lp.empty()) return;
   auto json = ReadJson(lp);
   for (const Setting& s : g_settings) {
-    if (!s.launcher) continue;
+    // Only what was changed here: the rest of this run (its name, frame
+    // limit... from the command line) must not overwrite the launcher's.
+    if (!s.launcher || !s.touched) continue;
     if (s.kind == Kind::kText) {
       json[s.launcher] = JsonString(s.text);
     } else {
@@ -348,26 +353,46 @@ void ApplyLive() {
   g_plane_mouse_invert = Value("plane_invert") == "1";
 }
 
-// ---- drawing -----------------------------------------------------------------
+// ---- screens -----------------------------------------------------------------
+//
+// The look is pc_menu.cpp's; here each screen is described as a View. Main
+// menu (after the title screen, the game's own front end kept underneath and
+// never shown) and pause menu (Esc / Start in a level) are big entries on an
+// olive band; settings, host and join are lists.
 
-constexpr int kW = 1920, kH = 1080;
-constexpr COLORREF kKey = RGB(255, 0, 255);  // see-through (the game dimmed)
-constexpr COLORREF kGreen = RGB(112, 143, 82), kRow = RGB(236, 236, 236), kBlack = RGB(0, 0, 0),
-                   kWhite = RGB(255, 255, 255), kGrey = RGB(120, 120, 120);
-
-struct Layout {
-  RECT categories[kCategoryCount];
-  std::vector<std::pair<int, RECT>> rows;  // setting index, its row
-  RECT left_arrow[64], right_arrow[64];
-  RECT back_prompt{}, select_prompt{};
-  int first = 0;  // first visible row of the category
-};
-
-int g_category = 0, g_row = 0, g_focus = 0;  // focus 0 categories, 1 rows
+int g_category = 0, g_row = 0, g_focus = 0;  // focus 0 tabs, 1 rows
 int g_scroll = 0;
 bool g_capture = false, g_editing = false;
-Layout g_layout;
 std::wstring g_status;
+int g_button = 0;   // main / pause menu entry
+int g_page = 0;     // a new page slides in
+Mode g_back_to = kModeSettings;  // Back from a list: to the main or pause menu (kModeSettings: close)
+bool g_pad_used = false;
+bool g_suppress_main = false;    // a game is starting: no main menu until the next front end
+// The game's own pause menu, worked by pad presses under a STAND BY screen
+// (suicide, quit): its rows My Squad, Scoreboard, Help & Options,
+// Leaderboards, Achievements, Exit Game, Suicide; Exit and Suicide ask
+// "Are you sure?" (A = OK).
+struct Puppet {
+  bool on = false;
+  int row = 0, stage = 0;
+  double t0 = 0, press_until = 0, next_pulse = 0;
+  uint16_t press = 0;
+  int tries = 0;
+} g_puppet;
+constexpr int kExitGameRow = 5, kSuicideRow = 6;
+
+const std::vector<std::wstring> kMainButtons = {L"HOST GAME", L"JOIN GAME", L"SETTINGS", L"QUIT"};
+const std::vector<std::wstring> kMainNotes = {
+    L"Start a battle on your network. Pick the island and how many bots fight with you; "
+    L"others join you from JOIN GAME.",
+    L"Find a battle on your network, or type the address of one further away.",
+    L"Graphics, effects, mouse and key bindings, and your call sign.",
+    L"Leave the Pacific and return to the desktop."};
+const std::vector<std::wstring> kPauseButtons = {L"RESUME", L"SETTINGS", L"SUICIDE", L"QUIT TO MENU"};
+const std::vector<std::wstring> kPauseNotes = {
+    L"Back to the fight.", L"Graphics, effects, mouse and key bindings.",
+    L"Respawn at once, elsewhere.", L"Leave this battle for the main menu."};
 
 std::vector<int> RowsOf(int category) {
   std::vector<int> out;
@@ -379,6 +404,7 @@ std::vector<int> RowsOf(int category) {
     if (g_settings[i].category == category) out.push_back(int(i));
   return out;
 }
+bool IsList() { return g_mode == kModeSettings || g_mode == kModeHost || g_mode == kModeJoin; }
 
 std::wstring KeyName(int vk) {
   switch (vk) {
@@ -425,208 +451,69 @@ std::wstring ValueText(const Setting& s, bool selected) {
   return s.names[s.index];
 }
 
-HFONT Font(int height, int weight = FW_SEMIBOLD, bool italic = false) {
-  return CreateFontW(-height, 0, 0, 0, weight, italic, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS,
-                     CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH,
-                     L"Bahnschrift SemiBold Condensed");
-}
-
-void Fill(HDC dc, RECT r, COLORREF c) {
-  HBRUSH b = CreateSolidBrush(c);
-  FillRect(dc, &r, b);
-  DeleteObject(b);
-}
-void Frame(HDC dc, RECT r, COLORREF c, int width) {
-  for (int i = 0; i < width; ++i) {
-    HBRUSH b = CreateSolidBrush(c);
-    FrameRect(dc, &r, b);
-    DeleteObject(b);
-    InflateRect(&r, -1, -1);
-  }
-}
-void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, UINT format) {
-  SetTextColor(dc, c);
-  DrawTextW(dc, s.c_str(), int(s.size()), &r, format | DT_SINGLELINE | DT_NOPREFIX);
-}
-
-// A key cap like the game's prompts: a white rounded box with a black label.
-void KeyCap(HDC dc, int x, int y, const std::wstring& label, HFONT font) {
-  SelectObject(dc, font);
-  SIZE size{};
-  GetTextExtentPoint32W(dc, label.c_str(), int(label.size()), &size);
-  int w = std::max(44, int(size.cx) + 18);
-  HBRUSH b = CreateSolidBrush(kWhite);
-  HPEN p = CreatePen(PS_SOLID, 3, kBlack);
-  SelectObject(dc, b);
-  SelectObject(dc, p);
-  RoundRect(dc, x, y, x + w, y + 44, 12, 12);
-  DeleteObject(b);
-  DeleteObject(p);
-  RECT r{x, y, x + w, y + 44};
-  Text(dc, label, r, kBlack, DT_CENTER | DT_VCENTER);
-}
-
-// The prompt: a key cap and its label on a black plate, as clickable area.
-RECT Prompt(HDC dc, int x, int y, const std::wstring& key, const std::wstring& label, HFONT key_font,
-            HFONT font) {
-  SelectObject(dc, font);
-  SIZE size{};
-  GetTextExtentPoint32W(dc, label.c_str(), int(label.size()), &size);
-  SelectObject(dc, key_font);
-  SIZE ksize{};
-  GetTextExtentPoint32W(dc, key.c_str(), int(key.size()), &ksize);
-  int kw = std::max(44, int(ksize.cx) + 18);
-  RECT plate{x - 8, y - 6, x + kw + 16 + size.cx + 14, y + 50};
-  Fill(dc, plate, kBlack);
-  KeyCap(dc, x, y, key, key_font);
-  SelectObject(dc, font);
-  RECT t{x + kw + 12, y, plate.right, y + 44};
-  Text(dc, label, t, kWhite, DT_LEFT | DT_VCENTER);
-  return plate;
-}
-
-std::vector<uint8_t> Render() {
-  BITMAPINFO bi{};
-  bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-  bi.bmiHeader.biWidth = kW;
-  bi.bmiHeader.biHeight = -kH;
-  bi.bmiHeader.biPlanes = 1;
-  bi.bmiHeader.biBitCount = 32;
-  void* bits = nullptr;
-  HDC dc = CreateCompatibleDC(nullptr);
-  HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-  HGDIOBJ old = SelectObject(dc, bmp);
-  SetBkMode(dc, TRANSPARENT);
-  RECT all{0, 0, kW, kH};
-  Fill(dc, all, kKey);
-
-  HFONT title = Font(120, FW_BOLD, true), sub = Font(52, FW_BOLD, true), row = Font(34),
-        key_font = Font(26), prompt = Font(34), desc = Font(30, FW_NORMAL);
-  // Heading: like the game's brush-stroke titles, on black.
-  RECT banner{120, 70, 860, 205};
-  Fill(dc, banner, kBlack);
-  SelectObject(dc, title);
-  Text(dc, g_mode == kModeHost ? L"HOST GAME!" : g_mode == kModeJoin ? L"JOIN GAME!" : L"PC SETTINGS!",
-       RECT{150, 70, 860, 205}, kWhite, DT_LEFT | DT_VCENTER);
-  RECT subbanner{520, 190, 1060, 262};
-  Fill(dc, subbanner, kBlack);
-  Frame(dc, subbanner, kWhite, 3);
-  SelectObject(dc, sub);
-  Text(dc, g_mode == kModeHost ? L"YOUR SERVER!" : g_mode == kModeJoin ? L"FIND A FIGHT!" : L"TUNE YOUR RIG!",
-       subbanner, kWhite, DT_CENTER | DT_VCENTER);
-
-  Layout& L = g_layout;
-  constexpr int kRowH = 48;
-  // Categories.
-  for (int c = 0; c < kCategoryCount; ++c) L.categories[c] = RECT{0, 0, 0, 0};
-  for (int c = 0; c < kCategoryCount && g_mode == kModeSettings; ++c) {
-    RECT r{170, 330 + c * kRowH, 640, 330 + (c + 1) * kRowH};
-    L.categories[c] = r;
-    bool sel = c == g_category;
-    Fill(dc, r, sel ? kGreen : kRow);
-    Frame(dc, r, kBlack, 2);
-    SelectObject(dc, row);
-    RECT t = r;
-    t.left += 18;
-    Text(dc, kCategoryNames[c], t, sel ? kWhite : kBlack, DT_LEFT | DT_VCENTER);
-  }
-  // Rows of the category.
-  std::vector<int> rows = RowsOf(g_category);
-  constexpr int kVisible = 11;
+void ClampScroll(int count) {
+  constexpr int kVisible = pcmenu::kVisibleRows;
   g_scroll = std::clamp(g_scroll, std::max(0, g_row - kVisible + 1), std::max(0, g_row));
-  g_scroll = std::clamp(g_scroll, 0, std::max(0, int(rows.size()) - kVisible));
-  L.rows.clear();
-  L.first = g_scroll;
-  for (int i = g_scroll; i < int(rows.size()) && i < g_scroll + kVisible; ++i) {
-    const Setting& s = Page()[rows[i]];
-    int y = 330 + (i - g_scroll) * kRowH;
-    RECT r{g_mode == kModeSettings ? 700 : 170, y, 1750, y + kRowH};
-    L.rows.push_back({rows[i], r});
-    bool sel = g_focus == 1 && i == g_row;
-    bool hi = i == g_row;
-    Fill(dc, r, sel ? kGreen : kRow);
-    Frame(dc, r, kBlack, 2);
-    SelectObject(dc, row);
-    COLORREF ink = sel ? kWhite : kBlack;
-    RECT t = r;
-    t.left += 18;
-    Text(dc, s.label, t, ink, DT_LEFT | DT_VCENTER);
-    // The value: arrows for a choice, between them the value.
-    RECT v{r.right - 480, y, r.right - 50, y + kRowH};
-    int k = int(L.rows.size()) - 1;
-    L.left_arrow[k] = RECT{r.right - 510, y, r.right - 450, y + kRowH};
-    L.right_arrow[k] = RECT{r.right - 60, y, r.right, y + kRowH};
-    if (s.kind == Kind::kChoice) {
-      Text(dc, L"◄", L.left_arrow[k], ink, DT_CENTER | DT_VCENTER);
-      Text(dc, L"►", L.right_arrow[k], ink, DT_CENTER | DT_VCENTER);
-    }
-    Text(dc, ValueText(s, hi), v, ink, DT_CENTER | DT_VCENTER);
-    if (s.restart) {
-      SelectObject(dc, key_font);
-      RECT tag{r.right - 650, y, r.right - 510, y + kRowH};
-      Text(dc, L"RESTART", tag, sel ? kWhite : kGrey, DT_RIGHT | DT_VCENTER);
-    }
-  }
-  // Scroll marks.
-  SelectObject(dc, row);
-  if (g_scroll > 0) Text(dc, L"▲", RECT{1700, 280, 1750, 328}, kWhite, DT_CENTER | DT_VCENTER);
-  if (g_scroll + kVisible < int(rows.size()))
-    Text(dc, L"▼", RECT{1700, 330 + kVisible * kRowH, 1750, 378 + kVisible * kRowH}, kWhite,
-         DT_CENTER | DT_VCENTER);
-  // Description of the selected row (or the status).
-  std::wstring d;
-  if (!g_status.empty()) d = g_status;
-  else if (g_focus == 1 && g_row < int(rows.size())) {
-    const Setting& s = Page()[rows[g_row]];
-    d = s.desc;
-    if (s.restart) d += L"  Applies when you start the game again.";
-  } else {
-    d = L"Choose a page. Changes are saved as you make them.";
-  }
-  RECT db{170, 880, 1750, 940};
-  Fill(dc, db, kBlack);
-  SelectObject(dc, desc);
-  RECT dt = db;
-  dt.left += 18;
-  Text(dc, d, dt, kWhite, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
-  // Prompts, bottom left, like the game's.
-  L.select_prompt = Prompt(dc, 110, 975, L"↵", L"SELECT", key_font, prompt);
-  L.back_prompt = Prompt(dc, L.select_prompt.right + 30, 975, L"⌫", L"BACK", key_font, prompt);
-  Prompt(dc, L.back_prompt.right + 30, 975, L"← →", L"CHANGE", key_font, prompt);
+  g_scroll = std::clamp(g_scroll, 0, std::max(0, count - kVisible));
+}
 
-  for (HFONT f : {title, sub, row, key_font, prompt, desc}) DeleteObject(f);
-  GdiFlush();
-  // To RGBA: the key colour is the dimmed game behind.
-  std::vector<uint8_t> out(size_t(kW) * kH * 4);
-  const uint32_t* px = static_cast<const uint32_t*>(bits);
-  float white = xgpu::HdrWhite();
-  uint8_t lut[256];
-  for (int i = 0; i < 256; ++i) {
-    if (white <= 0.0f) {
-      lut[i] = uint8_t(i);
-    } else {
-      // HDR10: gamma 2.2 at the game's white, then PQ.
-      double y = std::pow(i / 255.0, 2.2) * white / 10000.0;
-      double m = std::pow(y, 0.1593017578125);
-      double pq = std::pow((0.8359375 + 18.8515625 * m) / (1.0 + 18.6875 * m), 78.84375);
-      lut[i] = uint8_t(std::clamp(pq * 255.0 + 0.5, 0.0, 255.0));
-    }
+pcmenu::View BuildView() {
+  pcmenu::View v;
+  v.pad = g_pad_used;
+  v.page = g_page;
+  std::wstring sel = g_pad_used ? L"A" : L"ENTER", back = g_pad_used ? L"B" : L"ESC";
+  if (g_puppet.on) {
+    v.screen = pcmenu::Screen::kBusy;
+    v.desc = g_puppet.row == kExitGameRow ? L"Returning to headquarters" : L"Requesting a new deployment";
+    return v;
   }
-  for (size_t i = 0; i < size_t(kW) * kH; ++i) {
-    uint32_t c = px[i] & 0xFFFFFF;
-    uint8_t* o = &out[i * 4];
-    if (c == 0xFF00FF) {
-      o[0] = o[1] = o[2] = 0;
-      o[3] = 215;
-    } else {
-      o[0] = lut[(c >> 16) & 0xFF], o[1] = lut[(c >> 8) & 0xFF], o[2] = lut[c & 0xFF];
-      o[3] = 255;
-    }
+  if (g_mode == kModeMain || g_mode == kModePause) {
+    bool main = g_mode == kModeMain;
+    v.screen = pcmenu::Screen::kButtons;
+    v.opaque = main;
+    v.subtitle = main ? L"PACIFIC THEATRE - FIELD ORDERS" : L"IN THE FIELD - ORDERS PAUSED";
+    v.buttons = main ? kMainButtons : kPauseButtons;
+    v.button = g_button;
+    v.desc = (main ? kMainNotes : kPauseNotes)[g_button];
+    v.prompts = {{sel, L"SELECT"}};
+    if (!main) v.prompts.push_back({back, L"RESUME"});
+    return v;
   }
-  SelectObject(dc, old);
-  DeleteObject(bmp);
-  DeleteDC(dc);
-  return out;
+  v.screen = pcmenu::Screen::kList;
+  v.title = g_mode == kModeHost ? L"HOST GAME" : g_mode == kModeJoin ? L"JOIN GAME" : L"SETTINGS";
+  v.subtitle = g_mode == kModeHost   ? L"Your server, your island."
+               : g_mode == kModeJoin ? L"Find a fight on the network."
+                                     : L"Tune your rig, soldier.";
+  if (g_mode == kModeSettings) {
+    for (int c = 0; c < kCategoryCount; ++c) v.tabs.push_back(kCategoryNames[c]);
+    v.tab = g_category;
+    v.tab_focus = g_focus == 0;
+  }
+  std::vector<int> rows = RowsOf(g_category);
+  ClampScroll(int(rows.size()));
+  for (int i = g_scroll; i < int(rows.size()) && i < g_scroll + pcmenu::kVisibleRows; ++i) {
+    const Setting& s = Page()[rows[i]];
+    pcmenu::Row r;
+    r.label = s.label;
+    r.value = ValueText(s, i == g_row);
+    r.choice = s.kind == Kind::kChoice;
+    if (s.restart) r.tag = L"RESTART";
+    v.rows.push_back(r);
+  }
+  v.row = g_focus == 1 && g_row >= g_scroll && g_row < g_scroll + pcmenu::kVisibleRows ? g_row - g_scroll : -1;
+  v.more_above = g_scroll > 0;
+  v.more_below = g_scroll + pcmenu::kVisibleRows < int(rows.size());
+  if (!g_status.empty()) {
+    v.desc = g_status;
+  } else if (g_focus == 1 && g_row < int(rows.size())) {
+    const Setting& s = Page()[rows[g_row]];
+    v.desc = s.desc;
+    if (s.restart) v.desc += L"  Applies when you start the game again.";
+  } else {
+    v.desc = L"Choose a page. Changes are saved as you make them.";
+  }
+  v.prompts = {{sel, L"SELECT"}, {back, L"BACK"}, {g_pad_used ? L"LB RB" : L"< >", g_pad_used ? L"PAGE" : L"CHANGE"}};
+  return v;
 }
 
 // ---- input -------------------------------------------------------------------
@@ -637,12 +524,13 @@ bool g_prev[256] = {};
 bool g_wait_release = false;
 POINT g_last_mouse{-1, -1};
 
-bool Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+bool Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0 || SimulatedKeyDown(vk); }
 
 void Change(Setting& s, int dir) {
   if (s.kind != Kind::kChoice) return;
   int n = int(s.values.size());
   s.index = (s.index + dir + n) % n;
+  s.touched = true;
   if (g_mode == kModeSettings) {
     ApplyLive();
     Save();
@@ -652,6 +540,7 @@ void Change(Setting& s, int dir) {
 
 void Close();
 void BuildJoinRows();
+void OpenMode(Mode mode, Mode back_to);
 const std::string& PageValue(const char* key) {
   static const std::string none;
   for (const Setting& s : Page())
@@ -665,18 +554,24 @@ const std::string& PageText(const char* key) {
   return none;
 }
 
+// A game is starting: the menus give way to the game's loading screen.
+void StartingGame() {
+  g_suppress_main = true;
+  Close();
+}
+
 void Activate(Setting& s) {
   if (s.kind == Kind::kButton) {
     if (s.button == kHostStart) {
       lan::Host(PageValue("host_map"), std::atoi(PageValue("bots").c_str()));
-      Close();
+      StartingGame();
     } else if (s.button == kJoinServer) {
       lan::Join(s.address, s.map);
-      Close();
+      StartingGame();
     } else if (s.button == kJoinAddress) {
       if (!PageText("address").empty()) {
         lan::Join(PageText("address"), PageValue("join_map"));
-        Close();
+        StartingGame();
       }
     } else if (s.button == kRefresh) {
       lan::Refresh();
@@ -689,13 +584,121 @@ void Activate(Setting& s) {
   else g_editing = true, g_wait_release = true;
 }
 
+void StartPuppet(int row) {
+  g_puppet = Puppet{};
+  g_puppet.on = true;
+  g_puppet.row = row;
+  g_puppet.t0 = 0;
+  g_dirty = true;
+}
+
+// Main and pause menu entries.
+void PressButton() {
+  if (g_mode == kModeMain) {
+    switch (g_button) {
+      case 0: OpenMode(kModeHost, kModeMain); break;
+      case 1: OpenMode(kModeJoin, kModeMain); break;
+      case 2: OpenMode(kModeSettings, kModeMain); break;
+      case 3: TerminateProcess(GetCurrentProcess(), 0); break;
+    }
+  } else {
+    switch (g_button) {
+      case 0: Close(); break;
+      case 1: OpenMode(kModeSettings, kModePause); break;
+      case 2: StartPuppet(kSuicideRow); break;
+      case 3: StartPuppet(kExitGameRow); break;
+    }
+  }
+}
+
+// Back from a page: to the menu it came from, or closed.
+void GoBack() {
+  if (g_mode == kModeMain) return;  // the main menu stays
+  if (g_mode == kModePause) {
+    Close();
+    return;
+  }
+  if (g_mode == kModeSettings && g_focus == 1) {
+    g_focus = 0;
+    return;
+  }
+  if (g_mode == kModeSettings) Save();
+  if (g_back_to == kModeMain || g_back_to == kModePause) {
+    Mode to = g_back_to, from = g_mode;
+    g_mode = to;
+    g_button = to == kModePause ? 1 : from == kModeHost ? 0 : from == kModeJoin ? 1 : 2;
+    g_back_to = kModeSettings;
+    ++g_page;
+    g_status.clear();
+  } else {
+    Close();
+  }
+}
+
 void Close() {
   g_open = false;
   g_capture = g_editing = false;
   if (g_mode == kModeSettings) Save();
-  xgpu::SetOverlay(nullptr, 0, 0);
+  pcmenu::Hide();
   // The keys that closed the page must not reach the game.
   g_wait_release = true;
+}
+
+// One poll of the game's pause menu worked under the STAND BY screen.
+uint16_t PuppetStep(double now) {
+  Puppet& p = g_puppet;
+  if (!p.on) return 0;
+  if (p.t0 == 0) p.t0 = now;
+  if (now < p.press_until) return p.press;
+  float rows[32][4];
+  int selected = -1;
+  int count = xgpu::MenuRows(rows, 32, &selected);
+  auto press = [&](uint16_t b, double hold) {
+    p.press = b;
+    p.press_until = now + hold;
+    return b;
+  };
+  double t = now - p.t0;
+  switch (p.stage) {
+    case 0:  // open the game's menu (Start), until its seven rows are up
+      if (count == 7 && selected >= 0) {
+        p.stage = 1, p.t0 = now;
+        return 0;
+      }
+      if (t > 8) break;  // gave up
+      if (now >= p.next_pulse) {
+        // Start opens it in play; on the spawn screen Back (B) does.
+        p.next_pulse = now + 1.2;
+        return press(++p.tries % 2 ? XINPUT_GAMEPAD_START : XINPUT_GAMEPAD_B, 0.12);
+      }
+      return 0;
+    case 1:  // step to the row
+      if (t > 5) break;
+      if (count == 7 && selected == p.row) {
+        p.stage = 2, p.t0 = now;
+        return press(XINPUT_GAMEPAD_A, 0.12);
+      }
+      if (now >= p.next_pulse && selected >= 0) {
+        p.next_pulse = now + 0.12;
+        return press(selected < p.row ? XINPUT_GAMEPAD_DPAD_DOWN : XINPUT_GAMEPAD_DPAD_UP, 0.06);
+      }
+      return 0;
+    case 2:  // "Are you sure?": OK
+      if (t > 0.7) {
+        p.stage = 3, p.t0 = now;
+        return press(XINPUT_GAMEPAD_A, 0.12);
+      }
+      return 0;
+    case 3:
+      if (t > 0.6) break;
+      return 0;
+  }
+  // Done (or given up): the game carries on from there.
+  bool quit = p.row == kExitGameRow;
+  p = Puppet{};
+  if (quit) g_suppress_main = false;
+  Close();
+  return 0;
 }
 
 }  // namespace
@@ -762,41 +765,51 @@ void BuildJoinRows() {
   go.names = {L"GO!"};
   g_join_rows.push_back(go);
 }
-}  // namespace
 
-void Open() {
-  g_mode = kModeSettings;
+void OpenMode(Mode mode, Mode back_to) {
+  g_mode = mode;
+  g_back_to = back_to;
   g_open = true;
-  g_focus = 0;
   g_dirty = true;
   g_wait_release = true;
   g_status.clear();
+  g_row = 0, g_scroll = 0;
+  ++g_page;
+  if (mode == kModeSettings) {
+    g_focus = 0;
+  } else if (mode == kModeHost) {
+    g_host_rows.clear();
+    g_host_rows.push_back(Choice(kGraphics, "host_map", L"MAP", L"The battlefield.", kMapNames, kMaps, 0));
+    g_host_rows.push_back(Choice(kGraphics, "bots", L"BOTS",
+                                 L"Computer players that join your game (each runs as its own copy).",
+                                 {L"NONE", L"2", L"4", L"6", L"8", L"12", L"15"},
+                                 {"0", "2", "4", "6", "8", "12", "15"}, 0));
+    Setting start;
+    start.category = kGraphics, start.kind = Kind::kButton, start.key = "start", start.button = kHostStart;
+    start.label = L"START SERVER";
+    start.desc = L"Hosts the game on your network: others join it with JOIN GAME.";
+    start.names = {L"GO!"};
+    g_host_rows.push_back(start);
+    g_focus = 1;
+  } else if (mode == kModeJoin) {
+    lan::Refresh();
+    BuildJoinRows();
+    g_focus = 1;
+    g_status = L"Looking for games on your network...";
+  } else {
+    g_button = 0;
+  }
 }
+}  // namespace
 
-void OpenHost() {
-  g_mode = kModeHost;
-  g_host_rows.clear();
-  g_host_rows.push_back(Choice(kGraphics, "host_map", L"MAP", L"The battlefield.", kMapNames, kMaps, 0));
-  g_host_rows.push_back(Choice(kGraphics, "bots", L"BOTS",
-                               L"Computer players that join your game (each runs as its own copy).",
-                               {L"NONE", L"2", L"4", L"6", L"8", L"12", L"15"},
-                               {"0", "2", "4", "6", "8", "12", "15"}, 0));
-  Setting start;
-  start.category = kGraphics, start.kind = Kind::kButton, start.key = "start", start.button = kHostStart;
-  start.label = L"START SERVER";
-  start.desc = L"Hosts the game on your network: others join it with JOIN GAME.";
-  start.names = {L"GO!"};
-  g_host_rows.push_back(start);
-  g_open = true, g_focus = 1, g_row = 0, g_scroll = 0, g_dirty = true, g_wait_release = true;
-  g_status.clear();
-}
+void Open() { OpenMode(kModeSettings, g_open && g_mode == kModeMain ? kModeMain : kModeSettings); }
+void OpenHost() { OpenMode(kModeHost, kModeSettings); }
+void OpenJoin() { OpenMode(kModeJoin, kModeSettings); }
 
-void OpenJoin() {
-  g_mode = kModeJoin;
-  lan::Refresh();
-  BuildJoinRows();
-  g_open = true, g_focus = 1, g_row = 0, g_scroll = 0, g_dirty = true, g_wait_release = true;
-  g_status = L"Looking for games on your network...";
+bool ControlsPad() { return g_open || g_puppet.on || g_wait_release; }
+uint16_t PuppetButtons() {
+  using namespace std::chrono;
+  return PuppetStep(duration<double>(steady_clock::now().time_since_epoch()).count());
 }
 
 void Load() {
@@ -838,19 +851,76 @@ void Load() {
   ApplyLive();
 }
 
-bool Update(HWND__* window) {
+bool Update(HWND__* window, bool title_passed) {
+  using namespace std::chrono;
+  double now = duration<double>(steady_clock::now().time_since_epoch()).count();
   bool pressed[256] = {};
   for (int vk = 1; vk < 256; ++vk) {
-    bool d = window && Down(vk);
+    bool d = (window && (GetAsyncKeyState(vk) & 0x8000) != 0) || SimulatedKeyDown(vk);
     pressed[vk] = d && !g_prev[vk];
     g_prev[vk] = d;
   }
+  // The pad, read here too: menus answer it, the game doesn't see it.
+  XINPUT_STATE pad{};
+  bool have_pad = XInputGetState(0, &pad) == ERROR_SUCCESS;
+  static WORD pad_prev = 0;
+  static double repeat_at = 0;
+  static int repeat_dir = 0;
+  WORD pb = have_pad ? pad.Gamepad.wButtons : 0;
+  // Left stick as the D-pad.
+  if (have_pad) {
+    if (pad.Gamepad.sThumbLY > 16000) pb |= XINPUT_GAMEPAD_DPAD_UP;
+    if (pad.Gamepad.sThumbLY < -16000) pb |= XINPUT_GAMEPAD_DPAD_DOWN;
+    if (pad.Gamepad.sThumbLX > 16000) pb |= XINPUT_GAMEPAD_DPAD_RIGHT;
+    if (pad.Gamepad.sThumbLX < -16000) pb |= XINPUT_GAMEPAD_DPAD_LEFT;
+  }
+  WORD pad_pressed = pb & ~pad_prev;
+  pad_prev = pb;
+  // Held directions repeat.
+  const WORD kDirs = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT;
+  if (pad_pressed & kDirs) repeat_dir = pad_pressed & kDirs, repeat_at = now + 0.35;
+  else if ((pb & repeat_dir) && now >= repeat_at) pad_pressed |= repeat_dir, repeat_at = now + 0.09;
+  else if (!(pb & repeat_dir)) repeat_dir = 0;
+  if (pad_pressed) g_pad_used = true;
+  for (int vk = 1; vk < 256; ++vk)
+    if (pressed[vk]) g_pad_used = false;
+
+  // The game's pause menu being worked: nothing else.
+  if (g_puppet.on) {
+    if (g_dirty) pcmenu::Show(BuildView()), g_dirty = false;
+    return true;
+  }
+
+  // The main menu: once the title is past and the game's front end idle
+  // (no dialog up), in place of the game's.
+  if (!g_in_menus) g_suppress_main = false;
+  static double title_at = 0;
+  if (title_passed && title_at == 0) title_at = now;
+  int dialogs = GameDialogs();
+  if (dialogs < 0 && title_at > 0 && now - title_at > 6) dialogs = 0;  // never asked: none
+  if (CustomMenus() && !g_open && g_in_menus && title_passed && dialogs == 0 && !g_suppress_main) {
+    OpenMode(kModeMain, kModeSettings);
+    g_wait_release = false;
+  }
+  // A level loading under the main menu (or its pages): the game takes over.
+  if (g_open && !g_in_menus && g_mode != kModePause && g_back_to != kModePause && g_mode != kModeSettings) Close();
+  // In a level: Esc (the pause key) or Start opens the pause menu.
+  bool pause_key = false;
+  for (int slot = 0; slot < 2; ++slot)
+    if (int vk = Key(kMenu, slot); vk && pressed[vk]) pause_key = true;
+  if (CustomMenus() && !g_open && !g_in_menus && !g_wait_release &&
+      (pause_key || (pad_pressed & XINPUT_GAMEPAD_START))) {
+    OpenMode(kModePause, kModeSettings);
+    for (int vk = 1; vk < 256; ++vk) pressed[vk] = false;
+    pad_pressed = 0;
+  }
+
   if (!g_open) {
-    if (pressed[VK_F10]) Open();
+    if (pressed[VK_F10]) OpenMode(kModeSettings, kModeSettings);
     if (!g_open) {
-      // After closing: nothing until the keys are let go.
+      // After closing: nothing until the keys and buttons are let go.
       if (g_wait_release) {
-        bool any = false;
+        bool any = pb != 0;
         for (int vk = 1; vk < 256; ++vk) any |= g_prev[vk];
         if (any) return true;
         g_wait_release = false;
@@ -860,14 +930,15 @@ bool Update(HWND__* window) {
   }
   // Wait for the keys that opened the page (or a row) to be let go.
   if (g_wait_release) {
-    bool any = false;
+    bool any = (pb & ~kDirs) != 0;
     for (int vk = 1; vk < 256; ++vk) any |= g_prev[vk];
     if (any) {
-      if (g_dirty) xgpu::SetOverlay(Render().data(), kW, kH), g_dirty = false;
+      if (g_dirty) pcmenu::Show(BuildView()), g_dirty = false;
       return true;
     }
     g_wait_release = false;
     for (int vk = 1; vk < 256; ++vk) pressed[vk] = false;
+    pad_pressed = 0;
   }
   static bool was_browsing = false;
   if (g_mode == kModeJoin && was_browsing && !lan::Browsing()) {
@@ -880,8 +951,17 @@ bool Update(HWND__* window) {
   was_browsing = lan::Browsing();
   std::vector<int> rows = RowsOf(g_category);
   auto sel_setting = [&]() -> Setting* {
-    return g_row < int(rows.size()) ? &Page()[rows[g_row]] : nullptr;
+    return IsList() && g_row < int(rows.size()) ? &Page()[rows[g_row]] : nullptr;
   };
+  // Abstract navigation from keys and pad.
+  int dv = (pressed[VK_DOWN] || pressed['S'] || (pad_pressed & XINPUT_GAMEPAD_DPAD_DOWN)) -
+           (pressed[VK_UP] || pressed['W'] || (pad_pressed & XINPUT_GAMEPAD_DPAD_UP));
+  int dh = (pressed[VK_RIGHT] || pressed['D'] || (pad_pressed & XINPUT_GAMEPAD_DPAD_RIGHT)) -
+           (pressed[VK_LEFT] || pressed['A'] || (pad_pressed & XINPUT_GAMEPAD_DPAD_LEFT));
+  bool accept = pressed[VK_RETURN] || pressed[VK_SPACE] || (pad_pressed & XINPUT_GAMEPAD_A);
+  bool back = pressed[VK_ESCAPE] || pressed[VK_BACK] || (pad_pressed & (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_BACK)) ||
+              (g_mode == kModePause && (pad_pressed & XINPUT_GAMEPAD_START));
+  int dtab = ((pad_pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 1 : 0) - ((pad_pressed & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 1 : 0);
   bool changed = false;
   if (g_capture) {
     // The next key or button: bound (Esc cancels).
@@ -904,6 +984,7 @@ bool Update(HWND__* window) {
       changed = true;
       break;
     }
+    if (pad_pressed & XINPUT_GAMEPAD_B) g_capture = false, changed = true;
   } else if (g_editing) {
     Setting* s = sel_setting();
     bool shift = Down(VK_SHIFT);
@@ -915,6 +996,7 @@ bool Update(HWND__* window) {
         g_wait_release = true;
       } else if (vk == VK_BACK) {
         if (!s->text.empty()) s->text.pop_back();
+        s->touched = true;
       } else if (s->text.size() < 15) {
         char c = 0;
         if (vk >= 'A' && vk <= 'Z') c = char(shift ? vk : vk + 32);
@@ -922,86 +1004,97 @@ bool Update(HWND__* window) {
         else if (vk == VK_SPACE) c = ' ';
         else if (vk == VK_OEM_MINUS) c = shift ? '_' : '-';
         else if (vk == VK_OEM_PERIOD) c = '.';
-        if (c) s->text += c;
+        if (c) s->text += c, s->touched = true;
       }
       changed = true;
     }
+    if (pad_pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B)) g_editing = false, changed = true;
   } else {
-    // Mouse: hover, click, wheel.
+    // Mouse: hover, click.
     POINT cursor;
     RECT client;
-    int mouse_over_cat = -1, mouse_over_row = -1, mouse_arrow = 0;
-    bool over_back = false;
-    if (window && GetCursorPos(&cursor) && ScreenToClient(window, &cursor) &&
-        GetClientRect(window, &client) && client.right > 0 && client.bottom > 0) {
-      POINT p{LONG(cursor.x * kW / client.right), LONG(cursor.y * kH / client.bottom)};
+    int over_button = -1, over_tab = -1, over_row = -1, mouse_arrow = 0, over_prompt = -1;
+    if (window && GetCursorPos(&cursor) && ScreenToClient(window, &cursor) && GetClientRect(window, &client) &&
+        client.right > 0 && client.bottom > 0) {
+      int x = int(cursor.x * pcmenu::kW / client.right), y = int(cursor.y * pcmenu::kH / client.bottom);
       bool moved = cursor.x != g_last_mouse.x || cursor.y != g_last_mouse.y;
       g_last_mouse = cursor;
-      for (int c = 0; c < kCategoryCount; ++c)
-        if (PtInRect(&g_layout.categories[c], p)) mouse_over_cat = c;
-      for (size_t i = 0; i < g_layout.rows.size(); ++i) {
-        if (!PtInRect(&g_layout.rows[i].second, p)) continue;
-        mouse_over_row = g_layout.first + int(i);
-        if (PtInRect(&g_layout.left_arrow[i], p)) mouse_arrow = -1;
-        if (PtInRect(&g_layout.right_arrow[i], p)) mouse_arrow = 1;
-      }
-      over_back = PtInRect(&g_layout.back_prompt, p);
-      if (moved && mouse_over_cat >= 0 && (g_focus != 0 || g_category != mouse_over_cat)) {
-        g_focus = 0, g_category = mouse_over_cat, g_row = 0, g_scroll = 0, changed = true;
-      }
-      if (moved && mouse_over_row >= 0 && (g_focus != 1 || g_row != mouse_over_row)) {
-        g_focus = 1, g_row = mouse_over_row, changed = true;
+      if (g_mode == kModeMain || g_mode == kModePause) {
+        for (int i = 0; i < 4; ++i)
+          if (pcmenu::ButtonRect(i).Has(x, y)) over_button = i;
+        if (moved && over_button >= 0 && over_button != g_button) g_button = over_button, changed = true;
+        for (int i = 0; i < 2; ++i)
+          if (pcmenu::Rect{76 + i * 280, 985, 76 + i * 280 + 270, 1041}.Has(x, y)) over_prompt = i;
+      } else {
+        for (int c = 0; c < kCategoryCount && g_mode == kModeSettings; ++c)
+          if (pcmenu::TabRect(c).Has(x, y)) over_tab = c;
+        int visible = std::min(pcmenu::kVisibleRows, int(rows.size()) - g_scroll);
+        for (int i = 0; i < visible; ++i) {
+          if (!pcmenu::RowRect(i).Has(x, y)) continue;
+          over_row = g_scroll + i;
+          if (pcmenu::LeftArrowRect(i).Has(x, y)) mouse_arrow = -1;
+          if (pcmenu::RightArrowRect(i).Has(x, y)) mouse_arrow = 1;
+        }
+        for (int i = 0; i < 3; ++i)
+          if (pcmenu::PromptRect(i).Has(x, y)) over_prompt = i;
+        if (moved && over_tab >= 0 && (g_focus != 0 || g_category != over_tab))
+          g_focus = 0, g_category = over_tab, g_row = 0, g_scroll = 0, changed = true;
+        if (moved && over_row >= 0 && (g_focus != 1 || g_row != over_row)) g_focus = 1, g_row = over_row, changed = true;
       }
     }
     if (pressed[VK_LBUTTON]) {
-      if (over_back) {
-        if (g_focus == 1 && g_mode == kModeSettings) g_focus = 0;
-        else Close();
-      } else if (mouse_over_cat >= 0) {
-        g_category = mouse_over_cat, g_focus = 1, g_row = 0, g_scroll = 0;
-      } else if (mouse_over_row >= 0) {
-        g_focus = 1, g_row = mouse_over_row;
+      if (over_prompt == 1) back = true;
+      else if (over_prompt == 0) accept = true;
+      else if (over_button >= 0) g_button = over_button, accept = true;
+      else if (over_tab >= 0) g_category = over_tab, g_focus = 1, g_row = 0, g_scroll = 0, changed = true;
+      else if (over_row >= 0) {
+        g_focus = 1, g_row = over_row;
         if (Setting* s = sel_setting()) {
           if (mouse_arrow) Change(*s, mouse_arrow);
           else Activate(*s);
         }
+        changed = true;
       }
-      changed = true;
     }
-    if (pressed[VK_RBUTTON]) {
-      if (g_focus == 1 && g_mode == kModeSettings) g_focus = 0;
-      else Close();
-      changed = true;
-    }
-    if (pressed[VK_RETURN] || pressed[VK_SPACE]) {
-      if (g_focus == 0) g_focus = 1, g_row = 0, g_scroll = 0;
+    if (pressed[VK_RBUTTON]) back = true;
+    if (pressed[VK_F10] && g_mode == kModeSettings && g_back_to == kModeSettings) back = true, g_focus = 0;
+    if (accept) {
+      if (g_mode == kModeMain || g_mode == kModePause) PressButton();
+      else if (g_focus == 0) g_focus = 1, g_row = 0, g_scroll = 0;
       else if (Setting* s = sel_setting()) Activate(*s);
       changed = true;
-    }
-    if (pressed[VK_ESCAPE] || pressed[VK_BACK] || pressed[VK_F10]) {
-      if (g_focus == 1 && !pressed[VK_F10] && g_mode == kModeSettings) g_focus = 0;
-      else Close();
+    } else if (back) {
+      GoBack();
       changed = true;
-    }
-    int dv = (pressed[VK_DOWN] || pressed['S']) - (pressed[VK_UP] || pressed['W']);
-    int dh = (pressed[VK_RIGHT] || pressed['D']) - (pressed[VK_LEFT] || pressed['A']);
-    if (dv) {
-      if (g_focus == 0) g_category = (g_category + dv + kCategoryCount) % kCategoryCount, g_row = 0, g_scroll = 0;
-      else if (!rows.empty()) g_row = (g_row + dv + int(rows.size())) % int(rows.size());
-      changed = true;
-    }
-    if (dh) {
-      if (g_focus == 0 && dh > 0) g_focus = 1, g_row = 0, g_scroll = 0;
-      else if (g_focus == 1 && dh < 0 && sel_setting() && sel_setting()->kind != Kind::kChoice &&
-               g_mode == kModeSettings)
-        g_focus = 0;
-      else if (g_focus == 1 && sel_setting()) Change(*sel_setting(), dh);
-      changed = true;
+    } else {
+      if (g_mode == kModeMain || g_mode == kModePause) {
+        if (dv) g_button = (g_button + dv + 4) % 4, changed = true;
+      } else {
+        if (dtab && g_mode == kModeSettings) {
+          g_category = (g_category + dtab + kCategoryCount) % kCategoryCount, g_row = 0, g_scroll = 0;
+          changed = true;
+        }
+        if (dv) {
+          if (g_focus == 0) g_category = (g_category + dv + kCategoryCount) % kCategoryCount, g_row = 0, g_scroll = 0;
+          else if (!rows.empty()) g_row = (g_row + dv + int(rows.size())) % int(rows.size());
+          changed = true;
+        }
+        if (dh) {
+          if (g_focus == 0 && dh > 0) g_focus = 1, g_row = 0, g_scroll = 0;
+          else if (g_focus == 0 && g_mode == kModeSettings)
+            g_category = (g_category + dh + kCategoryCount) % kCategoryCount, g_row = 0, g_scroll = 0;
+          else if (g_focus == 1 && dh < 0 && sel_setting() && sel_setting()->kind != Kind::kChoice &&
+                   g_mode == kModeSettings)
+            g_focus = 0;
+          else if (g_focus == 1 && sel_setting()) Change(*sel_setting(), dh);
+          changed = true;
+        }
+      }
     }
   }
-  if (!g_open) return true;
+  if (!g_open && !g_puppet.on) return true;
   if (changed || g_dirty) {
-    xgpu::SetOverlay(Render().data(), kW, kH);
+    pcmenu::Show(BuildView());
     g_dirty = false;
   }
   return true;

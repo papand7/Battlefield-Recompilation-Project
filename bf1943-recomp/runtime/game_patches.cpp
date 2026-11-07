@@ -3,6 +3,8 @@
 #include "kernel.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -128,11 +130,19 @@ GAME_PATCH(82413BC0) {
 // MaxFps getter) once the title is past: offline after the first numDialogs(0),
 // online once the Theater login has answered (g_online_ready, net.cpp).
 static uint32_t g_ui_manager;
+static std::atomic<int> g_dialogs{-1};
+bool rt::CustomMenus() {
+  // Not in the windowless bot copies; BF_STOCK_MENUS keeps the game's.
+  static const bool stock = std::getenv("BF_STOCK_MENUS") != nullptr;
+  return !stock && g_present;
+}
+int rt::GameDialogs() { return g_dialogs; }
 static int g_host_state;  // 0 = before startPressed, 1 = waiting, 2 = due, 3 = done
 GAME_PATCH(8246D918) {
   const char* name = G<char>(ctx.r4.u32);
   if (g_log_ui) RT_INFO("ui: %s(%s)", name, ctx.r5.u32 ? G<char>(ctx.r5.u32) : "");
   g_ui_manager = ctx.r3.u32;
+  if (!strcmp(name, "numDialogs") && ctx.r5.u32) g_dialogs = std::atoi(G<char>(ctx.r5.u32));
   if ((!g_host_map.empty() || !g_ui_call.empty()) && g_host_state < 2) {
     if (!strcmp(name, "startPressed")) g_host_state = 1;
     if (g_host_state == 1 && g_online_server.empty() && !strcmp(name, "numDialogs") && ctx.r5.u32 &&
