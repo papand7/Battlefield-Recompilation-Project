@@ -12,6 +12,9 @@
 #include "posix_input.h"
 #include "xenia_bridge.h"
 
+// Guest frames presented (VdSwap); the window title's fps on Windows.
+extern "C" std::atomic<uint64_t> g_title_swaps{0};
+
 // ---- GPU bridge: --toy-gpu (forced by --dedicated) never starts it ----------
 namespace rt::xgpu {
 bool Start(uint8_t*, bool, InterruptFn, uint32_t) { return false; }

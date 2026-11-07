@@ -9,7 +9,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#ifdef _WIN32
 #include <excpt.h>
+#endif
 #include <string>
 #include <thread>
 #include <vector>
@@ -234,11 +236,22 @@ static uint32_t FindSetting(PPCContext& ctx, uint8_t* base, uint32_t registry, u
   PPCContext c = ctx;
   c.r3.u64 = registry;
   c.r4.u64 = name;
+#ifdef _WIN32
   __try {
     sub_821F3248(c, base);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return 0;
   }
+#else
+  sigjmp_buf guard;
+  if (sigsetjmp(guard, 1) != 0) {
+    rt::g_fault_guard = nullptr;
+    return 0;
+  }
+  rt::g_fault_guard = &guard;
+  sub_821F3248(c, base);
+  rt::g_fault_guard = nullptr;
+#endif
   return c.r3.u32;
 }
 

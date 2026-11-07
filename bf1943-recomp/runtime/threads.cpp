@@ -435,6 +435,7 @@ GUEST_IMPORT(KeDelayExecutionThread) {
     int64_t us = -t / 10;
     if (us <= 0) {
       std::this_thread::yield();
+#ifdef _WIN32
     } else if (us < 2000) {
       thread_local HANDLE timer =
           CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -444,6 +445,7 @@ GUEST_IMPORT(KeDelayExecutionThread) {
         WaitForSingleObject(timer, INFINITE);
       else
         std::this_thread::sleep_for(std::chrono::microseconds(us));
+#endif
     } else {
       std::this_thread::sleep_for(std::chrono::microseconds(us));
     }

@@ -49,6 +49,7 @@ enum : DWORD {
   ERROR_HANDLE_EOF = 38, ERROR_FILE_EXISTS = 80, ERROR_ALREADY_EXISTS = 183,
 };
 enum GET_FILEEX_INFO_LEVELS { GetFileExInfoStandard };
+enum : DWORD { FILE_WRITE_DATA = 0x2, FILE_APPEND_DATA = 0x4 };  // guest access mask bits
 
 namespace posixfs {
 
@@ -173,6 +174,10 @@ inline BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER to, LARGE_INTEGER* now, DWO
   return 1;
 }
 inline BOOL CloseHandle(HANDLE h) { return close(FdOf(h)) == 0; }
+inline BOOL SetEndOfFile(HANDLE h) {
+  off_t at = lseek(FdOf(h), 0, SEEK_CUR);
+  return at >= 0 && ftruncate(FdOf(h), at) == 0;
+}
 
 inline BOOL GetFileAttributesExW(const char* path, GET_FILEEX_INFO_LEVELS, WIN32_FILE_ATTRIBUTE_DATA* d) {
   struct stat st{};

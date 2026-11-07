@@ -13,6 +13,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <x86intrin.h>
+#include <linux/futex.h>
+#include <setjmp.h>
+#include <strings.h>
 
 using DWORD = uint32_t;
 using HANDLE = void*;
@@ -63,6 +66,38 @@ inline BOOL SystemTimeToFileTime(const SYSTEMTIME* st, FILETIME* ft) {
   ft->dwLowDateTime = DWORD(v);
   ft->dwHighDateTime = DWORD(v >> 32);
   return 1;
+}
+
+// Thread names (SetThreadDescription(GetCurrentThread(), L"name")).
+inline HANDLE GetCurrentThread() { return nullptr; }
+inline long SetThreadDescription(HANDLE, const wchar_t* name) {
+  char n[16];
+  size_t i = 0;
+  for (; name[i] && i < 15; ++i) n[i] = char(name[i]);
+  n[i] = 0;
+  pthread_setname_np(pthread_self(), n);
+  return 0;
+}
+inline int _stricmp(const char* a, const char* b) { return strcasecmp(a, b); }
+
+// WaitOnAddress / WakeByAddressSingle (4-byte values) on a futex.
+inline BOOL WaitOnAddress(volatile void* address, void* compare, size_t size, DWORD ms) {
+  if (size != 4) {
+    sched_yield();
+    return 1;
+  }
+  timespec t{time_t(ms / 1000), long(ms % 1000) * 1000000L};
+  syscall(SYS_futex, address, FUTEX_WAIT_PRIVATE, *static_cast<uint32_t*>(compare), ms == 0xFFFFFFFFu ? nullptr : &t,
+          nullptr, 0);
+  return 1;
+}
+inline void WakeByAddressSingle(void* address) { syscall(SYS_futex, address, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0); }
+inline void WakeByAddressAll(void* address) { syscall(SYS_futex, address, FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, nullptr, nullptr, 0); }
+
+// A guarded call that may fault (SEH __try on Windows): the SIGSEGV handler
+// jumps back here while it is set (main.cpp).
+namespace rt {
+extern thread_local sigjmp_buf* g_fault_guard;
 }
 
 // MSVC byte-swap intrinsics.

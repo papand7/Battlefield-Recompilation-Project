@@ -63,8 +63,11 @@ static LONG WINAPI GuestFaultReporter(EXCEPTION_POINTERS* ep) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 #else
-// Linux: report, then let the default action end the process (core dump).
+// Linux: back to a guarded call (rt::g_fault_guard) if one is running; else
+// report, then let the default action end the process (core dump).
+thread_local sigjmp_buf* rt::g_fault_guard = nullptr;
 static void GuestFaultSignal(int sig, siginfo_t* info, void*) {
+  if (rt::g_fault_guard) siglongjmp(*rt::g_fault_guard, 1);
   ReportGuestFault(static_cast<uint8_t*>(info->si_addr), false);
   bf_crash_diag::PrintStack(nullptr);
   signal(sig, SIG_DFL);

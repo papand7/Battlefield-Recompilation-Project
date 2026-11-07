@@ -106,7 +106,7 @@ bf1943.exe --game <your game files> --dedicated --name "My Server" --maps Wake_i
 ```
 
 **Linux server (experimental):** a native Linux build of the dedicated server
-(`bf1943_server`) is written but hasn't been built or tested yet. See
+(`bf1943_server`) now builds, but hasn't been run on Linux yet. See
 [the developer guide](docs/DEVELOPERS.md) to try it.
 
 To join a server that isn't on your network: **Join Game → Address**, or start the game with

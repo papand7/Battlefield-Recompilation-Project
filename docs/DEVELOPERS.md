@@ -101,7 +101,7 @@ VulkanMemoryAllocator (MIT), FFmpeg subset (LGPL-2.1), Arcadia (GPL-2.0).
 Fonts in `bf1943-recomp/data/fonts`: Stardos Stencil (SIL OFL 1.1), Special Elite (Apache 2.0).
 Battlefield is a trademark of Electronic Arts; this project is not affiliated with EA or DICE.
 
-## Linux dedicated server (written, not yet built)
+## Linux dedicated server (builds; not yet run on Linux)
 
 `bf1943-recomp/game/linux/CMakeLists.txt` builds `bf1943_server`: the recompiled game and the
 runtime with clang on Linux, without GPU, audio, window, PC menus or bots
@@ -116,6 +116,14 @@ cmake --build build/linux
 build/linux/bf1943_server --game <your dump> --dedicated --name "My Server" --maps Wake_island_s
 ```
 
-Not built on Linux yet: expect compile errors to fix. Known gaps: no bots (shared memory and
+It also builds on Windows, cross-compiled with LLVM for Windows and a Debian sysroot:
+
+```
+python bf1943-recomp/tools/fetch_linux_sysroot.py bf1943-recomp/build/linux-sysroot
+cmake -S bf1943-recomp/game/linux -B bf1943-recomp/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release       -DCMAKE_TOOLCHAIN_FILE=bf1943-recomp/game/linux/cross-from-windows.cmake
+cmake --build bf1943-recomp/build/linux
+```
+
+That build compiles and links (an x86-64 ELF), but hasn't been run on Linux yet. Known gaps: no bots (shared memory and
 process launch), silent XMA (the stand-in reports every buffer consumed; the game's mixer
 may not like that), and no full Linux client (Vulkan presenter, input, audio).
