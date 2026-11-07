@@ -60,6 +60,10 @@ namespace {
 // Pack normal maps keep alpha at 254/255 or below; the raw view of every other
 // texture returns 1.
 constexpr float kPbrAlphaLimit = 0.998f;
+// Pack textures keep alpha in 191-253 (the height); a game texture whose alpha
+// is a mask or anything lower must not count as pack data (it was taken for
+// smooth metal: dirt turned into tinted mirrors).
+constexpr float kPbrAlphaMin = 189.5f / 255.0f;
 }  // namespace
 
 void SpirvShaderTranslator::ProcessInstructionBegin(uint32_t address) {
@@ -189,9 +193,11 @@ spv::Id SpirvShaderTranslator::PbrRoughness() {
   SpirvBuilder& b = *builder_;
   const spv::Id f1 = type_float_;
   spv::Id rm = LoadExtraRegister(0);
-  spv::Id has_pbr = b.createBinOp(spv::OpFOrdLessThan, b.makeBoolType(),
-                                  b.createCompositeExtract(rm, f1, 3),
-                                  b.makeFloatConstant(kPbrAlphaLimit));
+  spv::Id rm_alpha = b.createCompositeExtract(rm, f1, 3);
+  spv::Id has_pbr = b.createBinOp(
+      spv::OpLogicalAnd, b.makeBoolType(),
+      b.createBinOp(spv::OpFOrdLessThan, b.makeBoolType(), rm_alpha, b.makeFloatConstant(kPbrAlphaLimit)),
+      b.createBinOp(spv::OpFOrdGreaterThanEqual, b.makeBoolType(), rm_alpha, b.makeFloatConstant(kPbrAlphaMin)));
   // Without pack data: from the game's specular power, sqrt(sqrt(2/(n+2))).
   spv::Id fallback = b.makeFloatConstant(pbr_->rough);
   if (pbr_->pow.is_constant()) {
@@ -493,8 +499,10 @@ void SpirvShaderTranslator::EmitPbrLighting() {
 
   spv::Id rm = LoadExtraRegister(0);
   spv::Id rm_a = component(rm, 3);
-  spv::Id has_pbr = b.createBinOp(spv::OpFOrdLessThan, b.makeBoolType(), rm_a,
-                                  k(kPbrAlphaLimit));
+  spv::Id has_pbr = b.createBinOp(
+      spv::OpLogicalAnd, b.makeBoolType(),
+      b.createBinOp(spv::OpFOrdLessThan, b.makeBoolType(), rm_a, k(kPbrAlphaLimit)),
+      b.createBinOp(spv::OpFOrdGreaterThanEqual, b.makeBoolType(), rm_a, k(kPbrAlphaMin)));
   spv::Id rough = PbrRoughness();
   spv::Id metal = b.createTriOp(
       spv::OpSelect, f1, has_pbr,

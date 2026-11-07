@@ -1,102 +1,109 @@
 # Battlefield Recompilation Project
 
-Native Windows x64 ports of two Xbox 360 Battlefield games, built by statically
-recompiling their PowerPC code with [XenonRecomp](https://github.com/hedge-dev/XenonRecomp)
-and rendering through Vulkan with a modified [Xenia](https://github.com/xenia-project/xenia) GPU backend.
+**Battlefield 1943, running natively on PC.** The Xbox 360 classic, rebuilt to run on
+Windows at high frame rates and resolutions, with modern graphics, full mouse and keyboard
+controls, LAN multiplayer with bots, and a brand-new menu.
 
-| Project | Game | State |
-|---|---|---|
-| [`bf1943-recomp/`](bf1943-recomp/) | Battlefield 1943 (XBLA, v1.06) | Playable: all maps, LAN host/join, bots, full PC feature set |
-| [`bfbc1-recomp/`](bfbc1-recomp/) | Battlefield: Bad Company | In progress, shares the bf1943 runtime and renderer |
+Battlefield: Bad Company is next (work in progress).
 
-**No game files or recompiled game code are included.** Put your own dump in
-`bf1943-recomp/original/v106/` (and `bfbc1-recomp/original/`), then generate and build
-as described in [`bf1943-recomp/README.md`](bf1943-recomp/README.md).
+> You need your own copy of the game. Nothing from the game itself is included here.
 
-## Before / after
+---
 
-Left: the game's own rendering (`--preset stock`, 1280×720). Right: this project
-(`--preset enhanced`, HD/PBR texture pack, 2560×1440 with FSR; shown downscaled).
+## Default vs Ultra
 
-| Stock | Enhanced |
+Left: the game as it looked on Xbox 360. Right: Ultra, with everything turned on, in 4K.
+
+| Default | Ultra |
 |---|---|
-| ![Wake Island stock](docs/images/wake_before.jpg) | ![Wake Island enhanced](docs/images/wake_after.jpg) |
-| ![Iwo Jima stock](docs/images/iwo_before.jpg) | ![Iwo Jima enhanced](docs/images/iwo_after.jpg) |
+| ![Wake Island, default](docs/images/cmp_wake_default.jpg) | ![Wake Island, ultra](docs/images/cmp_wake_ultra.jpg) |
+| ![Iwo Jima, default](docs/images/cmp_iwo_default.jpg) | ![Iwo Jima, ultra](docs/images/cmp_iwo_ultra.jpg) |
+| ![Guadalcanal, default](docs/images/cmp_guadalcanal_default.jpg) | ![Guadalcanal, ultra](docs/images/cmp_guadalcanal_ultra.jpg) |
+| ![Coral Sea, default](docs/images/cmp_coral_default.jpg) | ![Coral Sea, ultra](docs/images/cmp_coral_ultra.jpg) |
 
-## Menus
+## The new menus
 
-The game's own intro and title screen are kept; from the main menu on, the PC menus
-take over: a WW2 field-orders look (aged paper, olive drab, stencil and typewriter
-type), animated, for mouse, keyboard and controller alike.
+A WW2 field-orders look, animated, and made for mouse, keyboard and controller alike.
+The original intro and title screen are kept.
 
 | | |
 |---|---|
 | ![Main menu](docs/images/menu_main.jpg) | ![Settings](docs/images/menu_settings.jpg) |
-| ![Host game](docs/images/menu_host.jpg) | ![Pause menu over the game](docs/images/menu_pause.jpg) |
+| ![Host a game](docs/images/menu_host.jpg) | ![Pause menu in battle](docs/images/menu_pause.jpg) |
 
-## Features (Battlefield 1943)
+---
 
-### Port
-- Static recompilation of the whole game to x64 (clang-cl), no emulated CPU.
-- Vulkan 1.3 renderer (Xenia's Xenos → SPIR-V translator, vendored and extended).
-- Audio through Xenia's XMA decoder (FFmpeg) and XAudio2.
-- Electron launcher: finds the game and texture pack, resolution, upscaling, shadows,
-  frame rate, window size, HD textures, PBR, look presets, HDR.
+## What you get
 
-### Graphics
-- **Resolution scale** 1–3× of 720p, **AMD FSR / CAS** upscaling and sharpening.
-- **Uncapped frame rate** (`--max-fps`, default 120) with the client simulation ticking at the same rate.
-- **HD texture pack** (`tools/texpack`) with **PBR materials**: GGX metal/roughness lighting,
-  roughness-blurred cube-map reflections, 16× anisotropic filtering.
-- **Parallax occlusion mapping** from height maps in the pack's normal maps.
-- **Ray-traced sun shadows** (Vulkan ray queries): every world mesh, multi-part vehicles,
-  alpha-tested foliage and the full terrain heightmap; casters off screen still cast.
-- **Screen-space sun shadows** on GPUs without ray tracing.
-- **Ray-traced bounce lighting (GI)** with a world-space colour cache and contact darkening.
-- **GTAO ambient occlusion**.
-- **Volumetric light shafts and height fog**, fog matched to the horizon sky.
-- **Volumetric clouds** with cloud shadows on the ground.
-- **Water**: wave refraction, foam along hulls and beaches, clear turquoise shallows,
-  sea and surface reflections.
-- **Muzzle-flash light** replaced by a short-range shadowed light (the game's lit the whole scene).
-- **Procedural surface detail**: grime, pebbles and cracks on bare ground.
-- **Larger shadow map** (1600², 300 m) and **4× vegetation draw distance**.
-- **HDR10 output** with adjustable paper white and peak.
-- **Looks**: stock, enhanced, toon, noir and WW2 newsreel film.
-- **Blood and gore** (optional): hit sprays, pools, bodies breaking apart on explosive kills.
+**Looks**
+- Up to **4K** (resolution scale 1×, 2× or 3×) with **AMD FSR** upscaling.
+- **High frame rates**: 60, 120, 144, 165, 240 or unlimited, and the game runs smoothly at them.
+- **HD texture pack** with realistic materials: metal shines, wood and rust look rough.
+- **Ray-traced shadows** (on GPUs that support it): every object, tree and hill casts a proper shadow, even from off screen.
+- **Ray-traced bounce light**, **ambient occlusion**, **light shafts and haze**, **volumetric clouds** and their shadows.
+- **Better water**: foam along ships and beaches, clear turquoise shallows, waves that bend what's below.
+- **Surface depth** (parallax) and small details like pebbles and cracks on bare ground.
+- **A realistic muzzle flash** that lights only what's near your gun.
+- **HDR** on HDR monitors.
+- **Looks**: Enhanced, Toon, Noir and WW2 newsreel film, or Stock for the original.
+- Optional **blood and gore**.
 
-### PC controls and menus
-- Full **mouse and keyboard**: raw mouse look, rebindable keys, controller still works.
-- **Vehicle keys**: W/S throttle and brake, A/D steering or rudder, arrow keys pitch and
-  roll planes, separate **plane mouse sensitivity** and invert.
-- **PRESS ANY KEY** title; any key or mouse button starts.
-- **New main menu** (HOST GAME, JOIN GAME, SETTINGS, QUIT) replacing the game's: its
-  buttons call the game's own code directly (`hostMultiplayerLocal`), the game's front end
-  runs hidden underneath.
-- **New pause menu** (Esc / Start in a level: RESUME, SETTINGS, SUICIDE, QUIT TO MENU) over
-  the live game; suicide and quit work the game's own menu unseen behind a STAND BY screen.
-- **Settings** (also F10 anywhere): every graphics option and effect, mouse, plane mouse,
-  key bindings, multiplayer name; most apply live.
-- Menus answer the mouse (hover, click, right click = back), keyboard and controller
-  (D-pad / stick, A, B, LB/RB for pages); `BF_STOCK_MENUS=1` brings back the game's own.
+**Plays**
+- Proper **mouse and keyboard**, every key rebindable; a controller works too.
+- **Vehicles on the keyboard**: W/S for throttle and brake, A/D to steer, arrow keys to fly planes,
+  and a separate plane mouse sensitivity.
+- **Host a game** on your network (pick the island and add **bots**) or **join** one from the
+  server browser. No account or sign-in needed.
+
+## Playing
+
+1. Have your own Battlefield 1943 (Xbox 360) game files.
+2. Build the game and launcher. This is a one-time step for now, as there is no ready-made
+   download yet; see [the developer guide](docs/DEVELOPERS.md).
+3. Start the **launcher**, point it at your game files, pick your settings and press **Play**.
+
+Everything can also be changed in game under **Settings** (or press **F10** at any time).
+
+### Controls (keyboard and mouse)
+
+| Action | Key |
+|---|---|
+| Move | W A S D |
+| Look / aim | Mouse |
+| Fire | Left mouse |
+| Zoom / aim down sights | Right mouse |
+| Jump | Space |
+| Crouch | Ctrl or C |
+| Sprint | Shift |
+| Reload | R |
+| Enter vehicle / use | E |
+| Knife | F or V |
+| Grenade | G or middle mouse |
+| Switch weapon | 1, 2 or mouse wheel |
+| Scoreboard | Tab (hold) |
+| Pause menu | Esc |
+| Settings | F10 |
+
+**In vehicles:** W accelerates, S brakes or reverses, A and D steer. **In planes:** W is the
+throttle, A and D the rudder, and the arrow keys or the mouse pitch and roll.
+
+All keys can be changed under **Settings → Keys**.
 
 ### Multiplayer
-- **HOST GAME**: pick the map (Wake Island, Iwo Jima, Guadalcanal, Coral Sea air
-  superiority) and bot count; no sign-in needed.
-- **JOIN GAME**: LAN server browser, or join by address.
-- **Bots**: AI players for hosted games (control-point strategy, combat, swimming ashore).
-- Optional EA-server emulator (`server/arcadia360`, Arcadia, GPL-2.0).
 
-## Layout
-- `bf1943-recomp/runtime/`: the native host (kernel/XAM, memory, threads, input, network, PC menus, bots), shared with bfbc1.
-  The menus: `pc_settings.cpp` (screens and input), `pc_menu.cpp` (the look, GDI+ on its own thread).
-- `bf1943-recomp/thirdparty/xenia/`: the GPU backend with all render features (`gpu/vulkan/scene_fx*`, `gpu/shaders/`).
-- `bf1943-recomp/tools/`: XenonRecomp helpers, texture pack builder, menu patcher, PBR table generator.
-- `bf1943-recomp/launcher/`: the launcher.
-- `bfbc1-recomp/`: Bad Company build files and game-specific code.
+- **Host Game**: choose Wake Island, Iwo Jima, Guadalcanal or Coral Sea (air battle) and how
+  many bots to add, then **Start Server**. Friends on your network see it in **Join Game**.
+- **Join Game**: games on your network show up by themselves; for one further away, type its address.
+- The host's firewall needs to let the game through (UDP ports 1003 and 19430).
 
-## Licences
-Project code: as noted per directory. Third-party: XenonRecomp (MIT), Xenia (BSD-3),
-VulkanMemoryAllocator (MIT), FFmpeg subset (LGPL-2.1), Arcadia (GPL-2.0).
-Fonts in `bf1943-recomp/data/fonts`: Stardos Stencil (SIL OFL 1.1), Special Elite (Apache 2.0).
-Battlefield is a trademark of Electronic Arts; this project is not affiliated with EA or DICE.
+## Good to know
+
+- Ray-traced effects need a GPU with ray tracing (for example NVIDIA RTX or AMD RX 6000 and newer).
+  Without it you still get everything else, with screen-space shadows instead.
+- Still being worked on: Bad Company, bots using vehicles, softer edges on ray-traced shadows
+  up close, and an occasional crash at 4K.
+
+---
+
+Battlefield is a trademark of Electronic Arts. This is a fan project, not affiliated with EA or DICE.
+How it works and how to build it: [docs/DEVELOPERS.md](docs/DEVELOPERS.md).

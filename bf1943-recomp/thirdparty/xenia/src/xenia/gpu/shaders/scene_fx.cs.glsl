@@ -1313,6 +1313,23 @@ void main() {
     float t = TraceMeshes(camera.xyz, dir, dist * 1.02 + 2.0, n);
     if (t > 0.0 && abs(t - dist) < 1.0 + 0.01 * dist) on_sea = false;
   }
+  // Nor bare ground at the sea's height (Guadalcanal's airfield took the
+  // sea's reflections): the terrain right at the pixel, not blue or
+  // turquoise (water drawn over the terrain in the shallows stays sea).
+  if (on_sea && rt.x > 0.0 && dist < 400.0) {
+    rayQueryEXT q;
+    float slack = 0.15 + 0.004 * dist;
+    rayQueryInitializeEXT(q, world_meshes, gl_RayFlagsOpaqueEXT, 0x02, camera.xyz,
+                          max(dist - slack, 0.0), dir, dist + slack);
+    while (rayQueryProceedEXT(q)) {
+    }
+    vec3 c = color.rgb / max(dot(color.rgb, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    bool cool = c.b > c.r * 1.05 || (c.g > c.r * 1.05 && c.b > c.r * 0.95);
+    // Water drawn with depth is blue or turquoise; anything else at the sea's
+    // height is ground or a deck (some ground, as that airfield, isn't in the
+    // traced terrain; grey shadowed dirt took the sea's reflections).
+    if (!cool) on_sea = false;
+  }
 #endif
   // The game's shading already darkens where its shadow map says shadow
   // (casters off screen included): add only where it says lit. strength.y
@@ -1399,7 +1416,12 @@ void main() {
       camera.y > sea_level && dir.y < -1e-4) {
     float t_surf = (sea_level - camera.y) / dir.y;
     // Seen through the water: depth well below the surface point.
-    bool below = has_depth && !on_sea && world.y < sea_level - 0.05 && dist > t_surf;
+    // Seabed seen through the water is tinted blue or turquoise; dry ground
+    // a little under the measured sea level (Guadalcanal's airfield) is not,
+    // and took the shallows' tint and foam (white-green, grainy).
+    vec3 cn = color.rgb / max(dot(color.rgb, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    bool through_water = cn.b > cn.r * 1.15 || (cn.g > cn.r * 1.15 && cn.b > cn.r);
+    bool below = has_depth && !on_sea && world.y < sea_level - 0.05 && dist > t_surf && through_water;
     bool surface = !has_depth || on_sea;
     if ((below || surface) && (t_surf < 400.0 || water_debug)) {
       vec3 p = camera.xyz + dir * t_surf;
@@ -1564,13 +1586,18 @@ void main() {
 #ifdef SCENE_FX_RT
   // Ray-traced sky and bounce light: the game's ambient share of the pixel's
   // light (the rest is the sun's where it reaches) scaled by what the rays saw.
+  // The colour before the bounce light: what the cache learns (storing the
+  // lit result fed the bounce back into itself each frame, and bare ground
+  // washed out to white, blotchy and grainy).
+  vec3 unbounced = color.rgb;
   if (gi.x > 0.0 && has_depth && !on_sea) {
     const vec3 lum = vec3(0.2126, 0.7152, 0.0722);
     float sun_l = dot(sun_color.rgb, lum) * max(n_dot_l, 0.0) * (own ? 1.0 : game_lit) *
                   (1.0 - occluded);
     float amb_l = dot(ambient.rgb, lum);
     float share = amb_l / max(sun_l + amb_l, 1e-4);
-    vec3 light = LightAt(local, dist);
+    // At most half again the game's ambient, at least a fifth of it.
+    vec3 light = clamp(LightAt(local, dist), vec3(0.2), vec3(1.5));
     if (debug == 10u) {
       imageStore(scene, ivec2(pixel), vec4(light * 0.5, color.a));
       return;
@@ -1583,7 +1610,7 @@ void main() {
   // quarter of the pixels each frame, in turn.
   if (gi.w >= 0.0 && rt.x > 0.0 && has_depth && !on_sea && (debug == 0u || debug == 12u) &&
       ((local.x & 1) | ((local.y & 1) << 1)) == (int(gi.w) & 3)) {
-    CacheStore(world, normal, color.rgb);
+    CacheStore(world, normal, unbounced);
   }
   if (debug == 12u && has_depth) {
     vec3 cached;
@@ -1595,9 +1622,12 @@ void main() {
   // --pbr material (smooth ones only: a mirror image on a rough one looks
   // like glass).
   if (rt.x > 0.0 && !sky && (debug == 0u || debug == 11u || debug == 13u)) {
-    bool water_surface = !has_depth || on_sea;
+    // Mirror images on the open sea only: ground at the sea's height (in
+    // shadow it looks as blue as water) took them for puddles.
+    bool water_surface = !has_depth;
+    vec2 refl_amount = on_sea ? vec2(0.0) : refl.xy;
     float rough = 1.0, metal = 0.0;
-    bool has_material = !water_surface && refl.y > 0.0 &&
+    bool has_material = !water_surface && refl_amount.y > 0.0 &&
                         MaterialAt(ivec2(pixel), dist, rough, metal);
     if (debug == 13u) {
       // Material: red smooth, green metal; grey none, blue water.
@@ -1610,8 +1640,11 @@ void main() {
     float facing = clamp(dot(n, -dir), 0.0, 1.0);
     float f0 = water_surface ? 0.02 : mix(0.04, 0.7, metal);
     float fresnel = f0 + (1.0 - f0) * pow(1.0 - facing, 5.0);
-    float amount = water_surface ? fresnel * refl.x
-                 : fresnel * refl.y * (1.0 - smoothstep(0.1, 0.4, rough));
+    float amount = water_surface ? fresnel * refl_amount.x
+                 : fresnel * refl_amount.y * (1.0 - smoothstep(0.1, 0.4, rough));
+    // Ground and floors facing up mirror nothing unless metal (dirt whose
+    // material read smooth reflected planes in red and white patches).
+    if (!water_surface && normal.y > 0.7 && metal < 0.5) amount = 0.0;
     // Metals tint what they reflect with their colour.
     const vec3 lum3 = vec3(0.2126, 0.7152, 0.0722);
     vec3 tint = mix(vec3(1.0), clamp(color.rgb / max(dot(color.rgb, lum3), 1e-3), 0.0, 2.0), metal);

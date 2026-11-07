@@ -893,6 +893,8 @@ bool Update(HWND__* window, bool title_passed) {
 
   // The main menu: once the title is past and the game's front end idle
   // (no dialog up), in place of the game's.
+  static bool first = true;
+  if (first) first = false, g_suppress_main = !g_host_map.empty();  // --host-map hosts by itself
   if (!g_in_menus) g_suppress_main = false;
   static double title_at = 0;
   if (title_passed && title_at == 0) title_at = now;

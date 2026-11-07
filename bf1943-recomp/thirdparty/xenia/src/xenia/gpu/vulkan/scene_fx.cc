@@ -473,7 +473,10 @@ bool CreatePipeline(const ui::vulkan::VulkanDevice* device) {
 
 void Configure(const char* text) {
   enabled = true;
-  settings = ParseSettings(text);
+  // Tests: BF_SCENE_FX_EXTRA ("debug=13,...") wins over the settings page's.
+  std::string all = text ? text : "";
+  if (const char* extra = std::getenv("BF_SCENE_FX_EXTRA")) all += std::string(",") + extra;
+  settings = ParseSettings(all.c_str());
   pbr::SetGameShadowsOff(settings.shadows > 0.0f);
 }
 

@@ -57,8 +57,9 @@ struct Settings {
   // 1: every sun shadow is drawn here, the game's own are off: the
   // ray-traced meshes and terrain, and the game's shadow map only for what
   // the rays do not have (soldiers, billboards). 0: the game's, plus the
-  // rays'. Key own_shadows.
-  float shadows = 1.0f;
+  // rays'. Key own_shadows. Default 0: redrawn unfiltered, the game's map
+  // shadows came out blocky and dotted at their edges.
+  float shadows = 0.0f;
   // Ray-traced light (with rt): what the world's meshes hit is coloured from
   // a world-space cache of what was seen on screen (cells of rt_cell metres).
   // Sky light and bounce light: rays over each surface's hemisphere, at half

@@ -153,6 +153,7 @@ GUEST_IMPORT(XamInputGetCapabilities) {
 // Hold Alt to free the mouse cursor.
 namespace rt {
 std::vector<ScriptedPress> g_scripted_presses;
+std::atomic<uint16_t> g_auto_buttons{0};  // held by the game-side automation (bfbc1_game.cpp), OR-ed into pad 0
 float g_mouse_sensitivity = 1.0f;  // --mouse-sens
 bool g_mouse_invert = false;       // --invert-mouse
 float g_plane_mouse_sensitivity = 1.0f;
@@ -357,7 +358,8 @@ float rt::MouseLookAxis(int axis) {
 
 // Set when the game reads the profile: Start was taken at the title screen.
 // (g_local_flying: in a plane, from the keyboard poll; read by mouse look.)
-static std::atomic<bool> g_title_passed{false};
+namespace rt { std::atomic<bool> g_title_passed{false}; }  // declared in kernel.h
+using rt::g_title_passed;
 
 static void AddKeyboard(XINPUT_GAMEPAD& g) {
   HWND w = OurForegroundWindow();
@@ -580,6 +582,7 @@ GUEST_IMPORT(XamInputGetState) {
     XINPUT_GAMEPAD before = s.Gamepad;
     AddKeyboard(s.Gamepad);
     AddScripted(s.Gamepad);
+    s.Gamepad.wButtons |= g_auto_buttons.load();
     AddBotInput(s.Gamepad);
     // The PC menus are up (or working the game's pause menu): the game gets
     // none of the pad, only the menus' own presses.
@@ -711,6 +714,16 @@ GUEST_IMPORT(XamUserCreateAchievementEnumerator) {
   Out32(ARG32(10), NewEmptyEnumerator());
   RETURN(ERROR_SUCCESS);
 }
+// XamCreateEnumeratorHandle(...) and XamGetPrivateEnumStructureFromHandle(handle, ...):
+// Bad Company's online lists use these; an empty enumerator, with its structure
+// returned as a zeroed block (count 0), keeps the list code from faulting.
+GUEST_IMPORT(XamCreateEnumeratorHandle) { RETURN(NewEmptyEnumerator()); }
+GUEST_IMPORT(XamGetPrivateEnumStructureFromHandle) {
+  uint32_t s = g_system_heap->Alloc(0x80);
+  memset(G(s), 0, 0x80);
+  RETURN(s);
+}
+
 // XamEnumerate(handle, flags, buffer, size, items_returned*, overlapped*)
 GUEST_IMPORT(XamEnumerate) {
   Out32(ARG32(7), 0);
