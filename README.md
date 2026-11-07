@@ -16,12 +16,11 @@ as described in [`bf1943-recomp/README.md`](bf1943-recomp/README.md).
 ## Before / after
 
 Left: the game's own rendering (`--preset stock`, 1280×720). Right: this project
-(`--preset enhanced`, HD/PBR texture pack, 2560×1440 with FSR).
+(`--preset enhanced`, HD/PBR texture pack, 2560×1440 with FSR; shown downscaled).
 
 | Stock | Enhanced |
 |---|---|
 | ![Wake Island stock](docs/images/wake_before.jpg) | ![Wake Island enhanced](docs/images/wake_after.jpg) |
-| ![Guadalcanal stock](docs/images/guadalcanal_before.jpg) | ![Guadalcanal enhanced](docs/images/guadalcanal_after.jpg) |
 | ![Iwo Jima stock](docs/images/iwo_before.jpg) | ![Iwo Jima enhanced](docs/images/iwo_after.jpg) |
 
 ## Features (Battlefield 1943)

@@ -17,7 +17,11 @@ function setStatus(text, error = false) {
   $('status').classList.toggle('error', error);
 }
 
+// Render scale is remembered per game: Bad Company's levels are heavy, so it starts at 1x.
+const gameScale = { bf1943: '2', bfbc1: '1' };
+
 function buildRows() {
+  $('rows').textContent = '';
   for (const [key, label, options] of rows) {
     const row = document.createElement('div');
     row.className = 'row';
@@ -42,7 +46,12 @@ function buildRows() {
 // Shows the chosen game's tab, logo and options.
 function selectGame(key) {
   const g = games[key];
+  if (settings.game && settings.game !== key) {  // keep the old game's scale, load the new one's
+    settings.scale = { ...settings.scale, [settings.game]: settings.resolution };
+  }
   settings.game = key;
+  settings.resolution = (settings.scale && settings.scale[key]) || gameScale[key];
+  buildRows();
   document.querySelectorAll('.game').forEach((t) => t.classList.toggle('on', t.dataset.game === key));
   $('year').textContent = key === 'bfbc1' ? 'BAD COMPANY' : '1943';
   $('year').classList.toggle('long', key === 'bfbc1');
@@ -59,7 +68,8 @@ async function init() {
   const state = await window.launcher.state();
   settings = state.settings;
   games = state.games;
-  buildRows();
+  // The saved render scale belongs to the game that was last played.
+  settings.scale = { ...settings.scale, [settings.game || 'bf1943']: settings.resolution };
 
   $('name').value = settings.name;
   $('blood').checked = !!settings.blood;
@@ -79,6 +89,7 @@ $('play').onclick = async () => {
   settings.textures = $('textures').checked;
   settings.blood = $('blood').checked;
   settings.hdr = $('hdr').checked;
+  settings.scale = { ...settings.scale, [settings.game]: settings.resolution };
   $('play').disabled = true;
   setStatus('Starting…');
   const result = await window.launcher.play(settings);
