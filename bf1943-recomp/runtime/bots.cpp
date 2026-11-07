@@ -26,10 +26,26 @@
 #include "kernel.h"
 #include "xenia_bridge.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <Xinput.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
+#include "posix_input.h"
+// Reads of our own memory that fail (instead of faulting) where nothing is mapped.
+using SIZE_T = size_t;
+inline HANDLE GetCurrentProcess() { return nullptr; }
+inline BOOL ReadProcessMemory(HANDLE, const void* addr, void* buf, size_t n, size_t* got) {
+  iovec local{buf, n}, remote{const_cast<void*>(addr), n};
+  ssize_t r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+  if (got) *got = r > 0 ? size_t(r) : 0;
+  return r == ssize_t(n);
+}
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -68,6 +84,23 @@ BotShared* g_shared = nullptr;
 int g_my_slot = -1;  // in a bot process
 
 BotShared* MapShared(const std::string& name, bool create) {
+#ifndef _WIN32
+  int fd = shm_open(name.c_str(), create ? O_CREAT | O_RDWR : O_RDWR, 0600);
+  if (fd < 0) return nullptr;
+  if (create && ftruncate(fd, sizeof(BotShared)) != 0) {
+    close(fd);
+    return nullptr;
+  }
+  void* m = mmap(nullptr, sizeof(BotShared), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (m == MAP_FAILED) return nullptr;
+  auto* p = static_cast<BotShared*>(m);
+  if (create) {
+    memset(p, 0, sizeof(*p));
+    p->magic = kMagic;
+  }
+  return p;
+#else
   HANDLE h = create ? CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
                                          sizeof(BotShared), name.c_str())
                     : OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name.c_str());
@@ -78,6 +111,7 @@ BotShared* MapShared(const std::string& name, bool create) {
     p->magic = kMagic;
   }
   return p;
+#endif
 }
 
 float LdF(uint32_t a) {
@@ -821,7 +855,11 @@ struct Director {
   }
 };
 
+#ifdef _WIN32
 std::string SharedName() { return "Local\\bf1943-bots-" + std::to_string(GetCurrentProcessId()); }
+#else
+std::string SharedName() { return "/bf1943-bots-" + std::to_string(GetCurrentProcessId()); }
+#endif
 
 // ---- the local player's vehicle (for the PC vehicle keys) -------------------
 //

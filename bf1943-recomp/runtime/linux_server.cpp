@@ -1,6 +1,6 @@
 // Linux console server: the parts the server does without, as no-ops. No GPU
 // (the toy GPU path only counts command packets), no audio device, no PC menus
-// or key icons, no bots yet (they need shared memory and process launch).
+// or key icons.
 // Built only on Linux; empty on Windows.
 #ifndef _WIN32
 
@@ -110,17 +110,5 @@ bool Update(HWND__*, bool) { return false; }
 bool ControlsPad() { return false; }
 uint16_t PuppetButtons() { return 0; }
 }  // namespace rt::pcset
-
-// ---- bots: Windows only for now ----------------------------------------------
-namespace rt {
-std::string StartBotDirector(int count) {
-  if (count) RT_WARN("bots: not on Linux yet; the server runs without them");
-  return {};
-}
-void SetBotSlot(const std::string&, int) {}
-bool BotLookAxis(int, float&) { return false; }
-bool AddBotInput(XINPUT_GAMEPAD&) { return false; }
-int LocalVehicle() { return kOnFoot; }
-}  // namespace rt
 
 #endif  // !_WIN32

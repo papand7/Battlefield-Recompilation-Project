@@ -1,5 +1,5 @@
 # Linux console server (bf1943_server): the recompiled game and the runtime,
-# without GPU, audio, window, PC menus or bots (runtime/linux_server.cpp has
+# without GPU, audio, window or PC menus (runtime/linux_server.cpp has
 # their stand-ins). Same generated/ppc as the Windows build (run XenonRecomp
 # on your own default.xex first, see the README).
 #
@@ -40,10 +40,10 @@ target_include_directories(bf1943_xexload PUBLIC ${XU} ${XT}/simde
   PRIVATE ${XT}/libmspack/libmspack/mspack ${XT}/tiny-AES-c ${XT}/TinySHA1)
 
 # The runtime minus what needs Windows (window, Vulkan presenter, XAudio2,
-# GDI menus, the bots' shared memory).
+# GDI menus).
 file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS ${ROOT}/runtime/*.cpp)
 list(REMOVE_ITEM RUNTIME_SOURCES
-  ${ROOT}/runtime/bots.cpp ${ROOT}/runtime/pc_settings.cpp ${ROOT}/runtime/pc_menu.cpp ${ROOT}/runtime/pc_ui.cpp)
+  ${ROOT}/runtime/pc_settings.cpp ${ROOT}/runtime/pc_menu.cpp ${ROOT}/runtime/pc_ui.cpp)
 set(STUBS ${CMAKE_CURRENT_BINARY_DIR}/import_stubs.cpp)
 add_custom_command(OUTPUT ${STUBS}
   COMMAND Python3::Interpreter ${ROOT}/tools/gen_import_stubs.py

@@ -104,7 +104,7 @@ Battlefield is a trademark of Electronic Arts; this project is not affiliated wi
 ## Linux dedicated server (builds; not yet run on Linux)
 
 `bf1943-recomp/game/linux/CMakeLists.txt` builds `bf1943_server`: the recompiled game and the
-runtime with clang on Linux, without GPU, audio, window, PC menus or bots
+runtime with clang on Linux, without GPU, audio, window or PC menus
 (`runtime/linux_server.cpp` has their stand-ins). The runtime's Windows calls have POSIX
 versions: memory (`mmap`/`mprotect`, the physical views through `memfd`), threads,
 files (`posix_files.h`, case-insensitive paths), sockets (`posix_net.h`, Winsock error
@@ -124,6 +124,6 @@ cmake -S bf1943-recomp/game/linux -B bf1943-recomp/build/linux -G Ninja -DCMAKE_
 cmake --build bf1943-recomp/build/linux
 ```
 
-That build compiles and links (an x86-64 ELF), but hasn't been run on Linux yet. Known gaps: no bots (shared memory and
-process launch), silent XMA (the stand-in reports every buffer consumed; the game's mixer
+That build compiles and links (an x86-64 ELF), but hasn't been run on Linux yet. Bots run as on Windows (shared memory
+through shm_open, bot copies by fork/exec, ending with the server). Known gaps: silent XMA (the stand-in reports every buffer consumed; the game's mixer
 may not like that), and no full Linux client (Vulkan presenter, input, audio).

@@ -20,6 +20,9 @@ namespace xe::gpu::scenefx { void Configure(const char* settings); }  // xenia g
 #else
 #include <arpa/inet.h>
 #include <csignal>
+#include <fcntl.h>
+#include <sys/prctl.h>
+#include <vector>
 #endif
 
 #include <algorithm>
@@ -121,8 +124,34 @@ void rt::LaunchBots() {
   if (launched || !g_bot_count) return;
   launched = true;
 #ifndef _WIN32
-  RT_WARN("bots: not on Linux yet (--bots %d ignored)", g_bot_count);
-  StartBotDirector(g_bot_count);
+  // Linux: fork + exec of this program; each bot ends with the server
+  // (PR_SET_PDEATHSIG), its output in <user>_botN/bot.log.
+  std::string ai = StartBotDirector(g_bot_count);
+  for (int i = 1; i <= g_bot_count; ++i) {
+    std::filesystem::path user = g_user_root.string() + "_bot" + std::to_string(i);
+    std::filesystem::create_directories(user);
+    std::vector<std::string> args = {g_argv[0], "--game", g_game_root.string(), "--user", user.string(), "--host",
+                                     "--toy-gpu", "--headless", "--port-offset", std::to_string(10 * i),
+                                     "--host-map", g_host_map, "--gamertag", "Bot" + std::to_string(i), "--press",
+                                     "15:start,20:start,25:a,58:a,61:a,64:a,67:a,70:a,75:a"};
+    if (!ai.empty()) {
+      args.insert(args.end(), {"--bot-ai", ai, "--bot-slot", std::to_string(i - 1)});
+    }
+    std::vector<char*> argv_c;
+    for (std::string& a : args) argv_c.push_back(a.data());
+    argv_c.push_back(nullptr);
+    std::string log = (user / "bot.log").string();
+    pid_t pid = fork();
+    if (pid == 0) {
+      prctl(PR_SET_PDEATHSIG, SIGTERM);
+      int fd = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (fd >= 0) dup2(fd, 1), dup2(fd, 2);
+      execv("/proc/self/exe", argv_c.data());
+      _exit(127);
+    }
+    if (pid > 0) RT_INFO("bots: started bot %d (log %s)", i, log.c_str());
+    else RT_WARN("bots: could not start bot %d", i);
+  }
 }
 #else
   std::string ai = StartBotDirector(g_bot_count);
