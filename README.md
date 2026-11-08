@@ -139,7 +139,7 @@ The same recompiler is being used for Battlefield: Bad Company (Xbox 360). Curre
 
 - Ray-traced effects need a GPU with ray tracing (for example NVIDIA RTX or AMD RX 6000 and newer).
   Without it you still get everything else, with screen-space shadows instead.
-- Still being worked on: Bad Company, hosting and joining in the new menus, bots in jeeps, tanks and planes (they already use the landing craft), softer edges on ray-traced shadows
+- Still being worked on: Bad Company, hosting and joining in the new menus, smarter bots (they take landing craft, jeeps, tanks and planes, but still get stuck on some shores and walls), softer edges on ray-traced shadows
   up close, and an occasional crash at 4K.
 
 ---

@@ -70,6 +70,7 @@ using botapi::Vec;
 using botapi::Vehicle;
 using botapi::Wrap;
 using botapi::Dist2D;
+using botapi::Dist3D;
 
 constexpr uint32_t kSoldierVtable = 0x82013A40;
 constexpr uint32_t kCapturePointVtable = 0x820190D0;
@@ -193,9 +194,52 @@ bool ReadVehicle(uint32_t o, Vehicle& v) {
   memcpy(v.kind, n, len);
   v.kind[len] = 0;
   v.pos = {LdF(body + 0xF0), LdF(body + 0xF4), LdF(body + 0xF8)};
-  // (A jeep or tank at a flag nobody holds yet waits at 0,0,0.)
+  // Jeeps, tanks, planes and guns don't keep it there (0,0,0): where it was
+  // made, *(+EC) + 310, is where it stands until someone moves it (and a
+  // seated bot's own position is its vehicle's).
+  if (v.pos.x == 0 && v.pos.y == 0 && v.pos.z == 0) {
+    uint32_t made = Ld32(o + 0xEC);
+    if (Readable(made)) v.pos = {LdF(made + 0x310), LdF(made + 0x314), LdF(made + 0x318)};
+  }
   if (v.pos.x == 0 && v.pos.y == 0 && v.pos.z == 0) return false;
   return std::isfinite(v.pos.x) && std::fabs(v.pos.x) < 1e5f;
+}
+
+// Scenarios: move a soldier. Its position lives in its physics (and copies
+// of it): every 16-byte aligned position vector where it stands (the
+// physics' format, within 5 cm) moves there. Done on the server, which has
+// the say (a move in the bot's own game is put back), and in the bot's game.
+size_t MoveVectorsNear(Vec pos, Vec to, const char* who) {
+  auto f = [](uint32_t raw) {
+    float v;
+    raw = _byteswap_ulong(raw);
+    memcpy(&v, &raw, 4);
+    return v;
+  };
+  std::vector<std::pair<uint32_t, Vec>> hits;
+  for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+    if (page >= 0x80000000 && page < 0xA0000000) continue;
+    if (!IsCommitted(uint32_t(page))) continue;
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(g_base + page);
+    for (int i = 0; i < 1024; i += 4) {
+      float x = f(w[i]), y = f(w[i + 1]), z = f(w[i + 2]);
+      if (std::fabs(x - pos.x) < 0.05f && std::fabs(z - pos.z) < 0.05f && std::fabs(y - pos.y) < 0.05f)
+        hits.push_back({uint32_t(page) + i * 4, Vec{x, y, z}});
+    }
+  }
+  static const bool trace = getenv("BF_TELEPORT_SCAN") != nullptr;
+  for (auto& [a, v] : hits) {
+    if (trace) RT_INFO("teleport (%s): %08X %.2f,%.2f,%.2f w %08X", who, a, v.x, v.y, v.z, Ld32(a + 12));
+    float t[3] = {to.x + v.x - pos.x, to.y + v.y - pos.y, to.z + v.z - pos.z};
+    for (int i = 0; i < 3; ++i) {
+      uint32_t u;
+      memcpy(&u, &t[i], 4);
+      St32(a + 4 * i, u);
+    }
+  }
+  RT_INFO("bots: teleport (%s): %zu position vectors near %.1f,%.1f,%.1f moved", who, hits.size(), pos.x, pos.y,
+          pos.z);
+  return hits.size();
 }
 
 // ---- the brain: built in, or bot_brain.dll reloaded when it changes ----------
@@ -260,6 +304,8 @@ struct Director {
   double probe_until = 0;
   float probe_dir = -1.0f;
   std::vector<std::pair<uint32_t, float>> probe_pitch;  // unmapped soldiers before the probe
+  struct Answer { Vec at; float yaw = 0; double since = 0; };
+  Answer answer[kMaxBots];  // each bot's soldier: where and which way it was, since when (told to move)
 
   // Reads the match; true when the flags changed.
   bool Refresh(bool rescan) {
@@ -319,10 +365,19 @@ struct Director {
   void Probe() {
     if (probe_slot >= 0) {
       if (now < probe_until) return;
+      if (getenv("BF_PROBE_TRACE"))  // DEBUG: the candidates' pitch before and now
+        for (auto& [obj, before] : probe_pitch) {
+          const Soldier* s = Find(obj);
+          RT_INFO("probe: bot%d dir %.0f soldier %08X team %d at %.0f,%.0f,%.0f pitch %.2f -> %.2f veh %08X",
+                  probe_slot + 1, probe_dir, obj, s ? s->team : -1, s ? s->pos.x : 0.f, s ? s->pos.y : 0.f,
+                  s ? s->pos.z : 0.f, before, s ? s->pitch : 0.f, s ? s->vehicle : 0);
+        }
       for (auto& [obj, before] : probe_pitch) {
         const Soldier* s = Find(obj);
         // (Up or down: a view already at the top can't go further up.)
-        if (s && std::fabs(s->pitch - before) > 0.25f) {
+        // Moved the way it was tipped (other bots hold their view still
+        // meanwhile; one looking about must not count).
+        if (s && (s->pitch - before) * probe_dir > 0.25f) {
           for (botapi::BotIO& b : bots)
             if (b.slot == probe_slot) {
               b.soldier = obj;
@@ -347,7 +402,11 @@ struct Director {
       next = int((next + i + 1) % bots.size());
       probe_slot = b.slot;
       probe_until = now + 0.8;
-      probe_dir = -probe_dir;  // alternate, so a view stuck at one end moves
+      // Alternate per bot, so a view stuck at one end moves next time (one
+      // global flip gave two bots the same direction every time).
+      static float dir_of[kMaxBots] = {};
+      dir_of[b.slot] = dir_of[b.slot] > 0 ? -1.0f : 1.0f;
+      probe_dir = dir_of[b.slot];
       return;
     }
   }
@@ -739,12 +798,30 @@ std::string StartBotDirector(int count) {
       for (botapi::BotIO& b : d.bots) {
         Pad pad = b.pad;
         if (d.probe_slot == b.slot) pad = Pad{0, 0, 0, d.probe_dir, 0, 0};  // being identified: look up or down
+        else if (d.probe_slot >= 0) pad.ry = 0;  // the others keep their view level meanwhile
+        // A soldier that doesn't answer its bot (told to move for 20 s, and
+        // it stays put) was mistaken for it: identify again.
+        if (const Soldier* ms = b.soldier ? d.Find(b.soldier) : nullptr) {
+          auto& an = d.answer[b.slot];
+          // (On foot: a seated one may wait for its craft to be let down. A
+          // stuck one still turns its view: that answers too.)
+          bool told = !ms->vehicle && std::fabs(pad.lx) + std::fabs(pad.ly) > 0.5f;
+          if (!told || Dist3D(ms->pos, an.at) > 1.5f || std::fabs(Wrap(ms->yaw - an.yaw)) > 0.15f)
+            an.at = ms->pos, an.yaw = ms->yaw, an.since = d.now;
+          auto& since = an.since;
+          if (d.now - since > 20.0) {
+            RT_INFO("bots: bot %d: soldier %08X doesn't answer, identifying again", b.slot + 1, b.soldier);
+            b.soldier = 0;
+            since = d.now;
+          }
+        }
         if (b.teleport && b.soldier)
           if (const Soldier* s = d.Find(b.soldier)) {
             BotSlot& slot = g_shared->slots[b.slot];
             slot.from[0] = s->pos.x, slot.from[1] = s->pos.y, slot.from[2] = s->pos.z;
             slot.to[0] = b.to.x, slot.to[1] = b.to.y, slot.to[2] = b.to.z;
             slot.teleport_seq = slot.teleport_seq + 1;
+            MoveVectorsNear(s->pos, b.to, "server");
           }
         Director::Commit(g_shared->slots[b.slot], pad);
         const Soldier* bs = b.soldier ? d.Find(b.soldier) : nullptr;
@@ -836,11 +913,12 @@ void BotTeleport(const BotSlot& s) {
     RT_WARN("bots: teleport: no client soldier near %.0f,%.0f,%.0f", s.from[0], s.from[1], s.from[2]);
     return;
   }
-  for (int i = 0; i < 3; ++i) {
-    uint32_t u;
-    memcpy(&u, const_cast<const float*>(&s.to[i]), 4);
-    St32(best + 0x3D0 + 4 * i, u);
-  }
+  // The soldier's +3D0 is copied from its physics every frame (sub_821F99B0):
+  // write every copy of where it stands (the brain holds it still first), so
+  // the physics moves too.
+  float pos[3];
+  for (int i = 0; i < 3; ++i) SafeLdF(best + 0x3D0 + 4 * i, pos[i]);
+  MoveVectorsNear(Vec{pos[0], pos[1], pos[2]}, Vec{s.to[0], s.to[1], s.to[2]}, "bot");
   RT_INFO("bots: teleport: client soldier %08X to %.0f,%.0f,%.0f", best, s.to[0], s.to[1], s.to[2]);
   if (getenv("BF_TELEPORT_WATCH")) StartWriteWatch(best + 0x3D0, 12, 0);  // DEBUG: who moves it back
 }

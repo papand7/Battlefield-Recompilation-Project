@@ -5,7 +5,7 @@
 // every control point a "temperature" (how much the team needs it) and
 // spreads the team's bots over the hot ones; each bot is a reactive agent that
 // picks the most needed behaviour every tick (engage an enemy, capture its
-// point, get unstuck, respawn, ride a vehicle) and turns it into pad input.
+// point, go round what blocks it, respawn, ride a vehicle) and turns it into pad input.
 //
 // Scenarios (BF_BOT_SCENARIO) make every bot do one thing and say whether it
 // worked, for testing:
@@ -22,6 +22,7 @@
 #include <new>
 #include <random>
 #include <string>
+#include <vector>
 
 using namespace botapi;
 
@@ -36,8 +37,18 @@ struct Bot {
   Vec target_offset;         // where around the point to stand
   Vec last_pos;
   double last_moved = 0;     // time it last made progress
-  double unstuck_until = 0;
-  float unstuck_dir = 1;
+  // Stuck on foot: a detour, wider and on the other side each time.
+  int stuck_level = 0;
+  Vec stuck_at;
+  double back_until = 0, detour_until = 0;
+  float detour_angle = 0, detour_side = 1;
+  bool boat_done = false;  // came ashore by boat this life: no boats again
+  int avoid_point = -1;  // a flag it couldn't reach, left alone for a while
+  double avoid_until = 0;
+  // A vehicle stalled far from its flag: reverse and veer off.
+  int reverse_tries = 0;
+  double reverse_until = 0, veer_until = 0;
+  float veer = 0;
   double next_spawn_press = 0;
   float strafe = 0;
   double next_strafe = 0;
@@ -51,11 +62,21 @@ struct Bot {
   double no_boat_until = 0;
   Vec boat_last, board_pos, boat_start;
   float boat_heading = 0, boat_travel = 0;
-  bool ride_land = false;  // a jeep or tank rather than a landing craft
+  bool ride_land = false;  // a jeep or tank (or a plane) rather than a landing craft
+  bool ride_air = false;   // a plane
+  float fly_last_y = 0;
+  double fly_last_t = 0;
+  float fly_vy = 0;
   bool released = false;   // the landing craft is down from its crane
   uint32_t bad_boat = 0;   // gave up on it
   // Scenario
   bool teleported = false;
+  double hold_until = 0;  // standing still for the teleport
+  char probe_name[16] = {};  // BF_BOT_INPUT_PROBE
+  Vec spawned_at;         // where it last spawned
+  Vec shore_from;         // where it was a few seconds ago (Shore::Saw)
+  double shore_t = 0;
+  int exit_tries = 0;
   double scenario_since = -1, judge_from = 0;
   float drive_from = -1;  // distance to the flag when it started driving
   bool released_once = false;  // this ride's landing craft is already in the water
@@ -94,6 +115,28 @@ Scenario ParseScenario(const char* s) {
   if (const char* t = getenv("BF_BOT_SCENARIO_TIME")) sc.time_limit = atof(t);
   return sc;
 }
+
+// Ways up from the water onto land, learnt from the bots themselves: where one
+// that waded ashore got up over the shore (from about sea level to 5 m above).
+struct Shore {
+  float sea = 1e9f;  // the lowest a soldier has stood (in the water: sea level)
+  std::vector<Vec> exits;
+  void Saw(Vec before, Vec now) {
+    sea = std::min(sea, now.y);
+    if (before.y < sea + 1.5f && now.y > sea + 5.0f && Dist2D(before, now) < 25.0f) {
+      for (const Vec& e : exits)
+        if (Dist2D(e, now) < 10.0f) return;
+      exits.push_back(now);
+    }
+  }
+  const Vec* Nearest(Vec p, float range) const {
+    const Vec* best = nullptr;
+    for (const Vec& e : exits)
+      if (float d = Dist2D(e, p); d < range) range = d, best = &e;
+    return best;
+  }
+};
+Shore g_shore;
 
 // ---- the brain ---------------------------------------------------------------
 
@@ -135,8 +178,10 @@ struct Brain {
   int ChoosePoint(const BotIO& io, const Soldier& me) {
     int best = -1;
     float best_score = -1e9f;
+    const Bot& self = *reinterpret_cast<const Bot*>(io.mem);
     for (int i = 0; i < w.point_count; ++i) {
       const Point& p = w.points[i];
+      if (i == self.avoid_point && w.now < self.avoid_until && w.point_count > 1) continue;
       float temp = p.owner == me.team ? 10.0f : (p.owner == 0 ? 60.0f : 45.0f);
       // Enemy soldiers near a point we own make it hot to defend.
       int threats = 0;
@@ -155,6 +200,15 @@ struct Brain {
   }
 
   static bool IsBoat(const char* k) { return !strcmp(k, "LCVP") || !strcmp(k, "Daihatsu"); }
+  static bool IsPlane(const char* k) {
+    for (const char* p : {"Corsair", "Zero", "Aichi", "Val", "Kate", "Dauntless", "Avenger", "Wildcat"})
+      if (strstr(k, p)) return true;
+    return false;
+  }
+  // Same sort of vehicle as the one it rides (getting back in).
+  static bool SameSort(const Bot& b, const char* k) {
+    return b.ride_air ? IsPlane(k) : b.ride_land ? IsLand(k) : IsBoat(k);
+  }
   static bool IsLand(const char* k) {
     return !strcmp(k, "Willys") || !strcmp(k, "Kurogane") || !strcmp(k, "Sherman") || !strcmp(k, "chi-ha") ||
            !strcmp(k, "Chi-Ha");
@@ -183,6 +237,34 @@ struct Brain {
     b.boat_since = w.now;
   }
 
+  // A plane: full throttle (LT) off the deck, then hold about 100 m over the
+  // sea with the pitch (right stick Y, BF_PLANE_PITCH_SIGN if it flies the
+  // wrong way), turn with the rudder (left stick X), and circle the flag
+  // once there. Never gets out in the air.
+  bool Fly(BotIO& io, Bot& b, const Soldier& me, Vec goal, Pad& cmd) {
+    static const float sign = getenv("BF_PLANE_PITCH_SIGN") ? float(atof(getenv("BF_PLANE_PITCH_SIGN"))) : 1.0f;
+    double dt = w.now - b.fly_last_t;
+    if (dt > 0.25) {
+      if (b.fly_last_t > 0 && dt < 2.0) b.fly_vy = 0.7f * b.fly_vy + 0.3f * float((me.pos.y - b.fly_last_y) / dt);
+      b.fly_last_y = me.pos.y;
+      b.fly_last_t = w.now;
+    }
+    cmd.triggers = 255u;  // LT: throttle
+    double t = w.now - b.drive_since;
+    if (t < 5.0) return true;  // rolling along the deck
+    const float cruise = 320.0f;  // the sea is at about 214
+    float want_vy = std::clamp((cruise - me.pos.y) * 0.25f, -8.0f, 12.0f);
+    cmd.ry = sign * std::clamp((want_vy - b.fly_vy) * 0.06f, -0.7f, 0.7f);
+    if (me.pos.y < 240.0f && t > 8.0) cmd.ry = sign * 0.7f;  // too low: climb
+    float d = Dist2D(me.pos, goal);
+    float want = std::atan2(goal.x - me.pos.x, goal.z - me.pos.z);
+    if (d < 150.0f) want += 1.3f;  // there: circle it
+    float e = Wrap(want - b.boat_heading);
+    cmd.lx = std::clamp(-e * 1.5f, -1.0f, 1.0f);
+    snprintf(b.probe_name, sizeof(b.probe_name), "fly %.0f", me.pos.y);
+    return true;
+  }
+
   // Vehicles, as a few states (Bot::boat_state): walk to one, board it (E;
   // the seat pointer says when it sits in it), drive it (a landing craft is
   // let down from its crane with the right stick up; then the left stick
@@ -193,18 +275,27 @@ struct Brain {
     switch (b.boat_state) {
       case kNoBoat: {
         if (w.now < b.no_boat_until || b.target_point < 0 || b.target_point >= w.point_count) return false;
+        b.ride_air = false;
         if (want_kind) {
           boat = NearestVehicle(me.pos, 1e9f, io, b, true, false, want_kind);
-          if (boat) b.ride_land = !IsBoat(boat->kind);
+          if (boat) b.ride_land = !IsBoat(boat->kind), b.ride_air = IsPlane(boat->kind);
         } else {
           // A landing craft from a carrier for a far flag, else a jeep or
           // tank close by for a flag a long walk away.
           float away = Dist2D(me.pos, w.points[b.target_point].pos);
-          boat = away > 200.0f ? NearestVehicle(me.pos, 60.0f, io, b, true, false) : nullptr;
+          boat = away > 200.0f && !b.boat_done ? NearestVehicle(me.pos, 60.0f, io, b, true, false) : nullptr;
           b.ride_land = false;
-          // (Jeeps and tanks are untested: only with BF_BOT_VEHICLES.)
-          static const bool land_on = getenv("BF_BOT_VEHICLES") != nullptr;
-          if (!boat && land_on && away > 120.0f) {
+          // One bot in four is a pilot: a plane close by (a carrier's).
+          if (!boat && io.slot % 4 == 3) {
+            float best = 50.0f;
+            for (int i = 0; i < w.vehicle_count; ++i) {
+              const Vehicle& v = w.vehicles[i];
+              if (!IsPlane(v.kind) || v.obj == b.bad_boat || BoatTaken(v.obj, io)) continue;
+              if (float d = Dist3D(v.pos, me.pos); d < best) best = d, boat = &v;
+            }
+            if (boat) b.ride_land = b.ride_air = true;
+          }
+          if (!boat && away > 120.0f) {
             boat = NearestVehicle(me.pos, 35.0f, io, b, true, true);
             b.ride_land = boat != nullptr;
           }
@@ -219,6 +310,7 @@ struct Brain {
       }
       case kWalkToBoat: {
         if (!boat || (!want_kind && w.now - b.boat_since > 25)) {
+          b.bad_boat = b.boat;  // couldn't get to it: another one next time
           b.boat = 0;
           b.no_boat_until = w.now + 20;
           SetState(io, b, me, kNoBoat);
@@ -247,6 +339,7 @@ struct Brain {
             b.drive_from = Dist2D(me.pos, w.points[b.target_point].pos);
           b.released = b.ride_land || b.released_once;
           b.off_since = 0;
+          b.reverse_tries = 0;
           b.boat_last = me.pos;
           b.boat_start = me.pos;
           b.boat_moved = w.now;
@@ -287,6 +380,12 @@ struct Brain {
         // Out of the seat (a seat switch can leave it standing in the craft):
         // get back in, the nearest one (a landing craft let down from its
         // crane is a new vehicle).
+        if (!me.vehicle && b.ride_air) {
+          b.boat = 0;
+          b.no_boat_until = w.now + 30;
+          SetState(io, b, me, kNoBoat);
+          return false;
+        }
         if (!me.vehicle) {
           if (!b.off_since) b.off_since = w.now;
           if (w.now - b.off_since > 1.5) {
@@ -295,7 +394,7 @@ struct Brain {
             float best = 15.0f;
             for (int i = 0; i < w.vehicle_count; ++i) {
               const Vehicle& c = w.vehicles[i];
-              if (!(b.ride_land ? IsLand(c.kind) : IsBoat(c.kind))) continue;
+              if (!SameSort(b, c.kind)) continue;
               if (float d = Dist3D(c.pos, me.pos); d < best) best = d, v = &c;
             }
             if (!v || ++b.board_tries > 40) {
@@ -320,8 +419,45 @@ struct Brain {
           b.boat_moved = w.now;
         }
         bool stalled = w.now - b.boat_moved > 4.0;
+        if (b.ride_air) return Fly(io, b, me, goal, cmd);
         float arrive = b.ride_land ? 30.0f : 40.0f;
+        // BF_BOT_INPUT_PROBE (testing): seated, every input 4 s in turn, named
+        // in the bot's state, to read off the log which one moves the vehicle.
+        static const bool probe = getenv("BF_BOT_INPUT_PROBE") != nullptr;
+        if (probe) {
+          static const char* kTry[] = {"lt", "rt", "ly+", "ly-", "ry+", "ry-", "lb", "rb", "x", "y"};
+          int k = int((w.now - b.drive_since) / 4.0) % 10;
+          std::string x = kTry[k];
+          if (x == "lt") cmd.triggers = 255u;
+          if (x == "rt") cmd.triggers = 255u << 8;
+          if (x == "ly+") cmd.ly = 1;
+          if (x == "ly-") cmd.ly = -1;
+          if (x == "ry+") cmd.ry = 1;
+          if (x == "ry-") cmd.ry = -1;
+          if (x == "lb") cmd.buttons |= 0x0100;
+          if (x == "rb") cmd.buttons |= 0x0200;
+          if (x == "x") cmd.buttons |= 0x4000;
+          if (x == "y") cmd.buttons |= 0x8000;
+          snprintf(b.probe_name, sizeof(b.probe_name), "probe %s", kTry[k]);
+          return true;
+        }
         if (sc.kind == Scenario::kBoard) {  // the test is over once seated: sit still
+          return true;
+        }
+        if (w.now < b.reverse_until) {  // backing off: LB (brake, then reverse), turning
+          cmd.buttons |= 0x0100;
+          cmd.lx = b.veer > 0 ? -1.0f : 1.0f;
+          return true;
+        }
+        // Stalled far from the flag (a rock, a reef, another craft): back
+        // off and go round, twice, before getting out there.
+        if (b.released && b.boat_travel > (b.ride_land ? 15.0f : 30.0f) && stalled &&
+            Dist2D(pos, goal) > 120.0f && b.reverse_tries < 2) {
+          ++b.reverse_tries;
+          b.veer = b.reverse_tries % 2 ? 0.8f : -0.8f;
+          b.reverse_until = w.now + 2.5;
+          b.veer_until = w.now + 9.0;
+          b.boat_moved = w.now + 2.5;
           return true;
         }
         if ((b.boat_travel > (b.ride_land ? 15.0f : 30.0f) && stalled) || Dist2D(pos, goal) < arrive ||
@@ -332,7 +468,8 @@ struct Brain {
         // Not going anywhere: perhaps not the driver's seat (the craft let
         // down while it sat in another, or E gave it the gunner's): switch
         // seats (A) until it moves. (The drop itself moves it a few metres.)
-        if (b.released && b.boat_travel < 15.0f && w.now - b.drive_since > 5.0 && stalled) {
+        // (A jeep or tank: getting in takes a few seconds, wait longer.)
+        if (b.released && b.boat_travel < 15.0f && w.now - b.drive_since > (b.ride_land ? 12.0 : 5.0) && stalled) {
           if (b.seat_switches >= 6) {
             b.bad_boat = b.boat;
             SetState(io, b, me, kLeave);
@@ -343,7 +480,7 @@ struct Brain {
           cmd.buttons |= kA;
           return true;
         }
-        float want = std::atan2(goal.x - pos.x, goal.z - pos.z);
+        float want = std::atan2(goal.x - pos.x, goal.z - pos.z) + (w.now < b.veer_until ? b.veer : 0.0f);
         float e = Wrap(want - b.boat_heading);
         // The controls (the game's default vehicle layout): LT throttle, LB
         // brake, the left stick steers. A landing craft on a carrier first
@@ -361,10 +498,13 @@ struct Brain {
             b.seat_switches = 0;
           } else {
             double t = w.now - b.release_try;
-            // The first seat E gives is the driver's, and a crane can take a
-            // while to let a craft down: 30 s there before trying the others.
-            if (t > (b.seat_switches == 0 ? 30.0 : 5.0)) {
-              if (++b.seat_switches > 3) {
+            // E gives the driver's seat (the first), whose throttle lets the
+            // craft down, though the game can take a while (seen 2 s to 2
+            // minutes, the same seat): up to 45 s there, then the other two
+            // seats once (A after the last gets out). The throttle in pulses:
+            // one held while getting in isn't taken.
+            if (t > (b.seat_switches == 0 ? 45.0 : 5.0)) {
+              if (++b.seat_switches > 2) {
                 b.bad_boat = b.boat;
                 SetState(io, b, me, kLeave);
                 return true;
@@ -373,15 +513,19 @@ struct Brain {
               t = 0;
             }
             if (t < 0.3 && b.seat_switches > 0) cmd.buttons |= kA;
-            else if (t > 0.6) cmd.triggers = 255u;  // LT
+            else if (t > 0.6 && std::fmod(t, 1.8) > 0.3) cmd.triggers = 255u;  // LT
             return true;
           }
         }
         cmd.triggers = 255u;                           // LT: throttle
         cmd.lx = std::clamp(-e * 1.5f, -1.0f, 1.0f);  // turning right lowers the heading
+        // Not moving: let go of the throttle now and then (one held while
+        // getting in isn't taken).
+        if (stalled && std::fmod(w.now - b.drive_since, 4.0) < 0.4) cmd.triggers = 0;
         return true;
       }
       case kLeave: {
+        if (!b.ride_land) b.boat_done = true;
         double t = std::fmod(w.now - b.boat_since, 1.2);
         if (t < 0.3) cmd.buttons |= kB;  // E: get out
         if (w.now - b.boat_since > 3.0) {
@@ -399,6 +543,14 @@ struct Brain {
   // Scenario bookkeeping for one bot: teleport, pass or fail.
   void Judge(BotIO& io, Bot& b, const Soldier& me) {
     if (b.scenario_since < 0) b.scenario_since = w.now;
+    // Before a teleport: stand still a moment (the bot's game finds its
+    // position by value).
+    // (Off the spawn point first: standing on it, the spawn point's own
+    // position would match too.)
+    if (sc.near && !b.teleported && !b.hold_until && Dist3D(me.pos, b.spawned_at) > 4.0f)
+      b.hold_until = w.now + 1.5;
+    if (sc.near && !b.teleported && !b.hold_until) return;
+    if (sc.near && !b.teleported && w.now < b.hold_until) return;
     if (sc.near && !b.teleported && !sc.vehicle.empty()) {
       if (const Vehicle* v = NearestVehicle(me.pos, 1e9f, io, b, true, false, sc.vehicle.c_str())) {
         io.teleport = true;
@@ -428,7 +580,7 @@ struct Brain {
         // Driven to the flag, or most of the way (a landing craft stops at
         // the beach).
         float d = sc.point < w.point_count ? Dist2D(me.pos, w.points[sc.point].pos) : 1e9f;
-        done = b.boat_state >= kDrive && (d < 45 || (b.drive_from > 0 && b.drive_from - d > 0.6f * b.drive_from));
+        done = b.drive_from > 0 && (d < 45 || (b.boat_state >= kDrive && b.drive_from - d > 0.6f * b.drive_from));
         break;
       }
       default:
@@ -455,7 +607,8 @@ struct Brain {
       // Dead or on the spawn screen. When the team holds a flag, first step
       // the spawn choice off the carrier (the spawn screen lists the carrier,
       // then the held flags), then confirm.
-      if (b.alive) b.boat = 0, b.boat_state = kNoBoat, b.teleported = false;
+      if (b.alive) b.boat = 0, b.boat_state = kNoBoat, b.teleported = false, b.hold_until = 0, b.boat_done = false,
+                   b.stuck_level = 0, b.exit_tries = 0, b.shore_t = 0;
       b.alive = false;
       bool held = false;
       for (int i = 0; i < w.point_count; ++i) held |= w.points[i].owner != 0 && w.points[i].owner == b.team;
@@ -474,10 +627,15 @@ struct Brain {
       io.pad = cmd;
       return;
     }
-    if (!b.alive) b.last_pos = me->pos, b.last_moved = w.now;
+    if (!b.alive) b.last_pos = me->pos, b.last_moved = w.now, b.spawned_at = me->pos;
     b.alive = true;
     b.team = me->team;
     if (sc.kind != Scenario::kNone) Judge(io, b, *me);
+    if (sc.near && b.hold_until && w.now < b.hold_until + 0.5) {  // holding still for the teleport
+      snprintf(io.state, sizeof(io.state), "teleport");
+      io.pad = cmd;
+      return;
+    }
     // Behaviour weights (BF1942 style: how much each is needed right now).
     const Soldier* enemy = nullptr;
     float enemy_d = 1e9f;
@@ -495,22 +653,52 @@ struct Brain {
       else b.target_point = ChoosePoint(io, *me);
       b.target_offset = {Rand(-6, 6), 0, Rand(-6, 6)};
     }
+    // Shore: remember where bots get up out of the water.
+    if (w.now - b.shore_t > 3.0) {
+      if (b.shore_t > 0 && !me->vehicle) g_shore.Saw(b.shore_from, me->pos);
+      b.shore_from = me->pos;
+      b.shore_t = w.now;
+    }
     // Progress / stuck detection.
     if (Dist2D(me->pos, b.last_pos) > 1.5f) b.last_pos = me->pos, b.last_moved = w.now;
     bool at_point = b.target_point >= 0 && Dist2D(me->pos, w.points[b.target_point].pos) < 12;
     // Landing craft from the carriers; BF_BOT_NO_VEHICLES: none.
     static const bool vehicles_off = getenv("BF_BOT_NO_VEHICLES") != nullptr;
-    bool ride = !vehicles_off || sc.kind == Scenario::kBoard || sc.kind == Scenario::kDrive;
+    bool ride = (sc.kind == Scenario::kNone && !vehicles_off) || sc.kind == Scenario::kBoard ||
+                sc.kind == Scenario::kDrive;
     if (ride && Ride(io, b, *me, cmd)) {
       static const char* kNames[] = {"foot", "to vehicle", "boarding", "driving", "leaving"};
       snprintf(io.state, sizeof(io.state), "%s", kNames[b.boat_state]);
+      if (b.probe_name[0] && b.boat_state == kDrive) snprintf(io.state, sizeof(io.state), "%s", b.probe_name);
+      if (b.boat_state != kDrive) b.probe_name[0] = 0;
       io.pad = cmd;
       return;
     }
-    if (!at_point && w.now - b.last_moved > 2.5 && w.now > b.unstuck_until) {
-      b.unstuck_until = w.now + 1.2;
-      b.unstuck_dir = Rand(0, 1) < 0.5f ? -1.0f : 1.0f;
+    // Stuck (no progress for 2.5 s): back off, then a detour at an angle
+    // off the direct line. Real progress forgives it; seven failures and it
+    // tries another flag.
+    if (b.stuck_level && Dist2D(me->pos, b.stuck_at) > 25) b.stuck_level = 0;
+    if (!at_point && w_engage <= 0 && w.now - b.last_moved > 2.5 && w.now > b.detour_until) {
+      if (!b.stuck_level) b.stuck_at = me->pos;
+      ++b.stuck_level;
       b.last_moved = w.now;
+      if (b.stuck_level > 7 && sc.point < 0) {
+        b.avoid_point = b.target_point;
+        b.avoid_until = w.now + 60;
+        b.target_point = -1;
+        b.stuck_level = 0;
+      }
+      // One side for three tries (alternating cancels out: along a shore or
+      // a wall it has to keep going one way), each a little longer.
+      if (b.stuck_level % 3 == 1) b.detour_side = b.detour_side > 0 ? -1.0f : 1.0f;
+      b.back_until = w.now + 0.7;
+      b.detour_until = w.now + 0.7 + std::min(3.0 + 1.0 * b.stuck_level, 8.0);
+      b.detour_angle = b.detour_side * std::min(1.2f + 0.2f * b.stuck_level, 1.9f);
+      // At the water's edge: along the shore, longer (a way up is somewhere).
+      if (me->pos.y < g_shore.sea + 4.0f) {
+        b.detour_angle = b.detour_side * 1.57f;
+        b.detour_until = w.now + 0.7 + 10.0;
+      }
     }
     if (w_engage > 0) {
       // Aim at the chest, strafe now and then, fire when on target.
@@ -524,6 +712,29 @@ struct Brain {
       cmd.lx = b.strafe;
       cmd.ly = enemy_d > 30 ? 0.6f : 0.0f;
       snprintf(io.state, sizeof(io.state), "engage");
+    } else if (b.target_point >= 0 && me->pos.y < g_shore.sea + 4.0f && b.stuck_level > 0 &&
+               g_shore.Nearest(me->pos, 200.0f) && Dist2D(*g_shore.Nearest(me->pos, 200.0f), me->pos) > 4.0f &&
+               b.exit_tries < 3) {
+      // In the water and stuck: to the nearest way up another bot found.
+      Vec e = *g_shore.Nearest(me->pos, 200.0f);
+      Steer(cmd, *me, std::atan2(e.x - me->pos.x, e.z - me->pos.z), 0.0f);
+      Walk(cmd, *me, e, 1.0f);
+      if (Dist2D(e, me->pos) < 6.0f) ++b.exit_tries, b.stuck_level = 0;
+      snprintf(io.state, sizeof(io.state), "to shore exit");
+    } else if (b.target_point >= 0 && w.now < b.detour_until) {
+      Vec goal = w.points[b.target_point].pos;
+      float head = std::atan2(goal.x - me->pos.x, goal.z - me->pos.z);
+      if (w.now < b.back_until) {
+        Steer(cmd, *me, head, 0.0f);
+        cmd.ly = -1.0f;
+      } else {
+        float dir = head + b.detour_angle;
+        Vec to{me->pos.x + 10 * std::sin(dir), me->pos.y, me->pos.z + 10 * std::cos(dir)};
+        Steer(cmd, *me, dir, 0.0f);
+        Walk(cmd, *me, to, 1.0f);
+        if (std::fmod(w.now, 1.0) < 0.15) cmd.buttons |= kA;  // hop over small things
+      }
+      snprintf(io.state, sizeof(io.state), "detour %d", b.stuck_level);
     } else if (b.target_point >= 0) {
       Vec goal = w.points[b.target_point].pos;
       goal.x += b.target_offset.x, goal.z += b.target_offset.z;
@@ -532,12 +743,6 @@ struct Brain {
       Walk(cmd, *me, goal, 1.0f);
       if (!at_point && std::hypot(dx, dz) > 25) cmd.buttons |= kLeftThumb;  // sprint
       snprintf(io.state, sizeof(io.state), at_point ? "at flag %d" : "to flag %d", b.target_point);
-    }
-    if (w.now < b.unstuck_until) {  // jump and side-step
-      cmd.buttons |= kA;
-      cmd.lx = b.unstuck_dir;
-      cmd.ly = 0.5f;
-      snprintf(io.state, sizeof(io.state), "unstuck");
     }
     io.pad = cmd;
   }

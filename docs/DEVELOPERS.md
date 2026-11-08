@@ -160,11 +160,23 @@ build/game/bf1943.exe --dedicated --bots 1 --host-map Wake_island_s --user userd
 python tools/bot_paths.py board.csv
 ```
 
-Vehicles: bots take the landing craft from the carriers (LT is the throttle and lets the
-craft down from its crane, the left stick steers; seated shows in the soldier's byte at
-+34C). `BF_BOT_NO_VEHICLES` turns that off; jeeps and tanks (untested) only with
-`BF_BOT_VEHICLES`.
+Vehicles (`BF_BOT_NO_VEHICLES` turns them off):
+- Controls, as the game's default layout: LT throttle (it also lets a landing craft down
+  from its carrier crane), LB brake and reverse, left stick X steers; in a plane the right
+  stick Y pitches (`BF_PLANE_PITCH_SIGN=-1` flips it). `BF_BOT_INPUT_PROBE=1` makes a
+  seated bot try every input for 4 s in turn, to read off the log what moves a vehicle.
+- Seated shows in the soldier's byte at +34C (1 on foot, 0 seated). Jeeps, tanks, planes
+  and guns keep no live position at *(+F0)+F0; where they were made, *(+EC)+310, is used.
+- Landing craft: the bot stays in the first seat (the driver's) up to 45 s for the craft
+  to come down (the game takes from 2 s to a minute), and rides it to the beach.
+- Jeeps and tanks: taken near a captured flag when the next flag is a long walk away.
+- Planes: one bot in four is a pilot: takes off from its carrier, holds about 100 m over
+  the sea and circles the flag it's after (no bombing or dogfighting yet).
+- On foot, a bot that's stuck backs off and walks round at an angle (one side for three
+  tries, longer each time); at the water's edge along the shore, and to a way up another
+  bot found.
 
-Not working yet: the scenarios' `near` (teleporting a bot next to the vehicle or flag).
-Writing the soldier's position on the server (+180) or in the bot's client (+3D0) is put
-back every frame (by `sub_82536548` on the server and `sub_821F99B0` on the client).
+Scenario `near`: the bot stands still, then the server and the bot's game move every
+16-byte aligned vector equal to its position (its physics and the copies of it, a few
+hundred on the server) to the new place. (Writing only the soldier's +180 or +3D0 is put
+back every frame.)
