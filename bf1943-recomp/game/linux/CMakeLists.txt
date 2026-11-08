@@ -61,7 +61,7 @@ target_include_directories(bf1943_ffmpeg INTERFACE ${FFMPEG_DIR}/xenia-config ${
 target_compile_options(bf1943_ffmpeg PRIVATE -w -Wno-incompatible-pointer-types)
 set(XE ${ROOT}/thirdparty/xenia)
 file(GLOB XENIA_APU_SOURCES CONFIGURE_DEPENDS ${XE}/src/xenia/base/*.cc ${XE}/src/xenia/apu/*.cc)
-list(FILTER XENIA_APU_SOURCES EXCLUDE REGEX "_win\\.cc$|system_gnulinux\\.cc$|png_utils\\.cc$")
+list(FILTER XENIA_APU_SOURCES EXCLUDE REGEX "_win\\.cc$|system_gnulinux\\.cc$|png_utils\\.cc$|base/assert\\.cc$")
 list(APPEND XENIA_APU_SOURCES ${ROOT}/runtime/xenia_shims/apu_bridge.cc ${ROOT}/runtime/xenia_shims/memory_shim.cc
      ${ROOT}/runtime/xenia_shims/profiling_stub.cc ${ROOT}/runtime/xenia_shims/linux_shim.cc)
 add_library(xenia_apu STATIC ${XENIA_APU_SOURCES})
@@ -70,7 +70,7 @@ target_compile_definitions(xenia_apu PUBLIC FMT_HEADER_ONLY XXH_INLINE_ALL)
 target_compile_options(xenia_apu PRIVATE -march=x86-64-v3 -w)
 target_link_libraries(xenia_apu PUBLIC bf1943_ffmpeg)
 
-add_executable(bf1943_server ${RUNTIME_SOURCES} ${STUBS})
+add_executable(bf1943_server ${RUNTIME_SOURCES} ${ROOT}/runtime/bots/brain.cpp ${STUBS})
 target_include_directories(bf1943_server PRIVATE ${ROOT}/runtime ${ROOT}/runtime/xenia_shims)
 target_compile_options(bf1943_server PRIVATE -march=x86-64-v3 -fno-strict-aliasing)
 target_link_libraries(bf1943_server PRIVATE bf1943_ppc bf1943_xexload xenia_apu Threads::Threads ${CMAKE_DL_LIBS})

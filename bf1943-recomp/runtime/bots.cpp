@@ -1,12 +1,11 @@
 // Bot AI for --bots: the host's server decides, the bot clients press buttons.
 //
-// Modelled on DICE's own bots (Battlefield 1942 / 2): a strategic layer gives
-// every control point a "temperature" (how much the team needs it) and
-// spreads the team's bots over the hot ones; each bot is a reactive agent that
-// picks the most needed behaviour every tick (engage an enemy, capture its
-// point, get unstuck, respawn) and turns it into pad input. The director runs
-// in the host process, which owns the server and so sees every soldier and
-// control point; the bot processes read their pad from shared memory.
+// The director runs in the host process, which owns the server and so sees
+// every soldier, control point and vehicle; it hands them to the bot brain
+// (bots/brain.cpp: what each bot does) and passes each bot's pad on through
+// shared memory to the bot processes. The brain can be a DLL reloaded while
+// the match runs (BF_BOT_BRAIN); BF_BOT_SCENARIO and BF_BOT_LOG are for
+// testing (see bots/brain.cpp and tools/bot_paths.py).
 //
 // Server state (found with --snap-mem / --watch-write, see README):
 //   ServerSoldierEntity: vtable 82013A40 (getType 822ED958), team +48 (1 US,
@@ -22,6 +21,7 @@
 // A soldier object exists while its player is alive. Local games name every
 // player "Player1", so the director finds which soldier is which bot by
 // probing: it tips one bot's view up and watches whose pitch moves.
+#include "bots/bot_api.h"
 #include "guest.h"
 #include "kernel.h"
 #include "xenia_bridge.h"
@@ -51,6 +51,7 @@ inline BOOL ReadProcessMemory(HANDLE, const void* addr, void* buf, size_t n, siz
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <random>
@@ -62,17 +63,31 @@ namespace rt {
 
 namespace {
 
+using botapi::Pad;
+using botapi::Point;
+using botapi::Soldier;
+using botapi::Vec;
+using botapi::Vehicle;
+using botapi::Wrap;
+using botapi::Dist2D;
+
 constexpr uint32_t kSoldierVtable = 0x82013A40;
 constexpr uint32_t kCapturePointVtable = 0x820190D0;
 constexpr uint32_t kVehicleVtable = 0x82013068;
-constexpr int kMaxBots = 16;
-constexpr float kPi = 3.14159265f;
+constexpr int kMaxBots = botapi::kMaxBots;
 
 struct BotSlot {
   volatile float lx, ly, rx, ry;  // -1..1 (ly + = forward, ry + = look up)
   volatile uint32_t buttons;      // XINPUT_GAMEPAD_* bits
   volatile uint32_t triggers;     // lt | rt << 8
   volatile uint32_t active;
+  // Scenarios: move the bot's soldier (in its own process, which moves it)
+  // from about `from` to `to`, once per new teleport_seq.
+  volatile uint32_t teleport_seq;
+  volatile float from[3], to[3];
+  // In a vehicle: the right stick goes to the game as the stick (a vehicle
+  // reads it as such), not through the mouse look path.
+  volatile uint32_t in_vehicle;
 };
 struct BotShared {
   uint32_t magic;
@@ -121,31 +136,6 @@ float LdF(uint32_t a) {
   return f;
 }
 bool Readable(uint32_t a) { return a >= 0x40000000 && a < 0xC0000000 && IsCommitted(a) && IsCommitted(a + 0x400); }
-float Wrap(float a) {
-  while (a > kPi) a -= 2 * kPi;
-  while (a < -kPi) a += 2 * kPi;
-  return a;
-}
-
-struct Vec { float x = 0, y = 0, z = 0; };
-float Dist2D(Vec a, Vec b) { return std::hypot(a.x - b.x, a.z - b.z); }
-
-struct Soldier {
-  uint32_t obj;
-  int team;
-  Vec pos;
-  float yaw, pitch;
-};
-struct Point {
-  uint32_t obj;
-  int owner;
-  Vec pos;
-};
-struct Vehicle {
-  uint32_t obj;
-  std::string kind;
-  Vec pos;
-};
 
 // Every live object with this vtable in the heaps.
 std::vector<uint32_t> Scan(uint32_t vtable) {
@@ -161,6 +151,13 @@ std::vector<uint32_t> Scan(uint32_t vtable) {
   return out;
 }
 
+// A soldier's own entry component (+350; its +2C points at the soldier's
+// +190). It stays the same in a vehicle: being seated shows in the byte at
+// +34C instead, 1 on foot and 0 in a vehicle (seen with BF_SEAT_DUMP while a
+// bot got in and out of a landing craft).
+constexpr uint32_t kSoldierSeat = 0x350, kSeatVehicle = 0x2C, kSoldierOnFoot = 0x34C;
+constexpr uint32_t kSeated = 1;  // Soldier::vehicle until Refresh finds which
+
 bool ReadSoldier(uint32_t o, Soldier& s) {
   if (!Readable(o) || Ld32(o) != kSoldierVtable) return false;
   s.obj = o;
@@ -170,6 +167,7 @@ bool ReadSoldier(uint32_t o, Soldier& s) {
   if (!Readable(aim)) return false;
   s.yaw = LdF(aim + 0x134);
   s.pitch = LdF(aim + 0x138);
+  s.vehicle = (Ld32(o + kSoldierOnFoot) >> 24) == 0 ? kSeated : 0;
   return std::isfinite(s.pos.x) && std::isfinite(s.yaw) && (s.team == 1 || s.team == 2);
 }
 
@@ -191,72 +189,71 @@ bool ReadVehicle(uint32_t o, Vehicle& v) {
   if (!Readable(name)) return false;
   v.obj = o;
   const char* n = G<char>(name);
-  v.kind.assign(n, strnlen(n, 32));
+  size_t len = strnlen(n, sizeof(v.kind) - 1);
+  memcpy(v.kind, n, len);
+  v.kind[len] = 0;
   v.pos = {LdF(body + 0xF0), LdF(body + 0xF4), LdF(body + 0xF8)};
+  // (A jeep or tank at a flag nobody holds yet waits at 0,0,0.)
+  if (v.pos.x == 0 && v.pos.y == 0 && v.pos.z == 0) return false;
   return std::isfinite(v.pos.x) && std::fabs(v.pos.x) < 1e5f;
 }
 
-// A soldier's current seat (entry component): its own while on foot, a
-// vehicle's when in one. The seat's +2C points at its vehicle + 190.
-constexpr uint32_t kSoldierSeat = 0x350, kSeatVehicle = 0x2C, kVehicleSeatLink = 0x190;
-uint32_t SeatVehicle(uint32_t soldier) {
-  uint32_t seat = Ld32(soldier + kSoldierSeat);
-  if (!Readable(seat)) return 0;
-  uint32_t link = Ld32(seat + kSeatVehicle);
-  if (!Readable(link)) return 0;
-  uint32_t v = link - kVehicleSeatLink;
-  return Readable(v) && Ld32(v) == kVehicleVtable ? v : 0;
-}
+// ---- the brain: built in, or bot_brain.dll reloaded when it changes ----------
 
-// ---- one bot ---------------------------------------------------------------
+void BrainLog(const char* text) { RT_INFO("%s", text); }
 
-struct Bot {
-  int slot;
-  uint32_t soldier = 0;      // mapped soldier object (0 = dead / not found)
-  int target_point = -1;     // index into points
-  Vec target_offset;         // where around the point to stand
-  Vec last_pos;
-  double last_moved = 0;     // time it last made progress
-  double unstuck_until = 0;
-  float unstuck_dir = 1;
-  double dead_since = 0;
-  double next_spawn_press = 0;
-  float strafe = 0;
-  double next_strafe = 0;
-  // Landing craft: the one it is going for or in, since when, its heading.
-  uint32_t boat = 0;
-  bool in_boat = false;
-  double boat_since = 0, next_enter_press = 0;
-  Vec boat_last;
-  double boat_moved = 0;
-  float boat_heading = 0;
-  bool spawn_choice = false;
-  int team = 0;
-  // Seat test: after pressing E, a view sweep that the soldier doesn't
-  // follow means it sits in the boat.
-  double sweep_until = 0;
-  float sweep_yaw = 0;
-  float boat_travel = 0, boat_travel3d = 0;
-  int seat_switches = 0;
-  Vec boat_start;
-  int boat_state = 0, board_tries = 0;
-  bool ride_land = false;  // a jeep or tank rather than a landing craft
-  bool released = false;   // the landing craft is down from its crane
-  double board_cycle = 0;
-  Vec board_pos;
-  double release_try = 0;
-  double boat_lost_since = 0;
-  double no_boat_until = 0, drive_since = 0;
-  double next_seat_switch = 0, leaving_since = 0;
-  uint32_t bad_boat = 0;  // gave up on it
+struct BrainModule {
+  botapi::ThinkFn think = &BotBrainThink;
+#ifdef _WIN32
+  // BF_BOT_BRAIN=<path of bot_brain.dll>: loaded from a copy (so the build can
+  // write the DLL), again whenever the file changes.
+  std::filesystem::file_time_type stamp{};
+  HMODULE module = nullptr;
+  int loads = 0;
+  bool reloaded = false;  // the scenario is judged afresh
+  double next_check = 0;
+  void Poll(double now) {
+    static const char* path = getenv("BF_BOT_BRAIN");
+    if (!path || now < next_check) return;
+    next_check = now + 0.5;
+    std::error_code ec;
+    auto t = std::filesystem::last_write_time(path, ec);
+    if (ec || t == stamp) return;
+    // Settled: the linker is done writing it.
+    if (std::filesystem::file_time_type::clock::now() - t < std::chrono::milliseconds(500)) return;
+    std::filesystem::path copy = std::filesystem::temp_directory_path() /
+                                 ("bot_brain_" + std::to_string(GetCurrentProcessId()) + "_" +
+                                  std::to_string(++loads) + ".dll");
+    std::filesystem::copy_file(path, copy, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) return;
+    stamp = t;
+    HMODULE m = LoadLibraryW(copy.c_str());
+    auto fn = m ? reinterpret_cast<botapi::ThinkFn>(GetProcAddress(m, "BotBrainThink")) : nullptr;
+    auto ver = m ? reinterpret_cast<int (*)()>(GetProcAddress(m, "BotBrainVersion")) : nullptr;
+    if (!fn || !ver || ver() != botapi::kVersion) {
+      RT_WARN("bots: %s is not a usable brain (version %d, want %d)", path, ver ? ver() : -1, botapi::kVersion);
+      if (m) FreeLibrary(m);
+      return;
+    }
+    think = fn;
+    if (module) FreeLibrary(module);
+    module = m;
+    reloaded = true;
+    RT_INFO("bots: brain loaded from %s (#%d)", path, loads);
+  }
+#else
+  bool reloaded = false;
+  void Poll(double) {}
+#endif
 };
 
+// ---- the director: the host's view of the match --------------------------------
+
 struct Director {
-  std::vector<Bot> bots;
+  std::vector<botapi::BotIO> bots;
   std::vector<Soldier> soldiers;
   std::vector<Point> points;
   std::vector<Vehicle> vehicles;
-  std::mt19937 rng{1943};
   double now = 0;
   // probing
   int probe_slot = -1;
@@ -264,9 +261,8 @@ struct Director {
   float probe_dir = -1.0f;
   std::vector<std::pair<uint32_t, float>> probe_pitch;  // unmapped soldiers before the probe
 
-  float Rand(float a, float b) { return std::uniform_real_distribution<float>(a, b)(rng); }
-
-  void Refresh(bool rescan) {
+  // Reads the match; true when the flags changed.
+  bool Refresh(bool rescan) {
     static std::vector<uint32_t> soldier_objs, point_objs, vehicle_objs;
     if (rescan) {
       soldier_objs = Scan(kSoldierVtable);
@@ -283,19 +279,23 @@ struct Director {
       Soldier s;
       if (ReadSoldier(o, s)) soldiers.push_back(s);
     }
+    // A seated soldier sits at its vehicle: the nearest one.
+    for (Soldier& s : soldiers) {
+      if (s.vehicle != kSeated) continue;
+      float best = 8.0f;
+      for (const Vehicle& v : vehicles)
+        if (float dd = botapi::Dist3D(s.pos, v.pos); dd < best) best = dd, s.vehicle = v.obj;
+    }
     std::vector<Point> fresh;
     for (uint32_t o : point_objs) {
       Point p;
       if (ReadPoint(o, p)) fresh.push_back(p);
     }
-    if (fresh.size() != points.size()) {
-      points = fresh;
-      for (Bot& b : bots) b.target_point = -1;
-    } else {
-      points = fresh;
-    }
-    for (Bot& b : bots)
-      if (b.soldier && !Find(b.soldier)) b.soldier = 0, b.dead_since = now;
+    bool changed = fresh.size() != points.size();
+    points = fresh;
+    for (botapi::BotIO& b : bots)
+      if (b.soldier && !Find(b.soldier)) b.soldier = 0;
+    return changed;
   }
 
   const Vehicle* FindVehicle(uint32_t obj) const {
@@ -303,25 +303,13 @@ struct Director {
       if (v.obj == obj) return &v;
     return nullptr;
   }
-  bool BoatTaken(uint32_t obj, const Bot& me) const {
-    for (const Bot& b : bots)
-      if (&b != &me && b.boat == obj) return true;
-    return false;
-  }
-  // Nearest flag to a position.
-  float NearestPoint(Vec p) const {
-    float best = 1e9f;
-    for (const Point& q : points) best = std::min(best, Dist2D(p, q.pos));
-    return best;
-  }
-
   const Soldier* Find(uint32_t obj) const {
     for (const Soldier& s : soldiers)
       if (s.obj == obj) return &s;
     return nullptr;
   }
   bool Mapped(uint32_t obj) const {
-    for (const Bot& b : bots)
+    for (const botapi::BotIO& b : bots)
       if (b.soldier == obj) return true;
     return false;
   }
@@ -335,12 +323,11 @@ struct Director {
         const Soldier* s = Find(obj);
         // (Up or down: a view already at the top can't go further up.)
         if (s && std::fabs(s->pitch - before) > 0.25f) {
-          for (Bot& b : bots)
+          for (botapi::BotIO& b : bots)
             if (b.slot == probe_slot) {
               b.soldier = obj;
-              b.last_pos = s->pos;
-              b.last_moved = now;
               RT_INFO("bots: bot %d is soldier %08X (team %d)", probe_slot + 1, obj, s->team);
+              if (getenv("BF_TELEPORT_WATCH")) StartWriteWatch(obj + 0x180, 12, 0);  // DEBUG
             }
           break;
         }
@@ -355,7 +342,7 @@ struct Director {
     // Next bot without a soldier, round robin.
     static int next = 0;
     for (size_t i = 0; i < bots.size(); ++i) {
-      Bot& b = bots[(next + i) % bots.size()];
+      botapi::BotIO& b = bots[(next + i) % bots.size()];
       if (b.soldier) continue;
       next = int((next + i + 1) % bots.size());
       probe_slot = b.slot;
@@ -363,342 +350,6 @@ struct Director {
       probe_dir = -probe_dir;  // alternate, so a view stuck at one end moves
       return;
     }
-  }
-
-  // Strategic layer: temperature per point for a team, then the bot takes the
-  // hottest one, cooled by distance and by team mates already heading there.
-  int ChoosePoint(const Bot& b, const Soldier& me) {
-    int best = -1;
-    float best_score = -1e9f;
-    for (size_t i = 0; i < points.size(); ++i) {
-      const Point& p = points[i];
-      float temp = p.owner == me.team ? 10.0f : (p.owner == 0 ? 60.0f : 45.0f);
-      // Enemy soldiers near a point we own make it hot to defend.
-      int threats = 0;
-      for (const Soldier& s : soldiers)
-        if (s.team != me.team && Dist2D(s.pos, p.pos) < 40) ++threats;
-      if (p.owner == me.team) temp += 25.0f * threats;
-      int mates = 0;
-      for (const Bot& o : bots)
-        if (&o != &b && o.target_point == int(i)) ++mates;
-      float score = temp - 12.0f * mates - Dist2D(me.pos, p.pos) / 25.0f + Rand(0, 5);
-      if (score > best_score) best_score = score, best = int(i);
-    }
-    return best;
-  }
-
-  void Steer(BotSlot& out, const Soldier& me, float want_yaw, float want_pitch) {
-    float e = Wrap(want_yaw - me.yaw);
-    float rx = std::clamp(-e * 2.0f, -1.5f, 1.5f);
-    float ep = want_pitch - me.pitch;
-    float ry = std::clamp(ep * 2.0f, -1.5f, 1.5f);
-    if (std::fabs(ep) > 0.03f && std::fabs(ry) < 0.35f) ry = ry < 0 ? -0.35f : 0.35f;  // small pitch inputs don't move it
-    out.rx = rx;
-    out.ry = ry;
-  }
-
-  // Walk towards target (world), whatever way the bot faces.
-  void Walk(BotSlot& out, const Soldier& me, Vec target, float speed) {
-    float dx = target.x - me.pos.x, dz = target.z - me.pos.z;
-    float len = std::hypot(dx, dz);
-    if (len < 0.5f) { out.lx = out.ly = 0; return; }
-    dx /= len, dz /= len;
-    float fx = std::sin(me.yaw), fz = std::cos(me.yaw);  // forward
-    float rxv = -fz, rzv = fx;                            // right
-    out.ly = std::clamp((dx * fx + dz * fz) * speed, -1.0f, 1.0f);
-    out.lx = std::clamp((dx * rxv + dz * rzv) * speed, -1.0f, 1.0f);
-  }
-
-  void Think(Bot& b) {
-    BotSlot& out = g_shared->slots[b.slot];
-    BotSlot cmd{};
-    cmd.active = 1;
-    if (probe_slot == b.slot) {  // being identified: look up or down, nothing else
-      cmd.ry = probe_dir;
-      Commit(out, cmd);
-      return;
-    }
-    const Soldier* me = b.soldier ? Find(b.soldier) : nullptr;
-    if (!me) {
-      // Dead or on the spawn screen. When the team holds a flag, first step
-      // the spawn choice off the carrier (the spawn screen lists the carrier,
-      // then the held flags), then confirm.
-      b.boat = 0, b.boat_state = 0;
-      int team = 0;
-      for (const Bot& o : bots)
-        if (const Soldier* s = o.soldier ? Find(o.soldier) : nullptr) team = s->team;
-      bool held = false;
-      for (const Point& q : points) held |= q.owner != 0 && q.owner == b.team;
-      if (now >= b.next_spawn_press) {
-        if (held && !b.spawn_choice) {
-          cmd.buttons = XINPUT_GAMEPAD_DPAD_RIGHT;
-          b.spawn_choice = true;
-          b.next_spawn_press = now + 0.6;
-        } else {
-          cmd.buttons = XINPUT_GAMEPAD_A;
-          b.spawn_choice = false;
-          b.next_spawn_press = now + 2.0;
-        }
-      }
-      (void)team;
-      Commit(out, cmd);
-      return;
-    }
-    b.team = me->team;
-    // Behaviour weights (BF1942 style: how much each is needed right now).
-    const Soldier* enemy = nullptr;
-    float enemy_d = 1e9f;
-    for (const Soldier& s : soldiers) {
-      if (s.team == me->team) continue;
-      float d = std::hypot(Dist2D(s.pos, me->pos), s.pos.y - me->pos.y);
-      if (d < enemy_d) enemy_d = d, enemy = &s;
-    }
-    float w_engage = enemy && enemy_d < 70 ? 100 - enemy_d : 0;
-    if (b.target_point < 0 || b.target_point >= int(points.size()) ||
-        points[b.target_point].owner == me->team && Rand(0, 1) < 0.01f) {
-      b.target_point = getenv("BF_BOT_POINT") ? atoi(getenv("BF_BOT_POINT")) : ChoosePoint(b, *me);  // DEBUG override
-      b.target_offset = {Rand(-6, 6), 0, Rand(-6, 6)};
-    }
-    // Progress / stuck detection.
-    if (Dist2D(me->pos, b.last_pos) > 1.5f) b.last_pos = me->pos, b.last_moved = now;
-    bool at_point = b.target_point >= 0 && Dist2D(me->pos, points[b.target_point].pos) < 12;
-    if (!at_point && now - b.last_moved > 2.5 && now > b.unstuck_until) {
-      b.unstuck_until = now + 1.2;
-      b.unstuck_dir = Rand(0, 1) < 0.5f ? -1.0f : 1.0f;
-      b.last_moved = now;
-    }
-
-    // Landing craft: far from every flag (on a carrier), with one nearby that
-    // no other bot has, get in, drive to the target flag's shore, get out.
-    // (Vehicles are not reliable yet: off unless BF_BOT_VEHICLES is set.)
-    static const bool vehicles_on = getenv("BF_BOT_VEHICLES") != nullptr;
-    if (vehicles_on && Boat(b, *me, cmd)) {
-      Commit(out, cmd);
-      return;
-    }
-    if (w_engage > 0) {
-      // Aim at the chest, strafe now and then, fire when on target.
-      float dx = enemy->pos.x - me->pos.x, dz = enemy->pos.z - me->pos.z;
-      float want_yaw = std::atan2(dx, dz);
-      float want_pitch = std::atan2(enemy->pos.y + 1.2f - (me->pos.y + 1.6f), std::hypot(dx, dz));
-      Steer(cmd, *me, want_yaw, want_pitch);
-      if (std::fabs(Wrap(want_yaw - me->yaw)) < 0.06f && std::fabs(want_pitch - me->pitch) < 0.08f)
-        cmd.triggers |= 255u << 8;  // right trigger: fire
-      if (now > b.next_strafe) b.strafe = Rand(-1, 1), b.next_strafe = now + Rand(0.6f, 1.8f);
-      cmd.lx = b.strafe;
-      cmd.ly = enemy_d > 30 ? 0.6f : 0.0f;
-    } else if (b.target_point >= 0) {
-      Vec goal = points[b.target_point].pos;
-      goal.x += b.target_offset.x, goal.z += b.target_offset.z;
-      float dx = goal.x - me->pos.x, dz = goal.z - me->pos.z;
-      Steer(cmd, *me, std::atan2(dx, dz), 0.0f);
-      Walk(cmd, *me, goal, 1.0f);
-      if (!at_point && std::hypot(dx, dz) > 25) cmd.buttons |= XINPUT_GAMEPAD_LEFT_THUMB;  // sprint
-    }
-    if (now < b.unstuck_until) {  // jump and side-step
-      cmd.buttons |= XINPUT_GAMEPAD_A;
-      cmd.lx = b.unstuck_dir;
-      cmd.ly = 0.5f;
-    }
-    Commit(out, cmd);
-  }
-
-  // Landing craft, as a few states (Bot::boat_state): walk to one, board it
-  // (E, then a view sweep the soldier doesn't follow means seated), drive it
-  // (a landing craft is let down from its crane with the right stick up;
-  // then the left stick drives and steers), and get out at the flag. True while busy (cmd set).
-  enum BoatState { kNoBoat, kWalkToBoat, kBoard, kDrive, kLeave };
-  // any_kind: a landing craft let down from its crane is a new vehicle whose
-  // kind doesn't read as one.
-  static bool IsBoat(const std::string& k) { return k == "LCVP" || k == "Daihatsu"; }
-  static bool IsLand(const std::string& k) {
-    return k == "Willys" || k == "Kurogane" || k == "Sherman" || k == "chi-ha" || k == "Chi-Ha";
-  }
-  const Vehicle* NearestBoat(Vec p, float range, const Bot& b, bool free_only, bool any_kind = false,
-                             bool land = false) const {
-    const Vehicle* best = nullptr;
-    for (const Vehicle& v : vehicles) {
-      if (!any_kind && !(land ? IsLand(v.kind) : IsBoat(v.kind))) continue;
-      if (land && std::fabs(v.pos.y - p.y) > 4.0f) continue;
-      if (v.obj == b.bad_boat || (free_only && BoatTaken(v.obj, b))) continue;
-      float d = std::hypot(Dist2D(v.pos, p), v.pos.y - p.y);
-      if (d < range) range = d, best = &v;
-    }
-    return best;
-  }
-  bool Boat(Bot& b, const Soldier& me, BotSlot& cmd) {
-    const Vehicle* boat = b.boat ? FindVehicle(b.boat) : nullptr;
-    auto set_state = [&](int s) {
-      if (getenv("BF_BOAT_TRACE"))  // debugging: state changes
-        RT_INFO("boat: bot%d %d -> %d at %.0f,%.0f,%.0f travel %.0f tries %d", b.slot + 1, b.boat_state, s, me.pos.x,
-                me.pos.y, me.pos.z, b.boat_travel, b.board_tries);
-      b.boat_state = s;
-      b.boat_since = now;
-    };
-    switch (b.boat_state) {
-      case kNoBoat: {
-        if (now < b.no_boat_until || b.target_point < 0 || b.target_point >= int(points.size())) return false;
-        float away = Dist2D(me.pos, points[b.target_point].pos);
-        // A landing craft from a carrier for a far flag, else a jeep or tank
-        // close by for a flag a long walk away.
-        boat = away > 200.0f ? NearestBoat(me.pos, 60.0f, b, true) : nullptr;
-        b.ride_land = false;
-        if (!boat && away > 120.0f) {
-          boat = NearestBoat(me.pos, 35.0f, b, true, false, true);
-          b.ride_land = boat != nullptr;
-        }
-        if (!boat) return false;
-        b.boat = boat->obj;
-        b.board_tries = 0;
-        set_state(kWalkToBoat);
-        [[fallthrough]];
-      }
-      case kWalkToBoat: {
-        if (!boat || now - b.boat_since > 25) {
-          b.boat = 0;
-          b.no_boat_until = now + 20;
-          set_state(kNoBoat);
-          return false;
-        }
-        float dx = boat->pos.x - me.pos.x, dz = boat->pos.z - me.pos.z;
-        Steer(cmd, me, std::atan2(dx, dz), 0.0f);
-        Walk(cmd, me, boat->pos, 1.0f);
-        if (std::hypot(dx, dz) < 4.0f) {
-          set_state(kBoard);
-          b.board_cycle = now - 5.0;  // judge (not aboard) and start a cycle now
-          b.board_pos = me.pos;
-          b.board_tries = 0;
-        }
-        return true;
-      }
-      case kBoard: {
-        // A 3 s cycle: aim at it (E only works looking at it), E, then the
-        // throttle (a landing craft: the right stick up, which lets it down;
-        // a jeep or tank: the left stick). Aboard once it has dropped with a
-        // landing craft, or moves faster than on foot.
-        // (E may seat it as the gunner, who can't drive: every other try also
-        // switches seats, A, before the throttle.)
-        double t = now - b.board_cycle;
-        if (t > 4.0) {
-          float went = Dist2D(me.pos, b.board_pos);
-          bool aboard = went > 6.0f || (!b.ride_land && me.pos.y < b.board_pos.y - 3.0f);
-          if (aboard) {
-            set_state(kDrive);
-            b.drive_since = now;
-            b.released = true;
-            b.boat_last = me.pos;
-            b.boat_moved = now;
-            b.boat_travel = 0;
-            b.seat_switches = 0;
-            return true;
-          }
-          if (++b.board_tries > 8) {
-            b.bad_boat = b.boat;
-            b.boat = 0;
-            b.no_boat_until = now + 10;
-            set_state(kNoBoat);
-            return false;
-          }
-          b.board_cycle = now;
-          b.board_pos = me.pos;
-          t = 0;
-        }
-        if (t < 1.4) {
-          if (boat) {
-            float dx = boat->pos.x - me.pos.x, dz = boat->pos.z - me.pos.z;
-            float pitch = std::atan2(boat->pos.y + 0.5f - (me.pos.y + 1.6f), std::max(std::hypot(dx, dz), 0.5f));
-            Steer(cmd, me, std::atan2(dx, dz), pitch);
-          }
-          if (t >= 0.8 && t < 1.1) cmd.buttons |= XINPUT_GAMEPAD_B;
-        } else if (t >= 1.6 && t < 1.9) {
-          if (b.board_tries % 2 == 1) cmd.buttons |= XINPUT_GAMEPAD_A;
-        } else if (t >= 2.2) {
-          if (b.ride_land) cmd.ly = 1.0f;
-          else cmd.ry = 1.0f;
-        }
-        return true;
-      }
-      case kDrive: {
-        // The soldier rides with the boat: its position is the boat's (the
-        // landing craft let down from its crane is a new vehicle, found only
-        // at the next object scan).
-        Vec pos = me.pos;
-        if (b.target_point < 0 || b.target_point >= int(points.size())) return false;
-        Vec goal = points[b.target_point].pos;
-        float moved = Dist2D(pos, b.boat_last);
-        if (moved > 1.0f) {
-          b.boat_travel += moved;
-          b.boat_heading = std::atan2(pos.x - b.boat_last.x, pos.z - b.boat_last.z);
-          b.boat_last = pos;
-          b.boat_moved = now;
-        }
-        bool stalled = now - b.boat_moved > 4.0;
-        float arrive = b.ride_land ? 30.0f : 40.0f;
-        if ((b.boat_travel > (b.ride_land ? 15.0f : 30.0f) && stalled) || Dist2D(pos, goal) < arrive ||
-            now - b.drive_since > 150) {
-          set_state(kLeave);
-          return true;
-        }
-        // Not going anywhere after a while: perhaps the gunner's seat.
-        if ((b.ride_land || b.released) && b.boat_travel < 3.0f && now - b.drive_since > 15.0 && stalled) {
-          if (b.seat_switches >= 3) {
-            b.bad_boat = b.boat;
-            set_state(kLeave);
-            return true;
-          }
-          ++b.seat_switches;
-          b.boat_moved = now;
-          cmd.buttons |= XINPUT_GAMEPAD_A;
-          return true;
-        }
-        float want = std::atan2(goal.x - pos.x, goal.z - pos.z);
-        float e = Wrap(want - b.boat_heading);
-        // A landing craft first: the right stick straight up (nothing else)
-        // lets it down from its crane. Then the left stick drives and steers,
-        // with the right stick up as throttle too.
-        if (!b.ride_land && !b.released) {
-          // Down once the soldier has dropped with it; else perhaps the
-          // gunner's seat (only the driver lets it down): switch seats (A).
-          if (me.pos.y < b.boat_start.y - 3.0f) {
-            b.released = true;
-            b.boat_last = me.pos;
-            b.boat_moved = now;
-            b.boat_travel = 0;
-          } else {
-            double t = now - b.release_try;
-            if (t > 4.0) {
-              if (++b.seat_switches > 4) {
-                b.bad_boat = b.boat;
-                set_state(kLeave);
-                return true;
-              }
-              b.release_try = now;
-              t = 0;
-            }
-            if (t < 0.3 && b.seat_switches > 0) cmd.buttons |= XINPUT_GAMEPAD_A;
-            else if (t > 0.6) cmd.ry = 1.0f;
-            return true;
-          }
-        }
-        cmd.ly = 1.0f;
-        cmd.ry = 1.0f;
-        cmd.lx = std::clamp(-e * 1.5f, -1.0f, 1.0f);  // turning right lowers the heading
-        cmd.rx = 0.0f;
-        return true;
-      }
-      case kLeave: {
-        double t = std::fmod(now - b.boat_since, 1.2);
-        if (t < 0.3) cmd.buttons |= XINPUT_GAMEPAD_B;  // E: get out
-        if (now - b.boat_since > 3.0) {
-          b.boat = 0;
-          b.no_boat_until = now + 60;
-          set_state(kNoBoat);
-          return false;
-        }
-        return true;
-      }
-    }
-    return false;
   }
 
   // BF_SELF_TEST=<vehicle kind> (testing, with --bots 1): the host's own
@@ -712,14 +363,13 @@ struct Director {
     static Vec start;
     const int slot = kMaxBots - 1;
     BotSlot& out = g_shared->slots[slot];
-    BotSlot cmd{};
-    cmd.active = 1;
+    Pad cmd{};
     // Our soldier: the one no bot has (once the bots are found).
     const Soldier* me = nullptr;
     // (Or the only soldier while no bot is found: the host spawns first.)
     static uint32_t mine = 0;
     bool all_found = true;
-    for (const Bot& b : bots) all_found &= b.soldier != 0;
+    for (const botapi::BotIO& b : bots) all_found &= b.soldier != 0;
     // Ours: the server soldier nearest the camera (the bots' are elsewhere).
     float eye[3];
     if (!mine && xgpu::CameraEye(eye)) {
@@ -753,11 +403,11 @@ struct Director {
       return;
     }
     std::string want = getenv("BF_SELF_TEST");
-    uint32_t in = SeatVehicle(me->obj);
+    uint32_t in = me->vehicle;
     const Vehicle* target = nullptr;
     float best = 1e9f;
     for (const Vehicle& v : vehicles)
-      if (v.kind == want && Dist2D(v.pos, me->pos) < best) best = Dist2D(v.pos, me->pos), target = &v;
+      if (want == v.kind && Dist2D(v.pos, me->pos) < best) best = Dist2D(v.pos, me->pos), target = &v;
     if (state == 0 && since == 0) since = now;
     if (state == 0 && now >= next_log) {
       next_log = now + 2.0;
@@ -776,14 +426,14 @@ struct Director {
         state = 1, since = now, step = 0;
         const Vehicle* v = FindVehicle(in);
         start = v ? v->pos : me->pos;
-        RT_INFO("selftest: in %s", v ? v->kind.c_str() : "?");
+        RT_INFO("selftest: in %s", v ? v->kind : "?");
       } else if (target) {
         float dx = target->pos.x - me->pos.x, dz = target->pos.z - me->pos.z;
         float pitch = std::atan2(target->pos.y + 0.5f - (me->pos.y + 1.6f), std::max(std::hypot(dx, dz), 0.5f));
         static const double walk_limit = getenv("BF_SELF_TEST_WALK") ? atof(getenv("BF_SELF_TEST_WALK")) : 20.0;
         if (std::hypot(dx, dz) > 3.0f && now - since < walk_limit) {
-          Steer(cmd, *me, std::atan2(dx, dz), pitch);
-          Walk(cmd, *me, target->pos, 0.8f);
+          botapi::Steer(cmd, *me, std::atan2(dx, dz), pitch);
+          botapi::Walk(cmd, *me, target->pos, 0.8f);
         } else {
           // Close: sweep the aim over the vehicle and press E; 0.5 s after
           // each E, push the view sideways: if it doesn't turn, seated.
@@ -793,7 +443,7 @@ struct Director {
           int k = int(now / 1.6);
           double t = std::fmod(now, 1.6);
           if (t < 0.6) {
-            Steer(cmd, *me, std::atan2(dx, dz) + kYaw[k % 7], kPitch[(k / 7) % 4]);
+            botapi::Steer(cmd, *me, std::atan2(dx, dz) + kYaw[k % 7], kPitch[(k / 7) % 4]);
             if (t > 0.4) cmd.buttons |= XINPUT_GAMEPAD_B;
           } else if (t < 1.0) {
             test_yaw = me->yaw;
@@ -839,7 +489,7 @@ struct Director {
         if (Readable(cv) && Ld32(cv) == 0x82006DC8) p = {LdF(c + 0x3D0), LdF(c + 0x3D4), LdF(c + 0x3D8)};
       }
       RT_INFO("selftest: step %s t %.0f seat %s veh %.1f,%.1f,%.1f yaw %.2f", step < n ? kSteps[step] : "done", t,
-              in ? (v ? v->kind.c_str() : "vehicle") : "foot", p.x, p.y, p.z, me->yaw);
+              in ? (v ? v->kind : "vehicle") : "foot", p.x, p.y, p.z, me->yaw);
     }
     if (idle) {
       out.active = 0;  // the keyboard has the pad now
@@ -848,11 +498,45 @@ struct Director {
     Commit(out, cmd);
   }
 
-  static void Commit(BotSlot& out, const BotSlot& cmd) {
+  static void Commit(BotSlot& out, const Pad& cmd) {
     out.lx = cmd.lx, out.ly = cmd.ly, out.rx = cmd.rx, out.ry = cmd.ry;
     out.buttons = cmd.buttons;
     out.triggers = cmd.triggers;
     out.active = 1;
+  }
+};
+
+// BF_BOT_LOG=<file.csv>: every bot's track twice a second, with the flags and
+// vehicles now and then (tools/bot_paths.py draws it).
+struct TraceLog {
+  FILE* f = nullptr;
+  double next_row = 0, next_map = 0;
+  TraceLog() {
+    if (const char* p = getenv("BF_BOT_LOG")) {
+      f = fopen(p, "w");
+      if (f) fprintf(f, "t,bot,team,x,y,z,vehicle,state\n");
+    }
+  }
+  void Write(const Director& d, bool flags_changed, const char* result) {
+    if (!f) return;
+    if (flags_changed || d.now >= next_map) {
+      next_map = d.now + 10;
+      for (size_t i = 0; i < d.points.size(); ++i)
+        fprintf(f, "#flag,%zu,%.1f,%.1f,%d\n", i, d.points[i].pos.x, d.points[i].pos.z, d.points[i].owner);
+      for (const Vehicle& v : d.vehicles) fprintf(f, "#vehicle,%s,%.1f,%.1f\n", v.kind, v.pos.x, v.pos.z);
+    }
+    if (result) fprintf(f, "#result,%s\n", result);
+    if (d.now >= next_row) {
+      next_row = d.now + 0.5;
+      for (const botapi::BotIO& b : d.bots) {
+        const Soldier* s = b.soldier ? d.Find(b.soldier) : nullptr;
+        if (!s) continue;
+        const Vehicle* v = s->vehicle ? d.FindVehicle(s->vehicle) : nullptr;
+        fprintf(f, "%.2f,%d,%d,%.1f,%.1f,%.1f,%s,%s\n", d.now, b.slot + 1, s->team, s->pos.x, s->pos.y, s->pos.z,
+                v ? v->kind : (s->vehicle ? "?" : ""), b.state);
+      }
+    }
+    fflush(f);
   }
 };
 
@@ -1007,46 +691,107 @@ std::string StartBotDirector(int count) {
   }
   std::thread([count] {
     Director d;
-    for (int i = 0; i < std::min(count, kMaxBots - 1); ++i) d.bots.push_back(Bot{i});
+    for (int i = 0; i < std::min(count, kMaxBots - 1); ++i) {
+      botapi::BotIO io{};
+      io.slot = i;
+      d.bots.push_back(io);
+    }
     if (getenv("BF_SELF_TEST")) g_my_slot = kMaxBots - 1;  // the host's own player
+    BrainModule brain;
+    TraceLog trace;
+    const char* scenario = getenv("BF_BOT_SCENARIO");
+    int result = 0;
+    char result_text[160] = {};
+    double result_at = 0;
     auto t0 = std::chrono::steady_clock::now();
     double last_scan = -10, last_log = 0;
     while (true) {
       std::this_thread::sleep_for(std::chrono::milliseconds(33));
       d.now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      brain.Poll(d.now);
+      if (brain.reloaded) {
+        brain.reloaded = false;
+        result = 0;
+        // BF_BOT_RESET_ON_RELOAD: every bot starts over with the new brain.
+        if (getenv("BF_BOT_RESET_ON_RELOAD"))
+          for (botapi::BotIO& b : d.bots) b.mem_tag = 0;
+      }
       if (g_in_menus) continue;
       bool rescan = d.now - last_scan > 2.0;
       if (rescan) last_scan = d.now;
-      d.Refresh(rescan);
+      bool flags_changed = d.Refresh(rescan);
       if (d.points.empty()) continue;
       if (getenv("BF_SELF_TEST")) d.SelfTest();
       d.Probe();
-      for (Bot& b : d.bots) d.Think(b);
-      if (getenv("BF_BOT_TRACE")) {  // DEBUG
-        static double last_trace = 0;
-        if (d.now - last_trace > 2.0) {
-          last_trace = d.now;
-          for (const Bot& b : d.bots) {
-            const Soldier* me = b.soldier ? d.Find(b.soldier) : nullptr;
-            const BotSlot& o = g_shared->slots[b.slot];
-            const Vehicle* bv = b.boat ? d.FindVehicle(b.boat) : nullptr;
-            if (me) RT_INFO("bot%d: %.1f,%.1f,%.1f yaw %.2f pitch %.2f  lx %.2f ly %.2f rx %.2f ry %.2f btn %X fire %d boat %s %.1f,%.1f,%.1f%s",
-                            b.slot + 1, me->pos.x, me->pos.y, me->pos.z, me->yaw, me->pitch, o.lx, o.ly, o.rx, o.ry,
-                            o.buttons, int(o.triggers >> 8 != 0), bv ? bv->kind.c_str() : "-", bv ? bv->pos.x : 0.f,
-                            bv ? bv->pos.y : 0.f, bv ? bv->pos.z : 0.f, b.boat_state == 3 ? " DRIVE" : "");
-            else RT_INFO("bot%d: no soldier", b.slot + 1);
+
+      botapi::World w{};
+      w.version = botapi::kVersion;
+      w.now = d.now;
+      w.soldiers = d.soldiers.data(), w.soldier_count = int(d.soldiers.size());
+      w.points = d.points.data(), w.point_count = int(d.points.size());
+      w.vehicles = d.vehicles.data(), w.vehicle_count = int(d.vehicles.size());
+      w.bots = d.bots.data(), w.bot_count = int(d.bots.size());
+      w.points_changed = flags_changed;
+      w.scenario = scenario;
+      w.result = result;
+      w.log = BrainLog;
+      brain.think(&w);
+      for (botapi::BotIO& b : d.bots) {
+        Pad pad = b.pad;
+        if (d.probe_slot == b.slot) pad = Pad{0, 0, 0, d.probe_dir, 0, 0};  // being identified: look up or down
+        if (b.teleport && b.soldier)
+          if (const Soldier* s = d.Find(b.soldier)) {
+            BotSlot& slot = g_shared->slots[b.slot];
+            slot.from[0] = s->pos.x, slot.from[1] = s->pos.y, slot.from[2] = s->pos.z;
+            slot.to[0] = b.to.x, slot.to[1] = b.to.y, slot.to[2] = b.to.z;
+            slot.teleport_seq = slot.teleport_seq + 1;
           }
+        Director::Commit(g_shared->slots[b.slot], pad);
+        const Soldier* bs = b.soldier ? d.Find(b.soldier) : nullptr;
+        g_shared->slots[b.slot].in_vehicle = bs && bs->vehicle ? 1 : 0;
+      }
+      const char* new_result = nullptr;
+      if (w.result && !result) {
+        result = w.result;
+        snprintf(result_text, sizeof(result_text), "%s", w.result_text);
+        result_at = d.now;
+        new_result = result_text;
+        RT_INFO("scenario: %s", result_text);
+        if (const char* p = getenv("BF_BOT_RESULT"))
+          if (FILE* f = fopen(p, "w")) fprintf(f, "%s\n", result_text), fclose(f);
+      }
+      trace.Write(d, flags_changed, new_result);
+      // DEBUG BF_SEAT_DUMP: the soldier's seat fields each second, to see them change on E.
+      static double next_dump = 0;
+      if (getenv("BF_SEAT_DUMP") && d.now >= next_dump) {
+        next_dump = d.now + 1.0;
+        for (const botapi::BotIO& b : d.bots) {
+          const Soldier* s = b.soldier ? d.Find(b.soldier) : nullptr;
+          if (!s) continue;
+          std::string words;
+          for (uint32_t off = 0x330; off < 0x380; off += 4) {
+            char w8[12];
+            snprintf(w8, sizeof(w8), " %08X", Ld32(s->obj + off));
+            words += w8;
+          }
+          uint32_t seat = Ld32(s->obj + kSoldierSeat);
+          RT_INFO("seat: bot%d at %.1f,%.1f,%.1f seat %08X->+2C %08X | 330:%s", b.slot + 1, s->pos.x, s->pos.y,
+                  s->pos.z, seat, Readable(seat) ? Ld32(seat + kSeatVehicle) : 0, words.c_str());
         }
+      }
+      // BF_BOT_SCENARIO_EXIT: end the match (and with it the bots) once judged.
+      if (result && getenv("BF_BOT_SCENARIO_EXIT") && d.now - result_at > 1.0) {
+        fflush(stdout);
+        std::_Exit(result > 0 ? 0 : 3);
       }
       if (d.now - last_log > 10) {
         last_log = d.now;
         std::string s;
-        for (const Bot& b : d.bots) {
+        for (const botapi::BotIO& b : d.bots) {
           const Soldier* me = b.soldier ? d.Find(b.soldier) : nullptr;
           char buf[128];
-          if (me) snprintf(buf, sizeof(buf), " [%d: team %d at %.0f,%.0f,%.0f -> point %d%s]", b.slot + 1, me->team,
-                           me->pos.x, me->pos.y, me->pos.z, b.target_point,
-                           b.boat_state == 3 ? " driving" : b.boat_state == 2 ? " boarding" : b.boat_state == 1 ? " to boat" : b.boat_state == 4 ? " leaving" : "");
+          if (me) snprintf(buf, sizeof(buf), " [%d: team %d at %.0f,%.0f,%.0f, %s]", b.slot + 1, me->team, me->pos.x,
+                           me->pos.y, me->pos.z, b.state);
           else snprintf(buf, sizeof(buf), " [%d: no soldier]", b.slot + 1);
           s += buf;
         }
@@ -1067,20 +812,55 @@ void SetBotSlot(const std::string& shared_name, int slot) {
 // Bot process: look speed in right-stick units (see MouseLookAxis), or false.
 bool BotLookAxis(int axis, float& value) {
   if (g_my_slot < 0 || !g_shared || !g_shared->slots[g_my_slot].active) return false;
+  if (g_shared->slots[g_my_slot].in_vehicle) return false;  // the stick (AddBotInput)
   value = axis == 0 ? g_shared->slots[g_my_slot].rx : g_shared->slots[g_my_slot].ry;
   return true;
+}
+
+// Bot process: a teleport asked for by the director (scenarios). Our client
+// soldier is the one nearest where the server sees it.
+void BotTeleport(const BotSlot& s) {
+  static uint32_t done = 0;
+  uint32_t seq = s.teleport_seq;
+  if (seq == done) return;
+  done = seq;
+  uint32_t best = 0;
+  float best_d = 15.0f;
+  for (uint32_t c : SafeScan(kClientSoldierVtable)) {
+    float x, y, z;
+    if (!SafeLdF(c + 0x3D0, x) || !SafeLdF(c + 0x3D4, y) || !SafeLdF(c + 0x3D8, z)) continue;
+    float d = std::hypot(x - s.from[0], y - s.from[1], z - s.from[2]);
+    if (d < best_d) best_d = d, best = c;
+  }
+  if (!best) {
+    RT_WARN("bots: teleport: no client soldier near %.0f,%.0f,%.0f", s.from[0], s.from[1], s.from[2]);
+    return;
+  }
+  for (int i = 0; i < 3; ++i) {
+    uint32_t u;
+    memcpy(&u, const_cast<const float*>(&s.to[i]), 4);
+    St32(best + 0x3D0 + 4 * i, u);
+  }
+  RT_INFO("bots: teleport: client soldier %08X to %.0f,%.0f,%.0f", best, s.to[0], s.to[1], s.to[2]);
+  if (getenv("BF_TELEPORT_WATCH")) StartWriteWatch(best + 0x3D0, 12, 0);  // DEBUG: who moves it back
 }
 
 bool AddBotInput(XINPUT_GAMEPAD& g) {
   if (g_my_slot < 0 || !g_shared) return false;
   const BotSlot& s = g_shared->slots[g_my_slot];
+  BotTeleport(s);
   if (!s.active) return false;
   auto axis = [](float v) { return SHORT(std::clamp(v, -1.0f, 1.0f) * 32767.0f); };
   g.sThumbLX = axis(s.lx);
   g.sThumbLY = axis(s.ly);
   // Looking goes through the unclamped mouse path (BotLookAxis), without
   // the stick's deadzone; the stick only marks the pad as active.
-  if (s.rx || s.ry) g.sThumbRX ^= 1;
+  if (s.in_vehicle) {
+    g.sThumbRX = axis(s.rx);
+    g.sThumbRY = axis(s.ry);
+  } else if (s.rx || s.ry) {
+    g.sThumbRX ^= 1;
+  }
   g.wButtons |= WORD(s.buttons);
   g.bLeftTrigger = BYTE(s.triggers & 0xFF);
   g.bRightTrigger = BYTE((s.triggers >> 8) & 0xFF);

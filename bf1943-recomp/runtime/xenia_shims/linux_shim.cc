@@ -28,5 +28,10 @@ void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
   fprintf(stderr, "[%s] %.*s\n", type == SimpleMessageBoxType::Error ? "error" : "note", int(message.size()),
           message.data());
 }
+
+// (base/assert.cc asks through SDL on Linux.) Logged; the game goes on.
+void AssertFailed(const char* expression, const char* file, int line) {
+  fprintf(stderr, "[assert] %s (%s:%d)\n", expression, file, line);
+}
 }  // namespace xe
 #endif  // !_WIN32

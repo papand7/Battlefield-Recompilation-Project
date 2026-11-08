@@ -54,8 +54,13 @@ add_custom_command(OUTPUT ${STUBS}
           ${ROOT}/generated/ppc/ppc_recomp_shared.h ${ROOT}/runtime ${STUBS}
   DEPENDS ${RUNTIME_SOURCES} ${ROOT}/tools/gen_import_stubs.py ${ROOT}/generated/ppc/ppc_recomp_shared.h)
 
-add_executable(bf1943 ${RUNTIME_SOURCES} ${STUBS})
+add_executable(bf1943 ${RUNTIME_SOURCES} ${ROOT}/runtime/bots/brain.cpp ${STUBS})
 target_include_directories(bf1943 PRIVATE ${ROOT}/runtime)
+# The bot brain alone, for reloading while a match runs (BF_BOT_BRAIN): built
+# only when asked for (cmake --build build/game --target bot_brain).
+add_library(bot_brain SHARED EXCLUDE_FROM_ALL ${ROOT}/runtime/bots/brain.cpp)
+target_compile_definitions(bot_brain PRIVATE BF_BOT_BRAIN_DLL _CRT_SECURE_NO_WARNINGS)
+target_compile_options(bot_brain PRIVATE -march=x86-64-v3)
 target_compile_options(bf1943 PRIVATE -march=x86-64-v3 -fno-strict-aliasing)
 target_link_libraries(bf1943 PRIVATE bf1943_ppc bf1943_xexload xenia_gpu xinput dbghelp dxgi d3d11 shcore dwmapi winmm bcrypt ws2_32 synchronization)
 target_compile_options(bf1943 PRIVATE /Z7)

@@ -133,8 +133,7 @@ void rt::LaunchBots() {
     std::filesystem::create_directories(user);
     std::vector<std::string> args = {g_argv[0], "--game", g_game_root.string(), "--user", user.string(), "--host",
                                      "--toy-gpu", "--headless", "--port-offset", std::to_string(10 * i),
-                                     "--host-map", g_host_map, "--gamertag", "Bot" + std::to_string(i), "--press",
-                                     "15:start,20:start,25:a,58:a,61:a,64:a,67:a,70:a,75:a"};
+                                     "--host-map", g_host_map, "--gamertag", "Bot" + std::to_string(i)};
     if (!ai.empty()) {
       args.insert(args.end(), {"--bot-ai", ai, "--bot-slot", std::to_string(i - 1)});
     }
@@ -166,7 +165,6 @@ void rt::LaunchBots() {
     std::string cmd = "\"" + g_argv[0] + "\" --game \"" + g_game_root.string() + "\" --user \"" + user.string() +
                       "\" --host --toy-gpu --headless --port-offset " + std::to_string(10 * i) + " --host-map " +
                       g_host_map + " --gamertag Bot" + std::to_string(i) +
-                      " --press 15:start,20:start,25:a,58:a,61:a,64:a,67:a,70:a,75:a" +
                       (ai.empty() ? "" : " --bot-ai " + ai + " --bot-slot " + std::to_string(i - 1));
     std::filesystem::path log = user / "bot.log";
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
@@ -377,12 +375,12 @@ int main(int argc, char** argv) {
   xgpu::SetDisplayOptions(res_scale, present_effect, window_w, window_h, shadowmap ? shadowmap : 1024);
   g_shadow_size = uint32_t(shadowmap);
   if (!bot_ai.empty() && bot_slot >= 0) SetBotSlot(bot_ai, bot_slot);
+  g_auto_start = g_dedicated || bot_slot >= 0;
   if (!join_address.empty() && !rt::lan::PrepareJoin(join_address, g_host_map.empty() ? "Wake_island_s" : g_host_map))
     RT_WARN("--join: not an IPv4 address: %s", join_address.c_str());
   if (g_dedicated) {
     if (g_host_map.empty()) g_host_map = g_map_rotation.empty() ? "Wake_island_s" : g_map_rotation[0];
     if (g_gamertag.empty() || g_gamertag == "Player") g_gamertag = "Dedicated";
-    if (g_scripted_presses.empty()) ParsePresses("15:start,20:start,25:a,30:a");
     rt::lan::StartBeacon();
     RT_INFO("dedicated server '%s': hosting %s on UDP %d (browsers: UDP 19430)%s", g_gamertag.c_str(),
             g_host_map.c_str(), 1003 + g_port_offset, g_bot_count ? ", with bots" : "");

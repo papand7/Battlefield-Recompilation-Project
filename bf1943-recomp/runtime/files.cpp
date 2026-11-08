@@ -51,6 +51,15 @@ std::string Lower(std::string s) {
 std::mutex g_content_mutex;
 std::vector<std::pair<std::string, std::filesystem::path>> g_content_roots;  // lower-case root
 
+// A guest path's rest ("dist\\xenon\\x.fbrb") as a host path: on Linux the
+// backslashes would stay part of the name.
+std::filesystem::path HostRest(std::string rest) {
+#ifndef _WIN32
+  std::replace(rest.begin(), rest.end(), '\\', '/');
+#endif
+  return rest;
+}
+
 // Returns an empty path for devices we do not know.
 std::filesystem::path MapPath(std::string guest) {
   std::replace(guest.begin(), guest.end(), '/', '\\');
@@ -70,7 +79,7 @@ std::filesystem::path MapPath(std::string guest) {
         continue;
       std::string rest = guest.substr(root.size() + 1);
       while (!rest.empty() && rest[0] == '\\') rest.erase(0, 1);
-      return rest.empty() ? host : host / rest;
+      return rest.empty() ? host : host / HostRest(rest);
     }
   }
   for (auto& p : kPrefixes) {
@@ -80,15 +89,15 @@ std::filesystem::path MapPath(std::string guest) {
     while (!rest.empty() && rest[0] == '\\') rest.erase(0, 1);
     std::filesystem::path root = p.game ? g_game_root : g_user_root / "hdd";
     // The engine's optional settings file lives with the user's files, not the game's.
-    if (p.game && Lower(rest) == "xenongamesettings.cfg") return g_user_root / rest;
+    if (p.game && Lower(rest) == "xenongamesettings.cfg") return g_user_root / HostRest(rest);
     // Game files patched for the PC (tools/menu_patch.py) take the place of
     // the originals from <user>/override/.
     if (p.game && !rest.empty()) {
       std::error_code ec;
-      std::filesystem::path over = g_user_root / "override" / rest;
+      std::filesystem::path over = g_user_root / "override" / HostRest(rest);
       if (std::filesystem::is_regular_file(over, ec)) return over;
     }
-    return rest.empty() ? root : root / rest;
+    return rest.empty() ? root : root / HostRest(rest);
   }
   return {};
 }

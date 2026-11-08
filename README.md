@@ -114,8 +114,8 @@ bf1943.exe --game <your game files> --dedicated --name "My Server" --maps Wake_i
 ```
 
 **Linux server (experimental):** a native Linux build of the dedicated server
-(`bf1943_server`) now builds, but hasn't been run on Linux yet. See
-[the developer guide](docs/DEVELOPERS.md) to try it.
+(`bf1943_server`) runs on Ubuntu 24.04 (tested in WSL2), and the Windows game can join
+it. See [the developer guide](docs/DEVELOPERS.md) to try it.
 
 To join a server that isn't on your network: **Join Game → Address**, or start the game with
 `--join <address> --host-map <its map>`.
@@ -124,7 +124,7 @@ To join a server that isn't on your network: **Join Game → Address**, or start
 
 - Ray-traced effects need a GPU with ray tracing (for example NVIDIA RTX or AMD RX 6000 and newer).
   Without it you still get everything else, with screen-space shadows instead.
-- Still being worked on: Bad Company, bots using vehicles, softer edges on ray-traced shadows
+- Still being worked on: Bad Company, bots in jeeps, tanks and planes (they already use the landing craft), softer edges on ray-traced shadows
   up close, and an occasional crash at 4K.
 
 ---

@@ -84,7 +84,7 @@ type), animated, for mouse, keyboard and controller alike.
 - **HOST GAME**: pick the map (Wake Island, Iwo Jima, Guadalcanal, Coral Sea air
   superiority) and bot count; no sign-in needed.
 - **JOIN GAME**: LAN server browser, or join by address.
-- **Bots**: AI players for hosted games (control-point strategy, combat, swimming ashore).
+- **Bots**: AI players for hosted games (control-point strategy, combat, landing craft from the carriers).
 - Optional EA-server emulator (`server/arcadia360`, Arcadia, GPL-2.0).
 
 ## Layout
@@ -101,7 +101,7 @@ VulkanMemoryAllocator (MIT), FFmpeg subset (LGPL-2.1), Arcadia (GPL-2.0).
 Fonts in `bf1943-recomp/data/fonts`: Stardos Stencil (SIL OFL 1.1), Special Elite (Apache 2.0).
 Battlefield is a trademark of Electronic Arts; this project is not affiliated with EA or DICE.
 
-## Linux dedicated server (builds; not yet run on Linux)
+## Linux dedicated server
 
 `bf1943-recomp/game/linux/CMakeLists.txt` builds `bf1943_server`: the recompiled game and the
 runtime with clang on Linux, without GPU, sound output, window or PC menus
@@ -124,9 +124,47 @@ cmake -S bf1943-recomp/game/linux -B bf1943-recomp/build/linux -G Ninja -DCMAKE_
 cmake --build bf1943-recomp/build/linux
 ```
 
-That build compiles and links (an x86-64 ELF), but hasn't been run on Linux yet. Bots run as on Windows (shared memory
+The cross-compiled server runs on Ubuntu 24.04 (tested in WSL2): it passes the title,
+hosts the map, and a Windows client joined it (`--join <server IP>`). Copy the game files
+onto the Linux disk: loading them from a Windows drive in WSL is slow. Bots run as on Windows (shared memory
 through shm_open, bot copies by fork/exec, ending with the server). Audio: Xenia's XMA decoder (FFmpeg xmaframes) is built for Linux too, with no sound
 device (the game's audio code needs the decoding, without it the front end hangs);
 `--no-audio` runs Windows the same way, and a dedicated server run like that hosted a
 game a client joined and played. Still missing: a full Linux client (Vulkan presenter,
 input, sound output).
+
+## Working on the bots
+
+The bot decisions are in `bf1943-recomp/runtime/bots/brain.cpp`, behind a small C interface
+(`bots/bot_api.h`); `runtime/bots.cpp` reads the match from the server and passes each
+bot's pad on. Testing switches (environment variables, on the hosting game):
+
+- `BF_BOT_BRAIN=<path to build/game/bot_brain.dll>`: use the brain from that DLL, reloaded whenever it
+  changes, so a running match picks up a change. Rebuild it (about 3 s) with
+  `cmake --build build/game --target bot_brain`. Each bot's state is kept across reloads,
+  unless the state struct changed size.
+- `BF_BOT_SCENARIO="walk <flag>" | "board <kind>" | "drive <kind> <flag>"`: every bot does
+  only that and the result is logged as `scenario: PASS ...` or `FAIL ...` (time limit
+  `BF_BOT_SCENARIO_TIME`, default 180 s; `BF_BOT_RESULT=<file>` writes it to a file;
+  `BF_BOT_SCENARIO_EXIT=1` ends the run once judged, exit code 0 or 3).
+- `BF_BOT_LOG=<file.csv>`: every bot's position, vehicle and state twice a second, with
+  the flags and vehicles; `python bf1943-recomp/tools/bot_paths.py <file.csv>` draws it.
+
+An unattended test, headless (from `bf1943-recomp/`, in cmd):
+
+```
+set BF_BOT_SCENARIO=board LCVP
+set BF_BOT_SCENARIO_EXIT=1
+set BF_BOT_LOG=board.csv
+build/game/bf1943.exe --dedicated --bots 1 --host-map Wake_island_s --user userdata_test
+python tools/bot_paths.py board.csv
+```
+
+Vehicles: bots take the landing craft from the carriers (LT is the throttle and lets the
+craft down from its crane, the left stick steers; seated shows in the soldier's byte at
++34C). `BF_BOT_NO_VEHICLES` turns that off; jeeps and tanks (untested) only with
+`BF_BOT_VEHICLES`.
+
+Not working yet: the scenarios' `near` (teleporting a bot next to the vehicle or flag).
+Writing the soldier's position on the server (+180) or in the bot's client (+3D0) is put
+back every frame (by `sub_82536548` on the server and `sub_821F99B0` on the client).

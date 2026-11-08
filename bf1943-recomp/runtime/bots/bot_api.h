@@ -1,0 +1,102 @@
+// The bot brain's interface. bots.cpp (the host) reads the server's soldiers,
+// flags and vehicles into a World and asks the brain (brain.cpp) for every
+// bot's pad. Plain structs and one C function, so the brain can also be built
+// as bot_brain.dll and reloaded while a match runs (BF_BOT_BRAIN=<dll>, see
+// docs/DEVELOPERS.md): its state lives in BotIO::mem, kept by the host.
+#pragma once
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
+namespace botapi {
+
+constexpr int kVersion = 1;      // bump when a struct here changes
+constexpr int kMaxBots = 16;
+constexpr int kMemSize = 1024;   // per-bot brain state
+constexpr float kPi = 3.14159265f;
+
+// Pad buttons (XInput's bits).
+enum : uint32_t { kDpadRight = 0x0008, kLeftThumb = 0x0040, kA = 0x1000, kB = 0x2000 };
+
+struct Vec { float x = 0, y = 0, z = 0; };
+struct Soldier {
+  uint32_t obj;
+  int team;          // 1 US, 2 Japan
+  Vec pos;
+  float yaw, pitch;  // radians; forward = (sin yaw, cos yaw) in x/z
+  uint32_t vehicle;  // the vehicle it sits in (its seat), 0 on foot
+};
+struct Point { uint32_t obj; int owner; Vec pos; };
+struct Vehicle { uint32_t obj; char kind[32]; Vec pos; };
+struct Pad {
+  float lx, ly, rx, ry;  // -1..1 (ly + forward, ry + look up)
+  uint32_t buttons;
+  uint32_t triggers;     // lt | rt << 8
+};
+
+struct BotIO {
+  int slot;
+  uint32_t soldier;     // in: its soldier, 0 while dead or not identified yet
+  Pad pad;              // out
+  char state[24];       // out: what it is doing (logs, BF_BOT_LOG)
+  bool teleport;        // out: put the soldier at `to` (scenarios)
+  Vec to;
+  uint32_t mem_tag;     // the brain's state: reset when the tag isn't its own
+  alignas(8) unsigned char mem[kMemSize];
+};
+
+struct World {
+  int version;
+  double now;  // seconds
+  const Soldier* soldiers; int soldier_count;
+  const Point* points; int point_count;
+  const Vehicle* vehicles; int vehicle_count;
+  BotIO* bots; int bot_count;
+  bool points_changed;   // the flags were found again: targets are stale
+  const char* scenario;  // BF_BOT_SCENARIO, or null
+  int result;            // out: 1 the scenario passed, -1 failed
+  char result_text[160];
+  void (*log)(const char* text);
+};
+
+using ThinkFn = void (*)(World*);
+
+inline float Wrap(float a) {
+  while (a > kPi) a -= 2 * kPi;
+  while (a < -kPi) a += 2 * kPi;
+  return a;
+}
+inline float Dist2D(Vec a, Vec b) { return std::hypot(a.x - b.x, a.z - b.z); }
+inline float Dist3D(Vec a, Vec b) { return std::hypot(Dist2D(a, b), a.y - b.y); }
+
+// Turn the view towards a yaw and pitch (right stick).
+inline void Steer(Pad& out, const Soldier& me, float want_yaw, float want_pitch) {
+  float e = Wrap(want_yaw - me.yaw);
+  out.rx = std::clamp(-e * 2.0f, -1.5f, 1.5f);
+  float ep = want_pitch - me.pitch;
+  float ry = std::clamp(ep * 2.0f, -1.5f, 1.5f);
+  if (std::fabs(ep) > 0.03f && std::fabs(ry) < 0.35f) ry = ry < 0 ? -0.35f : 0.35f;  // small pitch inputs don't move it
+  out.ry = ry;
+}
+
+// Walk towards a target, whatever way the soldier faces (left stick).
+inline void Walk(Pad& out, const Soldier& me, Vec target, float speed) {
+  float dx = target.x - me.pos.x, dz = target.z - me.pos.z;
+  float len = std::hypot(dx, dz);
+  if (len < 0.5f) { out.lx = out.ly = 0; return; }
+  dx /= len, dz /= len;
+  float fx = std::sin(me.yaw), fz = std::cos(me.yaw);  // forward
+  float rxv = -fz, rzv = fx;                            // right
+  out.ly = std::clamp((dx * fx + dz * fz) * speed, -1.0f, 1.0f);
+  out.lx = std::clamp((dx * rxv + dz * rzv) * speed, -1.0f, 1.0f);
+}
+
+}  // namespace botapi
+
+#ifdef BF_BOT_BRAIN_DLL
+#define BOT_BRAIN_API extern "C" __declspec(dllexport)
+#else
+#define BOT_BRAIN_API extern "C"
+#endif
+BOT_BRAIN_API void BotBrainThink(botapi::World* w);
+BOT_BRAIN_API int BotBrainVersion();

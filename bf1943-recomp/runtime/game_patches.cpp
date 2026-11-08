@@ -168,6 +168,7 @@ GAME_PATCH(823CD3E8) {
 void rt::RequestHost() { g_host_state = 2; }
 
 bool rt::g_dedicated = false;
+bool rt::g_auto_start = false;
 std::vector<std::string> rt::g_map_rotation;
 
 static void HostFromMainLoop(PPCContext& ctx, uint8_t* base) {

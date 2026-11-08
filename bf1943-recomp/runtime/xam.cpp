@@ -645,15 +645,22 @@ GUEST_IMPORT(XamInputGetState) {
     stage[3] = s.Gamepad.wButtons;
     AddBotInput(s.Gamepad);
     stage[4] = s.Gamepad.wButtons;
-    // Dedicated server: its own player confirms the loading screen (A, or the
-    // level times out back to the menu) and then waits on the spawn screen.
-    if (g_dedicated) {
+    // Dedicated server and bot copies: Start until the title screen is passed
+    // and A on the dialogs after it (however long loading takes), then A on
+    // the loading screen (or the level times out back to the menu). The
+    // server's player then waits on the spawn screen; a bot's AI takes over.
+    if (g_auto_start) {
       static bool spawn_seen = false;
       if (g_in_menus) spawn_seen = false;
       if (g_level_menu) spawn_seen = true;
-      if (!g_in_menus && !spawn_seen) {
-        double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (std::fmod(t, 2.0) < 0.15) s.Gamepad.wButtons |= XINPUT_GAMEPAD_A;
+      double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      bool pulse = std::fmod(t, 2.0) < 0.15;
+      if (g_in_menus && !g_title_passed) {
+        if (pulse) s.Gamepad.wButtons |= XINPUT_GAMEPAD_START;
+      } else if (g_in_menus && GameDialogs() > 0) {
+        if (pulse) s.Gamepad.wButtons |= XINPUT_GAMEPAD_A;
+      } else if (!g_in_menus && !spawn_seen && pulse) {
+        s.Gamepad.wButtons |= XINPUT_GAMEPAD_A;
       }
     }
     // The PC menus are up (or working the game's pause menu): the game gets
