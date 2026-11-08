@@ -57,10 +57,18 @@ The original intro and title screen are kept.
 
 ## Playing
 
-1. Have your own Battlefield 1943 (Xbox 360) game files.
-2. Build the game and launcher. This is a one-time step for now, as there is no ready-made
-   download yet; see [the developer guide](docs/DEVELOPERS.md).
-3. Start the **launcher**, point it at your game files, pick your settings and press **Play**.
+You need your own copy of Battlefield 1943 for Xbox 360, **version 1.06** (the game package
+file, or `default.xex` in an unpacked folder). Nothing of the game is included here.
+
+1. Download the release and unzip it anywhere, then start **Launcher\BF1943Launcher.exe**.
+2. The first time, the launcher sets the game up for you: press **Choose game files…**, pick
+   your game package, then press **INSTALL**. It:
+   - copies your game files and checks that they are version 1.06,
+   - installs the free build tools it needs (LLVM, CMake, Visual Studio C++ build tools,
+     Vulkan SDK) through winget,
+   - recompiles the game code and builds the game on your PC (about 20-60 minutes).
+   Keep the launcher open while it works.
+3. Pick your settings and press **Play**.
 
 Everything can also be changed in game under **Settings** (or press **F10** at any time).
 

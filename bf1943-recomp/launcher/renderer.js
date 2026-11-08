@@ -62,7 +62,72 @@ function selectGame(key) {
   document.title = g.title;
   setStatus(g.error || '', !!g.error);
   $('play').disabled = !!g.error;
+  showSetup(key === 'bf1943' && !!g.error);
 }
+
+// ---- first-run setup: the game built here from the player's own copy ----------
+let gamePath = null;
+let setupState = null;
+async function showSetup(on) {
+  $('setupcard').hidden = !on;
+  $('graphicscard').hidden = on;
+  if (!on) return;
+  setupState = await window.launcher.setupStatus();
+  if (!setupState.ok) {
+    setStatus(setupState.error, true);
+    $('pick').disabled = $('install').disabled = true;
+    return;
+  }
+  setStatus('Set up the game first (right).');
+  if (setupState.gameFiles) {
+    $('pickpath').textContent = 'Game files already in place';
+    markStep('game', 'done');
+  }
+  $('install').disabled = !(gamePath || setupState.gameFiles);
+}
+function markStep(name, state) {
+  const li = document.querySelector(`.steps li[data-step="${name}"]`);
+  if (li) li.className = state;
+}
+const logLines = [];
+function addLog(line) {
+  logLines.push(line);
+  if (logLines.length > 6) logLines.shift();
+  $('setuplog').textContent = logLines.join('\n');
+}
+$('pick').onclick = async () => {
+  const p = await window.launcher.setupPick();
+  if (!p) return;
+  gamePath = p;
+  $('pickpath').textContent = p;
+  $('pickpath').title = p;
+  markStep('game', '');
+  $('install').disabled = false;
+};
+$('install').onclick = async () => {
+  $('install').disabled = $('pick').disabled = true;
+  $('install').textContent = 'INSTALLING…';
+  setStatus('Setting up… keep the launcher open.');
+  const r = await window.launcher.setupRun(gamePath);
+  if (r.error) {
+    setStatus(r.error, true);
+    $('install').textContent = 'TRY AGAIN';
+    $('install').disabled = $('pick').disabled = false;
+    return;
+  }
+  $('barfill').style.width = '100%';
+  setStatus('Ready. Have fun!');
+  await init();
+};
+window.launcher.onSetupEvent((ev) => {
+  if (ev.step) {
+    markStep(ev.step, ev.state);
+    if (ev.state === 'run' && ev.text) addLog(ev.text);
+    if (ev.state === 'fail' && ev.text) addLog('Failed: ' + ev.text);
+  }
+  if (ev.log) addLog(ev.log);
+  if (ev.progress !== undefined) $('barfill').style.width = Math.round(ev.progress * 100) + '%';
+});
 
 async function init() {
   const state = await window.launcher.state();

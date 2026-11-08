@@ -1,5 +1,6 @@
 // Electron main process: finds the game, keeps the settings and starts bf1943.exe.
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const setup = require('./setup');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -40,7 +41,8 @@ function find(...names) {
 const findDir = (...markers) => { const f = find(...markers); return f && path.dirname(f); };
 
 // One entry per port: its exe, the dumped game files and its HD texture pack.
-const games = {
+// Looked up again on every state request (the first-run setup makes them).
+const scanGames = () => ({
   bf1943: {
     title: 'Battlefield 1943',
     exe: find('bf1943.exe', 'build/game/bf1943.exe', 'game/bf1943.exe'),
@@ -55,7 +57,9 @@ const games = {
     textures: findDir('texpack_bfbc1/install/replacements.txt'),
     dataHint: 'bfbc1\extracted',
   },
-};
+});
+let games = scanGames();
+const launcherDir = app.isPackaged ? path.dirname(process.execPath) : __dirname;
 function problem(g) {
   return !g.exe ? `${g.title}: exe not found next to the launcher.`
        : !g.data ? `${g.title}: game files (${g.dataHint}) not found.` : null;
@@ -82,7 +86,7 @@ function createWindow() {
   win.once('ready-to-show', () => win.show());
 }
 
-ipcMain.handle('state', () => ({
+ipcMain.handle('state', () => (games = scanGames(), {
   settings: load(),
   games: Object.fromEntries(Object.entries(games).map(([k, g]) =>
     [k, { title: g.title, error: problem(g), hasTextures: !!g.textures }])),
@@ -114,6 +118,31 @@ ipcMain.handle('play', (_, s) => {
     game.once('spawn', () => { win.minimize(); resolve({}); });
     game.once('exit', () => { win.restore(); win.focus(); win.webContents.send('game-exited'); });
   });
+});
+
+// First-run setup (setup.js): status, choosing the game files, running it.
+ipcMain.handle('setup-status', () => setup.status(launcherDir));
+ipcMain.handle('setup-pick', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Your Battlefield 1943 game: the Xbox 360 package file, or default.xex in an unpacked folder',
+    properties: ['openFile'],
+    filters: [{ name: 'Game package or default.xex', extensions: ['*'] }],
+  });
+  return r.canceled ? null : r.filePaths[0];
+});
+let setupRunning = false;
+ipcMain.handle('setup-run', async (_, gamePath) => {
+  if (setupRunning) return { error: 'Setup is already running.' };
+  setupRunning = true;
+  try {
+    await setup.setup(launcherDir, gamePath, (ev) => win.webContents.send('setup-event', ev));
+    games = scanGames();
+    return {};
+  } catch (e) {
+    return { error: e.message };
+  } finally {
+    setupRunning = false;
+  }
 });
 
 ipcMain.on('minimize', () => win.minimize());

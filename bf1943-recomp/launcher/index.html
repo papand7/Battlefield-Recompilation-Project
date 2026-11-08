@@ -38,7 +38,26 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card setup" id="setupcard" hidden>
+      <h2>Set up Battlefield 1943</h2>
+      <p class="hint">The game is built on this PC from your own copy. Choose your game files: the Xbox 360
+        package of Battlefield 1943 (version 1.06), or <b>default.xex</b> in a folder you unpacked.</p>
+      <div class="pick">
+        <button id="pick" class="ghost">Choose game files…</button>
+        <div id="pickpath" class="hint path">No files chosen</div>
+      </div>
+      <ol class="steps">
+        <li data-step="game"><span class="dot"></span>Game files</li>
+        <li data-step="tools"><span class="dot"></span>Build tools (LLVM, CMake, Visual Studio C++, Vulkan SDK)</li>
+        <li data-step="recompile"><span class="dot"></span>Recompile the game code</li>
+        <li data-step="build"><span class="dot"></span>Build the game</li>
+      </ol>
+      <div class="bar"><span id="barfill"></span></div>
+      <pre id="setuplog" class="log"></pre>
+      <button id="install" class="play small" disabled>INSTALL</button>
+    </section>
+
+    <section class="card" id="graphicscard">
       <h2>Graphics</h2>
       <div id="rows"></div>
       <div class="line"></div>
