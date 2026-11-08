@@ -4,7 +4,8 @@
 Windows at high frame rates and resolutions, with modern graphics, full mouse and keyboard
 controls, LAN multiplayer with bots, and a brand-new menu.
 
-Battlefield: Bad Company is next (work in progress).
+Battlefield: Bad Company is in progress: it boots, plays its first mission at about 100 fps
+with keyboard and mouse, and logs in to the local online service. Hosting isn't working yet.
 
 > You need your own copy of the game. Nothing from the game itself is included here.
 
@@ -52,8 +53,8 @@ The original intro and title screen are kept.
 - Proper **mouse and keyboard**, every key rebindable; a controller works too.
 - **Vehicles on the keyboard**: W/S for throttle and brake, A/D to steer, arrow keys to fly planes,
   and a separate plane mouse sensitivity.
-- **Host a game** on your network (pick the island and add **bots**) or **join** one from the
-  server browser. No account or sign-in needed.
+- **Host a game** and **join** one are being rebuilt for the new menus, so they aren't working
+  right now (they worked with the original menus). A dedicated server still runs from the console.
 
 ## Playing
 
@@ -99,9 +100,8 @@ All keys can be changed under **Settings → Keys**.
 
 ### Multiplayer
 
-- **Host Game**: choose Wake Island, Iwo Jima, Guadalcanal or Coral Sea (air battle) and how
-  many bots to add, then **Start Server**. Friends on your network see it in **Join Game**.
-- **Join Game**: games on your network show up by themselves; for one further away, type its address.
+- **Host Game** and **Join Game** are not working in the rewritten menus at the moment. Use
+  a dedicated server (below), and the bot setup is still available through the command line.
 - The host's firewall needs to let the game through (UDP ports 1003 and 19430).
 
 ### Run your own server
@@ -120,11 +120,26 @@ it. See [the developer guide](docs/DEVELOPERS.md) to try it.
 To join a server that isn't on your network: **Join Game → Address**, or start the game with
 `--join <address> --host-map <its map>`.
 
+## Battlefield: Bad Company (work in progress)
+
+The same recompiler is being used for Battlefield: Bad Company (Xbox 360). Current state:
+
+- Boots to the menu and runs the first mission at about 100 fps at 1× render scale, with
+  keyboard, mouse and the HUD working.
+- Online login works against the local service, and the server list reports "no games"
+  because nothing is hosted yet. Hosting isn't working.
+- Not done yet: ray-traced shadows (they stall the opening cutscene), blood, the HD texture
+  pack, and saving the campaign.
+
+| In game | Multiplayer menu |
+|---|---|
+| ![Bad Company, first mission](docs/images/bfbc1_gameplay.png) | ![Bad Company, multiplayer menu](docs/images/bfbc1_multiplayer.png) |
+
 ## Good to know
 
 - Ray-traced effects need a GPU with ray tracing (for example NVIDIA RTX or AMD RX 6000 and newer).
   Without it you still get everything else, with screen-space shadows instead.
-- Still being worked on: Bad Company, bots in jeeps, tanks and planes (they already use the landing craft), softer edges on ray-traced shadows
+- Still being worked on: Bad Company, hosting and joining in the new menus, bots in jeeps, tanks and planes (they already use the landing craft), softer edges on ray-traced shadows
   up close, and an occasional crash at 4K.
 
 ---
