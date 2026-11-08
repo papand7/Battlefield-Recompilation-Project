@@ -13,6 +13,8 @@ file(GLOB XENIA_GPU_SOURCES CONFIGURE_DEPENDS
   ${XE}/src/xenia/apu/xaudio2/*.cc
   ${XE}/third_party/glslang/SPIRV/*.cpp
   ${ROOT}/runtime/xenia_shims/*.cc)
+# The POSIX/Linux halves of Xenia's base (for the Linux server) are not for Windows.
+list(FILTER XENIA_GPU_SOURCES EXCLUDE REGEX "_posix\.cc$|system_gnulinux\.cc$")
 add_library(xenia_gpu STATIC ${XENIA_GPU_SOURCES})
 target_include_directories(xenia_gpu PUBLIC
   ${ROOT}/runtime/xenia_shims    # must win over the real kernel/cpu/memory headers

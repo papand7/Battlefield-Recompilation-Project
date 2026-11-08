@@ -142,6 +142,7 @@ extern std::string g_online_server;  // --online-server: EA host names (*.ea.com
 extern uint32_t g_lan_ip;            // --lan-ip: address in our XNADDR (network order)
 void RegisterHostedGame(uint16_t port, const std::string& map);  // net.cpp: list on Arcadia
 extern uint16_t g_port_offset;       // --port-offset: added to bound ports
+extern bool g_no_audio;         // --no-audio (and the Linux server): no XMA, no output
 extern std::string g_audio_wav;  // --audio-wav: also write the mixed output (front L/R) here
 
 // Virtual pad button presses at fixed times since start (--press), for tests.

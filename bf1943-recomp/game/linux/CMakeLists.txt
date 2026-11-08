@@ -1,5 +1,5 @@
 # Linux console server (bf1943_server): the recompiled game and the runtime,
-# without GPU, audio, window or PC menus (runtime/linux_server.cpp has
+# without GPU, sound output, window or PC menus (runtime/linux_server.cpp has
 # their stand-ins). Same generated/ppc as the Windows build (run XenonRecomp
 # on your own default.xex first, see the README).
 #
@@ -50,8 +50,28 @@ add_custom_command(OUTPUT ${STUBS}
           ${ROOT}/generated/ppc/ppc_recomp_shared.h ${ROOT}/runtime ${STUBS}
   DEPENDS ${RUNTIME_SOURCES} ${ROOT}/tools/gen_import_stubs.py ${ROOT}/generated/ppc/ppc_recomp_shared.h)
 
+# Audio: Xenia's XMA decoder (FFmpeg's xmaframes) with no sound device. The
+# game's audio code needs the decoding to run: without it the front end hangs.
+set(FFMPEG_DIR ${ROOT}/thirdparty/ffmpeg)
+include(${FFMPEG_DIR}/sources.cmake)
+add_library(bf1943_ffmpeg STATIC ${FFMPEG_SOURCES})
+target_compile_definitions(bf1943_ffmpeg PRIVATE HAVE_AV_CONFIG_H _USE_MATH_DEFINES)
+target_include_directories(bf1943_ffmpeg PRIVATE ${FFMPEG_DIR}/xenia-config ${FFMPEG_DIR} ${FFMPEG_DIR}/libavcodec)
+target_include_directories(bf1943_ffmpeg INTERFACE ${FFMPEG_DIR}/xenia-config ${FFMPEG_DIR})
+target_compile_options(bf1943_ffmpeg PRIVATE -w -Wno-incompatible-pointer-types)
+set(XE ${ROOT}/thirdparty/xenia)
+file(GLOB XENIA_APU_SOURCES CONFIGURE_DEPENDS ${XE}/src/xenia/base/*.cc ${XE}/src/xenia/apu/*.cc)
+list(FILTER XENIA_APU_SOURCES EXCLUDE REGEX "_win\\.cc$|system_gnulinux\\.cc$|png_utils\\.cc$")
+list(APPEND XENIA_APU_SOURCES ${ROOT}/runtime/xenia_shims/apu_bridge.cc ${ROOT}/runtime/xenia_shims/memory_shim.cc
+     ${ROOT}/runtime/xenia_shims/profiling_stub.cc ${ROOT}/runtime/xenia_shims/linux_shim.cc)
+add_library(xenia_apu STATIC ${XENIA_APU_SOURCES})
+target_include_directories(xenia_apu PUBLIC ${ROOT}/runtime/xenia_shims ${XE}/src ${XE} ${XE}/third_party/fmt/include)
+target_compile_definitions(xenia_apu PUBLIC FMT_HEADER_ONLY XXH_INLINE_ALL)
+target_compile_options(xenia_apu PRIVATE -march=x86-64-v3 -w)
+target_link_libraries(xenia_apu PUBLIC bf1943_ffmpeg)
+
 add_executable(bf1943_server ${RUNTIME_SOURCES} ${STUBS})
 target_include_directories(bf1943_server PRIVATE ${ROOT}/runtime ${ROOT}/runtime/xenia_shims)
 target_compile_options(bf1943_server PRIVATE -march=x86-64-v3 -fno-strict-aliasing)
-target_link_libraries(bf1943_server PRIVATE bf1943_ppc bf1943_xexload Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(bf1943_server PRIVATE bf1943_ppc bf1943_xexload xenia_apu Threads::Threads ${CMAKE_DL_LIBS})
 target_link_options(bf1943_server PRIVATE -rdynamic)  # symbol names in crash stacks

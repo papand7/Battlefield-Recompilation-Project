@@ -8,7 +8,9 @@
 #include <cstring>
 #include <memory>
 
+#ifdef _WIN32
 #include "xenia/apu/xaudio2/xaudio2_audio_driver.h"
+#endif
 #include "xenia/apu/xma_context.h"
 #include "xenia/apu/xma_decoder.h"
 #include "xenia/base/byte_order.h"
@@ -30,7 +32,11 @@ constexpr int kMaxClients = 8;
 constexpr int kQueuedFrames = 64;  // Xenia's kMaximumQueuedFrames
 struct Client {
   std::unique_ptr<xe::threading::Semaphore> semaphore;
+#ifdef _WIN32
   std::unique_ptr<xe::apu::xaudio2::XAudio2AudioDriver> driver;
+#else
+  std::unique_ptr<int> driver;  // no sound device (the Linux server)
+#endif
 };
 Client g_clients[kMaxClients];
 
@@ -162,12 +168,19 @@ uint32_t XMADisableContext(uint32_t c, uint32_t wait) {
 
 // ---- render driver clients -------------------------------------------------------
 int OpenClient() {
+#ifndef _WIN32
+  return -1;  // no sound device: the client runs silent (audio.cpp)
+#endif
   for (int i = 0; i < kMaxClients; ++i) {
     Client& cl = g_clients[i];
     if (cl.driver) continue;
     cl.semaphore = xe::threading::Semaphore::Create(kQueuedFrames, kQueuedFrames);
+#ifdef _WIN32
     cl.driver = std::make_unique<xe::apu::xaudio2::XAudio2AudioDriver>(cl.semaphore.get());
     if (!cl.driver->Initialize()) {
+#else
+    if (true) {
+#endif
       cl.driver.reset();
       cl.semaphore.reset();
       return -1;
@@ -178,7 +191,9 @@ int OpenClient() {
 }
 void CloseClient(int index) {
   if (index < 0 || index >= kMaxClients || !g_clients[index].driver) return;
+#ifdef _WIN32
   g_clients[index].driver->Shutdown();
+#endif
   g_clients[index].driver.reset();
   g_clients[index].semaphore.reset();
 }
@@ -188,8 +203,12 @@ bool TakeFrameSlot(int index) {
                     xe::threading::WaitResult::kSuccess;
 }
 void SubmitFrame(int index, uint32_t samples) {
+#ifdef _WIN32
   if (index >= 0 && index < kMaxClients && g_clients[index].driver)
     g_clients[index].driver->SubmitFrame(reinterpret_cast<float*>(Ptr(samples)));
+#else
+  (void)index, (void)samples;
+#endif
 }
 
 }  // namespace rt::xapu

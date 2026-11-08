@@ -2,9 +2,18 @@
 #include "xenia/memory.h"
 #include "xenia/base/mutex.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <sys/mman.h>
+// Linux (the console server, no GPU): page protection through mprotect; the
+// write watches are never armed there, so no fault handler.
+using DWORD = uint32_t;
+constexpr DWORD PAGE_READONLY = PROT_READ, PAGE_READWRITE = PROT_READ | PROT_WRITE;
+namespace rt { bool IsCommitted(uint32_t guest); }
+#endif
 
 #include <bitset>
 #include <mutex>
@@ -28,13 +37,18 @@ auto WatchLock() { return global_critical_region::AcquireDirect(); }
 std::bitset<kPageCount>* g_watched = nullptr;
 std::vector<Callback*> g_callbacks;
 Memory* g_memory = nullptr;
-PVOID g_veh = nullptr;
-
 void Protect(uint8_t* physical_membase, uint32_t first_page, uint32_t page_count, DWORD protect) {
+#ifdef _WIN32
   DWORD old;
   VirtualProtect(physical_membase + size_t(first_page) * kPageSize, size_t(page_count) * kPageSize,
                  protect, &old);
+#else
+  mprotect(physical_membase + size_t(first_page) * kPageSize, size_t(page_count) * kPageSize, int(protect));
+#endif
 }
+
+#ifdef _WIN32
+PVOID g_veh = nullptr;
 
 LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* ep) {
   auto* rec = ep->ExceptionRecord;
@@ -45,6 +59,7 @@ LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* ep) {
              ? EXCEPTION_CONTINUE_EXECUTION
              : EXCEPTION_CONTINUE_SEARCH;
 }
+#endif
 }  // namespace
 
 Memory* Memory::Current() { return g_memory; }
@@ -53,12 +68,16 @@ Memory::Memory(uint8_t* guest_base)
     : virtual_membase_(guest_base), physical_membase_(guest_base + kPhysicalWindow) {
   g_watched = new std::bitset<kPageCount>();
   g_memory = this;
+#ifdef _WIN32
   // First in the chain, ahead of the runtime's fault reporter.
   g_veh = AddVectoredExceptionHandler(1, WatchHandler);
+#endif
 }
 
 Memory::~Memory() {
+#ifdef _WIN32
   if (g_veh) RemoveVectoredExceptionHandler(g_veh);
+#endif
   g_memory = nullptr;
 }
 
@@ -66,10 +85,14 @@ Memory* GetMemory() { return g_memory; }
 
 bool IsPhysicalCommitted(uint32_t physical_address) {
   if (!g_memory) return false;
+#ifdef _WIN32
   MEMORY_BASIC_INFORMATION mbi;
   if (!VirtualQuery(g_memory->physical_membase() + (physical_address & 0x1FFFFFFF), &mbi, sizeof(mbi)))
     return false;
   return mbi.State == MEM_COMMIT;
+#else
+  return rt::IsCommitted(0xA0000000u + (physical_address & 0x1FFFFFFF));
+#endif
 }
 
 void* Memory::RegisterPhysicalMemoryInvalidationCallback(
@@ -123,9 +146,13 @@ bool Memory::HandleWriteFault(void* host_address) {
   if (!g_watched->test(page)) {
     // Another thread lifted this watch between our fault and taking the lock:
     // retry the write if the page is writable again.
+#ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi;
     return VirtualQuery(a, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE));
+#else
+    return true;
+#endif
   }
   // Let every listener drop its copy; each returns the range it is fine to unwatch.
   uint32_t unwatch_start = page * kPageSize, unwatch_end = unwatch_start + kPageSize;

@@ -47,36 +47,7 @@ void TriggerWatches(uint32_t, uint32_t) {}
 bool CaptureFrame(const char*, FrameStats*) { return false; }
 }  // namespace rt::xgpu
 
-// ---- audio: no device. XMA contexts report their input used up and no
-// output, so the game's mixer moves on without sound. -----------------------
-namespace rt::xapu {
-bool Start(uint8_t*, uint32_t (*)(uint32_t, uint32_t)) { return false; }
-uint32_t ContextArray() { return 0; }
-void WriteRegister(uint32_t, uint32_t) {}
-uint32_t ReadRegister(uint32_t) { return 0; }
-uint32_t XMACreateContext(uint32_t) { return 0; }
-uint32_t XMAReleaseContext(uint32_t) { return 0; }
-uint32_t XMAInitializeContext(uint32_t, uint32_t) { return 0; }
-uint32_t XMAIsInputBuffer0Valid(uint32_t) { return 0; }
-uint32_t XMAIsInputBuffer1Valid(uint32_t) { return 0; }
-uint32_t XMAIsOutputBufferValid(uint32_t) { return 0; }
-uint32_t XMAGetOutputBufferReadOffset(uint32_t) { return 0; }
-uint32_t XMAGetOutputBufferWriteOffset(uint32_t) { return 0; }
-uint32_t XMAGetInputBufferReadOffset(uint32_t) { return 0; }
-uint32_t XMASetInputBuffer0Valid(uint32_t, uint32_t) { return 0; }
-uint32_t XMASetInputBuffer1Valid(uint32_t, uint32_t) { return 0; }
-uint32_t XMASetOutputBufferValid(uint32_t, uint32_t) { return 0; }
-uint32_t XMASetOutputBufferReadOffset(uint32_t, uint32_t) { return 0; }
-uint32_t XMASetInputBufferReadOffset(uint32_t, uint32_t) { return 0; }
-uint32_t XMASetInputBuffer0(uint32_t, uint32_t, uint32_t) { return 0; }
-uint32_t XMASetInputBuffer1(uint32_t, uint32_t, uint32_t) { return 0; }
-uint32_t XMAEnableContext(uint32_t) { return 0; }
-uint32_t XMADisableContext(uint32_t, uint32_t) { return 0; }
-int OpenClient() { return -1; }
-void CloseClient(int) {}
-bool TakeFrameSlot(int) { return false; }
-void SubmitFrame(int, uint32_t) {}
-}  // namespace rt::xapu
+// ---- audio: the real XMA decoder (xenia_shims/apu_bridge.cc), no device ------
 
 // ---- Xenia GPU shims (texture pack, PBR, scene effects): not on the server --
 namespace xe::gpu {

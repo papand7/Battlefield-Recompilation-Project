@@ -86,6 +86,10 @@ bool g_audio_ok = false;
 
 void StartAudio() {
   std::call_once(g_audio_started, [] {
+    // --no-audio: as without a sound device (the Linux server): XMA still
+    // decodes (the game waits on it), the mixer runs at the console's rate,
+    // nothing is played.
+    if (g_no_audio) RT_INFO("audio: no output (--no-audio)");
     g_audio_ok = xapu::Start(g_base, [](uint32_t size, uint32_t align) {
       uint32_t a = g_physical_heap->Alloc(size, align < 0x1000 ? 0x1000 : align);
       memset(G(a), 0, size);
@@ -161,7 +165,7 @@ GUEST_IMPORT(XAudioRegisterRenderDriverClient) {
     c.wrapped_arg = g_system_heap->Alloc(4, 4);
     St32(c.wrapped_arg, arg);
     c.cpu = *G<uint8_t>(ctx.r13.u32 + 0x10C);
-    c.output = xapu::OpenClient();
+    c.output = g_no_audio ? -1 : xapu::OpenClient();
     if (c.output < 0) RT_WARN("audio: no XAudio2 output, client %d runs silent", i);
     c.active.store(true, std::memory_order_release);
     St32(ARG32(4), 0x41550000 | i);

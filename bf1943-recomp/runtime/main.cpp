@@ -118,6 +118,7 @@ static void ParsePresses(const std::string& spec) {
 // client always connects to 127.0.0.1:1003, the host's server, since only
 // bound ports are offset. The job object closes them with the host.
 int rt::g_bot_count = 0;
+bool rt::g_no_audio = false;  // --no-audio (the Linux server decodes XMA too; it has no sound device)
 static std::vector<std::string> g_argv;
 void rt::LaunchBots() {
   static bool launched = false;
@@ -325,6 +326,7 @@ int main(int argc, char** argv) {
     }
     else if (a == "--port-offset" && i + 1 < argc) g_port_offset = uint16_t(atoi(argv[++i]));
     else if (a == "--audio-wav" && i + 1 < argc) g_audio_wav = argv[++i];
+    else if (a == "--no-audio") g_no_audio = true;
     else if (a == "--textures" && i + 1 < argc) {
       size_t n = xe::gpu::texrep::SetDirectory(std::filesystem::absolute(argv[++i]));
       RT_INFO("textures: %zu replacements", n);

@@ -10,6 +10,7 @@
 #include "xenia/base/utf8.h"
 
 #include <algorithm>
+#include <tuple>
 #include <cstdint>
 
 // https://github.com/nemtrif/utfcpp/issues/85

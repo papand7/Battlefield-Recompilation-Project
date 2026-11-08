@@ -20,7 +20,9 @@ class XHostThread : public xe::threading::WaitHandle {
   void Create();
   void Wait(int, int, int, void*) { if (thread_.joinable()) thread_.join(); }
   XHostThread* thread() { return this; }
-  void* native_handle() const override { return const_cast<std::thread&>(thread_).native_handle(); }
+  void* native_handle() const override {
+    return reinterpret_cast<void*>(uintptr_t(const_cast<std::thread&>(thread_).native_handle()));
+  }
   void Resume() {}
   void set_can_debugger_suspend(bool) {}
   bool IsCurrent() const { return std::this_thread::get_id() == id_; }
