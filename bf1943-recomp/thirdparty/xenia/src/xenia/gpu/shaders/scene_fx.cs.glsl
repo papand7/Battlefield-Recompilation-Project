@@ -1345,8 +1345,10 @@ void main() {
     // sun's light, as n.l, is little there anyway.
     float graze = smoothstep(0.02, 0.12, n_dot_l);
     if (n_dot_l > 0.02 && (own || game_lit > 0.5) && !on_sea) {
-      // A fixed per-pixel pattern (no frame term): steady, no shimmer.
-      if (ss.x > 0.0) {
+      // A fixed per-pixel pattern (no frame term): steady, no shimmer. Only
+      // without ray tracing: unfiltered, its pattern showed as dotted, grainy
+      // edges, and the traced shadows plus the game's own cover it.
+      if (ss.x > 0.0 && rt.x <= 0.0) {
         occluded = max(occluded, ss.x * graze * ScreenSpaceShadow(world, normal, dist, size,
                                             InterleavedGradientNoise(vec2(pixel), 0.0)));
       }

@@ -780,7 +780,8 @@ struct Director {
       } else if (target) {
         float dx = target->pos.x - me->pos.x, dz = target->pos.z - me->pos.z;
         float pitch = std::atan2(target->pos.y + 0.5f - (me->pos.y + 1.6f), std::max(std::hypot(dx, dz), 0.5f));
-        if (std::hypot(dx, dz) > 3.0f && now - since < 20) {
+        static const double walk_limit = getenv("BF_SELF_TEST_WALK") ? atof(getenv("BF_SELF_TEST_WALK")) : 20.0;
+        if (std::hypot(dx, dz) > 3.0f && now - since < walk_limit) {
           Steer(cmd, *me, std::atan2(dx, dz), pitch);
           Walk(cmd, *me, target->pos, 0.8f);
         } else {
