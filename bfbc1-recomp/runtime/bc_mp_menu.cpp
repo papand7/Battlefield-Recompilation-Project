@@ -710,13 +710,14 @@ bool OurWindowInFront() {
 // The main menu's MULTIPLAYER only goes on (to presenceRequestOnline, where
 // bfbc1_game.cpp opens this menu) for a profile signed in to LIVE.
 static const bool g_live = (g_report_live = true);
+// Bad Company's LAN games: their own tag and beacon port, so BF1943 games don't
+// show, set before main() (--host starts the beacon there).
+static const bool g_lan_game = (lan::SetGame("BFBC", 19431), true);
 
 void Open() { g_open_request = true; }
 bool IsOpen() { return g_open; }
 
 bool Update(const XINPUT_GAMEPAD& pad) {
-  static const bool game_set = (lan::SetGame("BFBC", 19431), true);
-  (void)game_set;
   std::unique_lock<std::mutex> lock(g_logic_mutex, std::try_to_lock);
   if (!lock.owns_lock()) return g_open || g_wait_release;
   if (g_open_request.exchange(false)) DoOpen();

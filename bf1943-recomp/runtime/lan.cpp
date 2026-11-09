@@ -13,12 +13,17 @@
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
 #else
 #include "posix_net.h"
+#include <ifaddrs.h>
+#include <net/if.h>
 #endif
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -37,7 +42,7 @@ namespace rt::lan {
 
 namespace {
 uint16_t kBeaconPort = 19430;  // SetGame
-std::string g_tag = "BF43";
+char g_tag[5] = "BF43";  // a plain array: SetGame may run during static initialization
 std::mutex g_mutex;
 std::vector<Server> g_found;
 std::atomic<bool> g_browsing{false}, g_beacon{false};
@@ -57,16 +62,51 @@ void Beacon() {
     sockaddr_in from{};
     int len = sizeof(from);
     int n = recvfrom(s, buf, sizeof(buf) - 1, 0, (sockaddr*)&from, &len);
-    if (n < 5 || memcmp(buf, (g_tag + "?").c_str(), 5)) continue;
-    std::string reply = g_tag + "!" + g_gamertag + "|" + g_host_map + "|" + std::to_string(1003 + g_port_offset);
+    if (n < 5 || memcmp(buf, g_tag, 4) || buf[4] != '?') continue;
+    std::string reply = std::string(g_tag) + "!" + g_gamertag + "|" + g_host_map + "|" + std::to_string(1003 + g_port_offset);
     sendto(s, reply.data(), int(reply.size()), 0, (sockaddr*)&from, len);
   }
 }
 }  // namespace
 
 void SetGame(const char* tag, uint16_t beacon_port) {
-  g_tag = std::string(tag).substr(0, 4);
+  snprintf(g_tag, sizeof(g_tag), "%.4s", tag);
   kBeaconPort = beacon_port;
+}
+
+// The directed broadcast address of each of this PC's IPv4 networks (host
+// order): 255.255.255.255 leaves through one adapter only, often a virtual one
+// (WSL, Hyper-V, a VPN) instead of the LAN's.
+static std::vector<uint32_t> BroadcastAddresses() {
+  std::vector<uint32_t> out;
+#ifdef _WIN32
+  ULONG size = 16384;
+  std::vector<uint8_t> buf;
+  ULONG r = ERROR_BUFFER_OVERFLOW;
+  const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+  for (int tries = 0; r == ERROR_BUFFER_OVERFLOW && tries < 3; tries++) {
+    buf.resize(size);
+    r = GetAdaptersAddresses(AF_INET, flags, nullptr, (IP_ADAPTER_ADDRESSES*)buf.data(), &size);
+  }
+  if (r != NO_ERROR) return out;
+  for (auto* a = (IP_ADAPTER_ADDRESSES*)buf.data(); a; a = a->Next) {
+    if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+    for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+      unsigned len = u->OnLinkPrefixLength;
+      if (len == 0 || len > 30) continue;
+      uint32_t ip = ntohl(((sockaddr_in*)u->Address.lpSockaddr)->sin_addr.s_addr);
+      out.push_back(ip | ~(0xFFFFFFFFu << (32 - len)));
+    }
+  }
+#else
+  ifaddrs* list = nullptr;
+  if (getifaddrs(&list) != 0) return out;
+  for (ifaddrs* i = list; i; i = i->ifa_next)
+    if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && (i->ifa_flags & IFF_BROADCAST) && i->ifa_broadaddr)
+      out.push_back(ntohl(((sockaddr_in*)i->ifa_broadaddr)->sin_addr.s_addr));
+  freeifaddrs(list);
+#endif
+  return out;
 }
 
 // Browses: broadcasts a query (and to this PC), collects answers for a second.
@@ -86,9 +126,12 @@ void Refresh() {
     to.sin_family = AF_INET;
     to.sin_port = htons(kBeaconPort);
     auto start = std::chrono::steady_clock::now();
-    for (uint32_t ip : {uint32_t(INADDR_BROADCAST), uint32_t(INADDR_LOOPBACK)}) {
+    std::vector<uint32_t> targets = {INADDR_BROADCAST, INADDR_LOOPBACK};
+    for (uint32_t b : BroadcastAddresses()) targets.push_back(b);
+    const std::string query = std::string(g_tag) + "?";
+    for (uint32_t ip : targets) {
       to.sin_addr.s_addr = htonl(ip);
-      sendto(s, (g_tag + "?").c_str(), 5, 0, (sockaddr*)&to, sizeof(to));
+      sendto(s, query.c_str(), 5, 0, (sockaddr*)&to, sizeof(to));
     }
     std::vector<Server> found;
     while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1200)) {
@@ -96,7 +139,7 @@ void Refresh() {
       sockaddr_in from{};
       int len = sizeof(from);
       int n = recvfrom(s, buf, sizeof(buf) - 1, 0, (sockaddr*)&from, &len);
-      if (n < 5 || memcmp(buf, (g_tag + "!").c_str(), 5)) continue;
+      if (n < 5 || memcmp(buf, g_tag, 4) || buf[4] != '!') continue;
       buf[n] = 0;
       std::string text(buf + 5);
       size_t a = text.find('|'), b = text.find('|', a + 1);

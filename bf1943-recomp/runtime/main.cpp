@@ -385,6 +385,7 @@ int main(int argc, char** argv) {
     RT_INFO("dedicated server '%s': hosting %s on UDP %d (browsers: UDP 19430)%s", g_gamertag.c_str(),
             g_host_map.c_str(), 1003 + g_port_offset, g_bot_count ? ", with bots" : "");
   }
+  if (g_lan_host && join_address.empty()) rt::lan::StartBeacon();  // --host: shown in server browsers
   if (shadowmap && g_guest_args.find("Shadowmap") == std::string::npos)
     g_guest_args = "-WorldRender.ShadowmapWidth " + std::to_string(shadowmap) + " -WorldRender.ShadowmapHeight " +
                    std::to_string(shadowmap) + (g_guest_args.empty() ? "" : " ") + g_guest_args;
