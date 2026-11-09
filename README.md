@@ -4,8 +4,8 @@
 Windows at high frame rates and resolutions, with modern graphics, full mouse and keyboard
 controls, LAN multiplayer with bots, and a brand-new menu.
 
-Battlefield: Bad Company is in progress: it boots, plays its first mission at about 100 fps
-with keyboard and mouse, and logs in to the local online service. Hosting isn't working yet.
+Battlefield: Bad Company is in progress: the campaign is playable with keyboard and mouse at
+about 100 fps, and LAN multiplayer (Gold Rush) works through its own Multiplayer menu.
 
 > You need your own copy of the game. Nothing from the game itself is included here.
 
@@ -124,12 +124,21 @@ To join a server that isn't on your network: **Join Game → Address**, or start
 
 The same recompiler is being used for Battlefield: Bad Company (Xbox 360). Current state:
 
-- Boots to the menu and runs the first mission at about 100 fps at 1× render scale, with
-  keyboard, mouse and the HUD working.
-- Online login works against the local service, and the server list reports "no games"
-  because nothing is hosted yet. Hosting isn't working.
-- Not done yet: ray-traced shadows (they stall the opening cutscene), blood, the HD texture
-  pack, and saving the campaign.
+- **Campaign:** plays at about 100 fps at 1× render scale, with keyboard, mouse and the HUD
+  working.
+- **LAN multiplayer:** **MULTIPLAYER** on the main menu opens a new menu:
+  - **Host Game:** pick one of the 8 maps (Valley Run, Deconstruction, Oasis, Final Ignition,
+    End of the Line, Ascension, Harvest Day, Over and Out) and start a Gold Rush game.
+  - **Server Browser:** lists the games on your network, with map and ping.
+  - **Join by Address:** type the host's address (add `:port` if it isn't the usual 1503).
+  - Two copies on one PC can play together. Across two PCs it hasn't been tested yet.
+  - The host's firewall needs to let the game through (UDP ports 1500-1503 and 19431).
+    Bad Company uses its own ports, so it can host on the same PC as Battlefield 1943.
+  - A player who stays on the spawn screen for about two minutes without deploying is sent
+    back to the menu (the game's own idle rule).
+- **Only Gold Rush:** the disc has no Conquest; that came later in an update.
+- **Not done yet:** bots, playing online, ray-traced shadows (they stall the opening
+  cutscene), blood and the HD texture pack. Saving the campaign hasn't been checked yet.
 
 | In game | Multiplayer menu |
 |---|---|
