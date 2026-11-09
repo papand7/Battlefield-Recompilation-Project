@@ -117,7 +117,9 @@ GUEST_IMPORT(XamUserAreUsersFriends) {
 
 // ---- input --------------------------------------------------------------------------
 // X_INPUT_GAMEPAD: be16 buttons, u8 lt, u8 rt, be16 lx, ly, rx, ry (same bit layout as XInput).
+std::atomic<uint64_t> rt::g_last_accept_ms{0};
 static void WriteGamepad(uint32_t p, const XINPUT_GAMEPAD& g) {
+  if (g.wButtons & XINPUT_GAMEPAD_A) g_last_accept_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
   St16(p + 0, g.wButtons);
   St8(p + 2, g.bLeftTrigger);
   St8(p + 3, g.bRightTrigger);

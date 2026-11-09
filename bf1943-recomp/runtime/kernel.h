@@ -145,6 +145,8 @@ extern bool g_report_live;          // xam.cpp: report the profile signed in to 
 extern uint32_t g_lan_ip;            // --lan-ip: address in our XNADDR (network order)
 void RegisterHostedGame(uint16_t port, const std::string& map);  // net.cpp: list on Arcadia
 extern uint16_t g_port_offset;       // --port-offset: added to bound ports
+extern uint16_t g_base_port_offset;  // the game's own offset (Bad Company 500), where --port-offset 0 starts
+extern std::atomic<uint64_t> g_last_accept_ms;  // xam.cpp: when A (Enter, a click) was last held, steady_clock ms
 extern bool g_no_audio;         // --no-audio (and the Linux server): no XMA, no output
 extern std::string g_audio_wav;  // --audio-wav: also write the mixed output (front L/R) here
 

@@ -148,10 +148,10 @@ void StartBeacon() {
 
 // JOIN GAME: the host's map loaded here, the client sent to the host.
 bool PrepareJoin(const std::string& address_port, const std::string& map) {
-  // "<ip>[:<port>]": the port is the host's server port (1003 + its --port-offset).
+  // "<ip>[:<port>]": the port is the host's server port (1003 + its port offset).
   size_t colon = address_port.find(':');
   std::string address = address_port.substr(0, colon);
-  int port = colon == std::string::npos ? 1003 : atoi(address_port.c_str() + colon + 1);
+  int port = colon == std::string::npos ? 1003 + g_base_port_offset : atoi(address_port.c_str() + colon + 1);
   in_addr ip{};
   if (inet_pton(AF_INET, address.c_str(), &ip) != 1 || port <= 0 || port > 65535) return false;
   g_join_port = htons(uint16_t(port));
@@ -160,7 +160,7 @@ bool PrepareJoin(const std::string& address_port, const std::string& map) {
   g_bot_count = 0;
   // On this PC: our own server and ports must not clash with the host's.
   bool local = ip.s_addr == htonl(INADDR_LOOPBACK) || ip.s_addr == g_lan_ip;
-  if (local && !g_port_offset) g_port_offset = 10;
+  if (local && g_port_offset == g_base_port_offset) g_port_offset += 10;
   g_join_address = local ? htonl(INADDR_LOOPBACK) : ip.s_addr;
   RT_INFO("lan: joining %s (%s)%s", address.c_str(), map.c_str(), local ? " on this PC" : "");
   return true;

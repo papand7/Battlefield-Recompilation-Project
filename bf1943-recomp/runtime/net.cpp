@@ -40,6 +40,7 @@ std::string g_gamertag = "Player";  // --gamertag
 std::string g_online_server;  // --online-server: EA host names resolve here
 uint32_t g_lan_ip = 0;        // --lan-ip (network order), else found at startup
 uint16_t g_port_offset = 0;   // --port-offset: added to bound ports (two copies on one PC)
+uint16_t g_base_port_offset = 0;
 std::atomic<bool> g_online_ready{false};  // Theater login answered
 }
 

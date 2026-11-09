@@ -584,7 +584,7 @@ View Build() {
       v.items = {{L"ADDRESS", Wide(g_address), false, g_sel == 0}, {L"JOIN GAME"}, {L"BACK"}};
       v.head = L"JOIN BY ADDRESS", v.sub = L"IPV4 ADDRESS";
       v.lines = {L"Type the host's address with the keyboard, for example 192.168.1.20. Add :port when the "
-                 L"host's server isn't on the usual one (1003).",
+                 L"host's server isn't on the usual one (" + std::to_wstring(1003 + g_base_port_offset) + L").",
                  L""};
       if (!g_note.empty()) v.lines.push_back(g_note);
       break;

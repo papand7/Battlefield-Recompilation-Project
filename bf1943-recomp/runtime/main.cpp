@@ -322,7 +322,7 @@ int main(int argc, char** argv) {
         }
       }).detach();
     }
-    else if (a == "--port-offset" && i + 1 < argc) g_port_offset = uint16_t(atoi(argv[++i]));
+    else if (a == "--port-offset" && i + 1 < argc) g_port_offset = uint16_t(g_base_port_offset + atoi(argv[++i]));
     else if (a == "--audio-wav" && i + 1 < argc) g_audio_wav = argv[++i];
     else if (a == "--no-audio") g_no_audio = true;
     else if (a == "--textures" && i + 1 < argc) {

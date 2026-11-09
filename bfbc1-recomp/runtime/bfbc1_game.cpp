@@ -24,6 +24,9 @@ static const bool g_title_set = (g_window_title = "Battlefield: Bad Company", tr
 namespace rt {
 uint32_t g_max_fps = 120;    // --max-fps (0 = no limit), applied in VdSwap
 bool g_lan_host = false;     // --host
+// Bad Company's ports are BF1943's + 500 (1500 VDP, 1503 server), so both games
+// can host on one PC; BF1943's bot copies use offsets up to 150.
+static const bool g_bc_ports = (g_base_port_offset = g_port_offset = 500, true);
 bool g_vsync = false;        // --vsync
 std::string g_host_map;      // --host-map
 bool g_log_ui = false;       // --log-ui
@@ -66,7 +69,6 @@ using namespace rt;
 GAME_PATCH(82181390) {
   uint32_t input = ctx.r4.u32, pad = ctx.r3.u32;
   __imp__sub_82181390(ctx, base);
-  { if (input < 8 && Ld32(pad + 8) == 1 && ctx.f1.f64 != 0.0) { static int nz = 0; if (nz++ < 40) RT_INFO("TEMP player axis in=%u f1=%f", input, ctx.f1.f64); } }
   if (input < 4 || input > 7 || Ld32(pad + 8) != 1) return;
   float v = MouseLookAxis(input >= 6);
   if (input & 1) v = -v;
@@ -251,7 +253,6 @@ static const bool g_replay_started = [] {
 // r6 = server object; 39/16 creates the server, +44 backend 1 = multiplayer UDP).
 // A multiplayer server is listed on Arcadia (net.cpp RegisterHostedGame).
 GAME_PATCH(823D1568) {
-  { static std::map<uint32_t, int> n; if (n[ctx.r4.u32 << 16 | ctx.r5.u32]++ < 3) RT_INFO("TEMP server msg %u sub %u at %llu", ctx.r4.u32, ctx.r5.u32, (unsigned long long)GetTickCount64()); }
   bool create = ctx.r4.u32 == 39 && ctx.r5.u32 == 16;
   uint32_t server = ctx.r6.u32;
   // --host / --join (lan.cpp): a multiplayer server (+44 = 1, real UDP) that
@@ -285,29 +286,6 @@ GAME_PATCH(8236DED8) {
   St32(server + 560, n);
 }
 
-// Menu callback dispatcher (bf1943's 8246D918): r3 = UI manager, r4 = callback
-// name, r5 = its argument string. Kept for hosting from the main loop.
-static uint32_t g_bc_ui_manager = 0;
-GAME_PATCH(823C6EF0) {
-  g_bc_ui_manager = ctx.r3.u32;
-  if (ctx.r4.u32 && ctx.r4.u32 < 0xF0000000u) {
-    static std::set<std::string> seen;
-    std::string nm(G<char>(ctx.r4.u32));
-    if (seen.insert(nm).second) RT_INFO("TEMP ui callback %s r5=%08X", nm.c_str(), ctx.r5.u32);
-  }
-  __imp__sub_823C6EF0(ctx, base);
-}
-
-// TEMP DIAG: which name lookup caller gets the menu callbacks (startSingleplayer...).
-static void LogNameArg(const char* fn, PPCContext& ctx) {
-  static std::set<std::string> seen;
-  uint32_t a = ctx.r4.u32;
-  if (a < 0x40000000u || a >= 0xF0000000u || !IsCommitted(a)) return;
-  std::string key = std::string(fn) + " " + std::string(G<char>(a)).substr(0, 40);
-  if (seen.insert(key).second) RT_INFO("TEMP lookup caller %s r5=%08X", key.c_str(), ctx.r5.u32);
-}
-#define TRACE_NAME(addr, tag) GAME_PATCH(addr) { LogNameArg(tag, ctx); __imp__sub_##addr(ctx, base); }
-TRACE_NAME(8242DBF8, "cb_A")
 // Menu callback dispatcher: r3 = menu manager, r4 = callback name, r5 = its
 // arguments as one string ("Movies/UIMAIntro", "0"; several are comma separated).
 // startBackgroundMovie is called once the main menu is up.
@@ -315,15 +293,18 @@ TRACE_NAME(8242DBF8, "cb_A")
 GAME_PATCH(8242F698) {
   g_menu_manager = ctx.r3.u32;
   g_menu_thread = GetCurrentThreadId();
-  if (!strcmp(G<char>(ctx.r4.u32), "startBackgroundMovie") && !g_menu_up_ms)
-    g_menu_up_ms = GetTickCount64();
-  uint32_t a = ctx.r5.u32;
-  RT_INFO("TEMP menu cb this=%08X tid=%lu %s(%s)", ctx.r3.u32, GetCurrentThreadId(), G<char>(ctx.r4.u32),
-          a >= 0x40000000u && a < 0xF0000000u && IsCommitted(a) ? std::string(G<char>(a)).substr(0, 80).c_str() : "?");
+  if (!strcmp(G<char>(ctx.r4.u32), "startBackgroundMovie")) {
+    RT_INFO("menu: main menu up");
+    if (!g_menu_up_ms) g_menu_up_ms = GetTickCount64();
+  }
   // MULTIPLAYER on the main menu logs in to EA's servers (gone) and opens the
   // game's online menu: ours (bc_mp_menu.cpp, LAN host/join) opens instead.
+  // The game also asks by itself some minutes after a match, which only opens
+  // ours when the player has just pressed A (or Enter, or clicked).
   if (!g_internal_call && g_online_server.empty() && !strcmp(G<char>(ctx.r4.u32), "presenceRequestOnline")) {
-    bcmp::Open();
+    uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (now - g_last_accept_ms.load() < 3000) bcmp::Open();
+    else RT_INFO("mp menu: not opened (the game asked, no A press)");
     return;
   }
   __imp__sub_8242F698(ctx, base);
@@ -341,9 +322,3 @@ static void CallMenu(PPCContext& ctx, uint8_t* base, const std::string& cb, cons
   sub_8242F698(c, base);
   g_internal_call = false;
 }
-TRACE_NAME(823B3E48, "fn_1")
-TRACE_NAME(8240A3B0, "fn_2")
-TRACE_NAME(82410100, "fn_3")
-TRACE_NAME(82433CB0, "fn_4")
-TRACE_NAME(82437DF0, "fn_5")
-TRACE_NAME(824384B0, "fn_6")
