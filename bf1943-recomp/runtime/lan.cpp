@@ -29,13 +29,15 @@ using namespace rt;
 
 namespace rt {
 uint32_t g_join_address = 0;  // network order: the host's address while joining (0 none)
+uint16_t g_join_port = 0x0000;  // network order: its server port (set by PrepareJoin)
 extern uint32_t g_lan_ip;     // net.cpp
 }
 
 namespace rt::lan {
 
 namespace {
-constexpr uint16_t kBeaconPort = 19430;
+uint16_t kBeaconPort = 19430;  // SetGame
+std::string g_tag = "BF43";
 std::mutex g_mutex;
 std::vector<Server> g_found;
 std::atomic<bool> g_browsing{false}, g_beacon{false};
@@ -55,12 +57,17 @@ void Beacon() {
     sockaddr_in from{};
     int len = sizeof(from);
     int n = recvfrom(s, buf, sizeof(buf) - 1, 0, (sockaddr*)&from, &len);
-    if (n < 5 || memcmp(buf, "BF43?", 5)) continue;
-    std::string reply = "BF43!" + g_gamertag + "|" + g_host_map + "|" + std::to_string(1003 + g_port_offset);
+    if (n < 5 || memcmp(buf, (g_tag + "?").c_str(), 5)) continue;
+    std::string reply = g_tag + "!" + g_gamertag + "|" + g_host_map + "|" + std::to_string(1003 + g_port_offset);
     sendto(s, reply.data(), int(reply.size()), 0, (sockaddr*)&from, len);
   }
 }
 }  // namespace
+
+void SetGame(const char* tag, uint16_t beacon_port) {
+  g_tag = std::string(tag).substr(0, 4);
+  kBeaconPort = beacon_port;
+}
 
 // Browses: broadcasts a query (and to this PC), collects answers for a second.
 void Refresh() {
@@ -81,7 +88,7 @@ void Refresh() {
     auto start = std::chrono::steady_clock::now();
     for (uint32_t ip : {uint32_t(INADDR_BROADCAST), uint32_t(INADDR_LOOPBACK)}) {
       to.sin_addr.s_addr = htonl(ip);
-      sendto(s, "BF43?", 5, 0, (sockaddr*)&to, sizeof(to));
+      sendto(s, (g_tag + "?").c_str(), 5, 0, (sockaddr*)&to, sizeof(to));
     }
     std::vector<Server> found;
     while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1200)) {
@@ -89,7 +96,7 @@ void Refresh() {
       sockaddr_in from{};
       int len = sizeof(from);
       int n = recvfrom(s, buf, sizeof(buf) - 1, 0, (sockaddr*)&from, &len);
-      if (n < 5 || memcmp(buf, "BF43!", 5)) continue;
+      if (n < 5 || memcmp(buf, (g_tag + "!").c_str(), 5)) continue;
       buf[n] = 0;
       std::string text(buf + 5);
       size_t a = text.find('|'), b = text.find('|', a + 1);
@@ -140,9 +147,14 @@ void StartBeacon() {
 }
 
 // JOIN GAME: the host's map loaded here, the client sent to the host.
-bool PrepareJoin(const std::string& address, const std::string& map) {
+bool PrepareJoin(const std::string& address_port, const std::string& map) {
+  // "<ip>[:<port>]": the port is the host's server port (1003 + its --port-offset).
+  size_t colon = address_port.find(':');
+  std::string address = address_port.substr(0, colon);
+  int port = colon == std::string::npos ? 1003 : atoi(address_port.c_str() + colon + 1);
   in_addr ip{};
-  if (inet_pton(AF_INET, address.c_str(), &ip) != 1) return false;
+  if (inet_pton(AF_INET, address.c_str(), &ip) != 1 || port <= 0 || port > 65535) return false;
+  g_join_port = htons(uint16_t(port));
   g_host_map = map;
   g_lan_host = true;
   g_bot_count = 0;

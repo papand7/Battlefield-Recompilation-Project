@@ -30,6 +30,7 @@ constexpr int kSelectNfds = FD_SETSIZE;
 #include <mutex>
 #include <random>
 #include <set>
+#include <map>
 #include <thread>
 
 using namespace rt;
@@ -136,7 +137,21 @@ void FdsToGuest(const fd_set& in, uint32_t guest) {
 // 0.0.0.0 again, or the engine drops them as from an unknown peer.
 std::mutex g_any_mutex;
 std::set<std::pair<SOCKET, uint16_t>> g_any_peers;  // (socket, port in network order)
+// Bad Company's client sends to its server at 127.0.0.1 or the LAN address
+// instead, always port 1003: those go to the joined host's server, or to our
+// own at 1003 + --port-offset; replies are made to look like they came from
+// that address and port 1003 again.
+std::atomic<uint32_t> g_server_alias{0};  // the address our client used (network order)
+uint32_t ServerAddress() { return rt::g_join_address ? rt::g_join_address : htonl(INADDR_LOOPBACK); }
+uint16_t ServerPort() { return rt::g_join_address ? rt::g_join_port : htons(uint16_t(1003 + g_port_offset)); }
 void FixAnyDestination(SOCKET s, sockaddr_in* a) {
+  if ((rt::g_join_address || g_port_offset) && a->sin_port == htons(1003) &&
+      (a->sin_addr.s_addr == htonl(INADDR_LOOPBACK) || a->sin_addr.s_addr == rt::g_lan_ip)) {
+    g_server_alias = a->sin_addr.s_addr;
+    a->sin_addr.s_addr = ServerAddress();
+    a->sin_port = ServerPort();
+    return;
+  }
   if (a->sin_addr.s_addr != INADDR_ANY) return;
   // JOIN GAME (lan.cpp): our client's packets to its "own" server go to the
   // host's.
@@ -146,6 +161,11 @@ void FixAnyDestination(SOCKET s, sockaddr_in* a) {
   g_any_peers.insert({s, a->sin_port});
 }
 void FixAnySource(SOCKET s, sockaddr_in* a) {
+  if (uint32_t alias = g_server_alias; alias && a->sin_addr.s_addr == ServerAddress() && a->sin_port == ServerPort()) {
+    a->sin_addr.s_addr = alias;
+    a->sin_port = htons(1003);
+    return;
+  }
   bool from_host = rt::g_join_address && a->sin_addr.s_addr == rt::g_join_address;
   if (a->sin_addr.s_addr != htonl(INADDR_LOOPBACK) && !from_host) return;
   std::lock_guard lock(g_any_mutex);
@@ -195,6 +215,10 @@ GUEST_IMPORT(NetDll_closesocket) {
     std::lock_guard l(g_vdp_mutex);
     g_vdp_sockets.erase(ARG32(4));
   }
+  sockaddr_in a{};
+  int len = sizeof(a);
+  if (::getsockname(Host(ARG32(4)), (sockaddr*)&a, &len) == 0 && a.sin_port)
+    RT_INFO("net: closesocket(%u, port %u)", ARG32(4), ntohs(a.sin_port));
   RETURN(::closesocket(Host(ARG32(4))));
 }
 GUEST_IMPORT(NetDll_shutdown) { RETURN(::shutdown(Host(ARG32(4)), int(ARG32(5)))); }
@@ -398,6 +422,33 @@ GUEST_IMPORT(NetDll_send) {
   }
   RETURN(::send(Host(ARG32(4)), data, n, int(ARG32(7))));
 }
+// BF_NET_STATS=1 (testing): packets and bytes per socket and peer, logged
+// every 10 s, to see whether a connection still carries traffic.
+void NetStat(uint32_t s, const sockaddr_in& a, bool out, int bytes) {
+  static const bool on = getenv("BF_NET_STATS") != nullptr;
+  if (!on || bytes <= 0) return;
+  struct Count { uint32_t in = 0, out = 0; uint64_t in_b = 0, out_b = 0; };
+  static std::mutex m;
+  static std::map<std::string, Count> counts;
+  static bool started = false;
+  std::lock_guard l(m);
+  Count& c = counts[std::to_string(s) + " " + AddrText(a)];
+  (out ? c.out : c.in)++, (out ? c.out_b : c.in_b) += bytes;
+  if (!started) {
+    started = true;
+    std::thread([] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        std::lock_guard l(m);
+        for (auto& [k, v] : counts)
+          RT_INFO("net stats: %s  out %u (%llu B)  in %u (%llu B)", k.c_str(), v.out, (unsigned long long)v.out_b, v.in,
+                  (unsigned long long)v.in_b);
+        counts.clear();
+      }
+    }).detach();
+  }
+}
+
 // recvfrom(caller, s, buf, len, flags, from, fromlen*)
 GUEST_IMPORT(NetDll_recvfrom) {
   sockaddr_in a{};
@@ -409,6 +460,7 @@ GUEST_IMPORT(NetDll_recvfrom) {
     St16(ARG32(5), uint16_t(r));  // game data only, no voice
     r += 2;
   }
+  NetStat(ARG32(4), a, false, r);
   if (r > 0) {
     static std::mutex m;
     static std::set<std::pair<uint32_t, uint16_t>> seen;  // log the first packet from each address
@@ -434,6 +486,7 @@ GUEST_IMPORT(NetDll_sendto) {
   if (vdp) size = std::min<int>(Ld16(ARG32(5)), size - 2), data += 2;
   int r = ::sendto(Host(ARG32(4)), (const char*)data, size, int(ARG32(7)), (sockaddr*)&a, sizeof(a));
   if (vdp && r >= 0) r = int(ARG32(6));  // the guest sent the whole VDP packet
+  NetStat(ARG32(4), a, true, r);
   static std::mutex m;
   static std::set<std::pair<uint32_t, uint16_t>> seen;  // log the first packet to each address
   if (std::lock_guard l(m); seen.insert({a.sin_addr.s_addr, a.sin_port}).second)
@@ -470,6 +523,9 @@ static void FillXnAddr(uint32_t xna, uint32_t ina) {
   St16(xna + 8, 3074);
   uint8_t mac[6] = {0x00, 0x22, 0x48, 0, 0, 0};
   memcpy(mac + 2, &ina, 4);  // unique per host and stable
+  // Two copies on one PC (--port-offset) are different consoles: Bad Company
+  // takes players with the same MAC for the same one.
+  if (ina == g_lan_ip) mac[1] ^= uint8_t(g_port_offset);
   memcpy(G(xna + 10), mac, 6);
   memcpy(G(xna + 16), &ina, 4);
 }
@@ -498,6 +554,19 @@ GUEST_IMPORT(NetDll_XNetServerToInAddr) {
 }
 GUEST_IMPORT(NetDll_XNetConnect) { RETURN(0); }
 GUEST_IMPORT(NetDll_XNetGetConnectStatus) { RETURN(2); }  // XNET_CONNECT_STATUS_CONNECTED
+// XNetQosServiceLookup(caller, flags, event, XNQOS**): the Live service QoS lookup
+// Bad Company runs before hosting. Like Xenia: an empty result (count 0, nothing
+// pending) and the event signalled, so the caller does not wait forever.
+GUEST_IMPORT(NetDll_XNetQosServiceLookup) {
+  if (uint32_t out = ARG32(6)) {
+    uint32_t qos = g_system_heap->Alloc(0x40, 8);
+    memset(G(qos), 0, 0x40);
+    St32(out, qos);
+  }
+  if (uint32_t ev = ARG32(5))
+    if (uint32_t o = rt::HandleToObject(ev)) rt::SetEvent(o);
+  RETURN(0);
+}
 // XNetCreateKey(caller, xnkid*, xnkey*)
 GUEST_IMPORT(NetDll_XNetCreateKey) {
   static std::mt19937 rng{std::random_device{}()};
@@ -590,6 +659,10 @@ int RecvInto(SOCKET s, uint32_t bufs, uint32_t count, uint32_t from, uint32_t fr
     host[i].len = Ld32(bufs + uint32_t(i) * 8);
     host[i].buf = (CHAR*)G(Ld32(bufs + uint32_t(i) * 8 + 4));
   }
+  // VDP: the game data comes after a be16 length (no voice), as in recvfrom.
+  bool vdp = IsVdp(uint32_t(s)) && !host.empty() && host[0].len > 2;
+  uint8_t* vdp_head = vdp ? (uint8_t*)host[0].buf : nullptr;
+  if (vdp) host[0].buf += 2, host[0].len -= 2;
   DWORD got = 0, flags = 0;
   sockaddr_in a{};
   int alen = sizeof(a);
@@ -598,6 +671,17 @@ int RecvInto(SOCKET s, uint32_t bufs, uint32_t count, uint32_t from, uint32_t fr
   if (r != 0) {
     *err = WSAGetLastError();
     return -1;
+  }
+  if (vdp) {
+    vdp_head[0] = uint8_t(got >> 8), vdp_head[1] = uint8_t(got);
+    got += 2;
+  }
+  if (from) NetStat(uint32_t(s), a, false, int(got));
+  if (got > 0 && from) {
+    static std::mutex m;
+    static std::set<std::pair<uint32_t, uint16_t>> seen;  // log the first packet from each address
+    if (std::lock_guard l(m); seen.insert({a.sin_addr.s_addr, a.sin_port}).second)
+      RT_INFO("net: first WSARecvFrom(%u, %s, %lu bytes)%s", unsigned(s), AddrText(a).c_str(), got, vdp ? " vdp" : "");
   }
   if (from) {
     FixAnySource(s, &a);

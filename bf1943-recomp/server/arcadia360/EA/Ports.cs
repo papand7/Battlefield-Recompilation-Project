@@ -3,6 +3,7 @@ namespace Arcadia.EA.Ports;
 public enum FeslGamePort : int
 {
     BadCompanyPS3 = 18800,
+    BadCompany360 = 18280,  // Xbox 360 client (127.0.0.1:18280 from the bfbc1 port)
     RomePS3 = 18121,
     RomeDemoPS3 = 18171,
     BeachPS3 = 18231,
@@ -48,5 +49,5 @@ public static class PortExtensions
 {
     public static bool IsFeslPort(int port) => Enum.IsDefined(typeof(FeslGamePort), port) || Enum.IsDefined(typeof(FeslServerPort), port);
     public static bool IsTheater(int port) => Enum.IsDefined(typeof(TheaterGamePort), port) || Enum.IsDefined(typeof(TheaterServerPort), port);
-    public static bool IsXbox360Port(int port) => port == (int)FeslGamePort.Beach360;
+    public static bool IsXbox360Port(int port) => port == (int)FeslGamePort.Beach360 || port == (int)FeslGamePort.BadCompany360;
 }

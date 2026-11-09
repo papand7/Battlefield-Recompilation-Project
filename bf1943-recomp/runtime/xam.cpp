@@ -82,7 +82,9 @@ GUEST_IMPORT(XGetLanguage) { RETURN(1); }  // English
 // ---- users ------------------------------------------------------------------------
 // 1 = signed in locally, 2 = signed in to Live. Online mode (--online-server) needs 2,
 // or the game's network setup shows the sign-in UI and gives up.
-GUEST_IMPORT(XamUserGetSigninState) { RETURN(ARG32(3) != 0 ? 0 : g_online_server.empty() ? 1 : 2); }
+// 2 = signed in to LIVE (online, or g_report_live), 1 = a local profile.
+bool rt::g_report_live = false;
+GUEST_IMPORT(XamUserGetSigninState) { RETURN(ARG32(3) != 0 ? 0 : g_online_server.empty() && !g_report_live ? 1 : 2); }
 GUEST_IMPORT(XamUserGetXUID) {
   if (ARG32(3) != 0) RETURN(ERROR_NOT_FOUND);
   St64(ARG32(5) ? ARG32(5) : ARG32(4), Xuid());
@@ -819,6 +821,14 @@ GUEST_IMPORT(XamGetPrivateEnumStructureFromHandle) {
 GUEST_IMPORT(XamEnumerate) {
   Out32(ARG32(7), 0);
   RETURN(CompleteOverlapped(ARG32(8), ERROR_NO_MORE_FILES));
+}
+// XamContentGetCreator(user, XCONTENT_DATA*, is_creator*, xuid*, overlapped): our saves
+// are always made by the local user. Bad Company checks this after creating its
+// profile save and shows "Unable to save player profile data" otherwise.
+GUEST_IMPORT(XamContentGetCreator) {
+  if (ARG32(5)) St32(ARG32(5), 1);
+  if (ARG32(6)) St64(ARG32(6), Xuid());
+  RETURN(CompleteOverlapped(ARG32(7), ERROR_SUCCESS));
 }
 // XamContentGetDeviceState(device, overlapped*)
 GUEST_IMPORT(XamContentGetDeviceState) { RETURN(CompleteOverlapped(ARG32(4), ERROR_SUCCESS)); }

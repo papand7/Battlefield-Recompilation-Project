@@ -5,11 +5,16 @@
 
 #include <windows.h>
 #include <Xinput.h>
+#include "bc_mp_menu.h"
 
 #include <algorithm>
 #include <cstdlib>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -29,14 +34,20 @@ float g_shadow_distance = 0;
 std::string g_worldrender;
 std::string g_overgrowth;
 float g_lod = 1.0f;
+bool g_auto_start = false;  // set by main.cpp for dedicated/bot copies (bf1943)
 
-void RequestHost() { RT_WARN("bfbc1: hosting is not supported yet"); }
+std::atomic<bool> g_host_request{false};  // HostFromMainLoop starts hosting g_host_map
+void RequestHost() { g_host_request = true; }
 void ApplyShadowSettings() {}
 
 std::string StartBotDirector(int) { return {}; }
 void SetBotSlot(const std::string&, int) {}
 bool BotLookAxis(int, float&) { return false; }
-bool AddBotInput(XINPUT_GAMEPAD&) { return false; }
+// The pad, every poll: our Multiplayer menu (bc_mp_menu.cpp) takes it while open.
+bool AddBotInput(XINPUT_GAMEPAD& pad) {
+  if (bcmp::Update(pad)) pad = {};
+  return false;
+}
 int LocalVehicle() { return kOnFoot; }
 bool CustomMenus() { return false; }
 bool g_dedicated = false;
@@ -70,23 +81,67 @@ GAME_PATCH(82160148) {
   __imp__sub_82160148(ctx, base);
 }
 
-// Frame timer update (bf1943's 822C7388): r3 = timer, +40 mode (0 = timed,
-// sleeps until 1/Game.MaxFps has passed), +44 tick rate. Game.MaxFps is read
-// straight from its setting (pointer cached at 82C24C68 on the first call), 30 by
-// default. The frame time it hands on is the real elapsed time, so the cap can
-// go up without the game running fast: MaxFps = --max-fps (0 = no limit).
+// --host-map <level> (mp_harbour_day1...) or --ui-call <callback>[:<args>]: two seconds after the main menu is up,
+// call the menu's hostMultiplayer callback (hostMultiplayerLocal without
+// --online-server) on the menu thread, as the Host Game screen would.
+// Set by the menu callback dispatcher hook (sub_8242F698) below.
+static std::atomic<uint32_t> g_menu_manager{0};
+static std::atomic<DWORD> g_menu_thread{0};
+static std::atomic<int64_t> g_menu_up_ms{0};
+static void CallMenu(PPCContext& ctx, uint8_t* base, const std::string& cb, const std::string& arg);
+// Online (--online-server) the game logs in first (presenceRequestOnline, as
+// opening the Multiplayer menu does) and hosts once the Theater login answered.
+// RequestHost (our Multiplayer menu, lan.cpp) starts it again later.
+static std::atomic<bool> g_internal_call{false};  // CallMenu from here, not the player
+static void HostFromMainLoop(PPCContext& ctx, uint8_t* base) {
+  static int state = -1;  // -1 idle, 0 waiting for the menu, 1 logging in
+  static bool startup = !g_host_map.empty() || !g_ui_call.empty();  // --host-map, --ui-call
+  if (!g_menu_up_ms || GetCurrentThreadId() != g_menu_thread) return;
+  if (startup) startup = false, state = 0;
+  if (g_host_request.exchange(false)) state = 0;
+  if (state < 0 || g_host_map.empty() && g_ui_call.empty()) return;
+  if (int64_t(GetTickCount64()) - g_menu_up_ms < 2000) return;
+  if (state == 0 && !g_online_server.empty()) {
+    state = 1;
+    RT_INFO("host: logging in");
+    CallMenu(ctx, base, "presenceRequestOnline", "1");
+    return;
+  }
+  if (state == 1 && !g_online_ready) return;
+  state = -1;
+  std::string cb = g_online_server.empty() ? "hostMultiplayerLocal" : "hostMultiplayer", arg = g_host_map;
+  if (!g_ui_call.empty()) {  // --ui-call name:args (testing)
+    size_t colon = g_ui_call.find(':');
+    cb = g_ui_call.substr(0, colon);
+    arg = colon == std::string::npos ? "" : g_ui_call.substr(colon + 1);
+  }
+  RT_INFO("host: %s(%s)", cb.c_str(), arg.c_str());
+  CallMenu(ctx, base, cb, arg);
+}
+
 GAME_PATCH(8229B708) {
   static uint32_t logged_modes = 0;  // bit per mode seen (two timers: 0 and 3)
   if (uint32_t mode = Ld32(ctx.r3.u32 + 40); mode < 32 && !(logged_modes & (1u << mode))) {
     logged_modes |= 1u << mode;
     RT_INFO("frame timer: mode %u, tick rate %u", mode, Ld32(ctx.r3.u32 + 44));
   }
+  // Frame timer update (bf1943's 822C7388): r3 = timer, +40 mode, +44 tick rate,
+  // +48 ticks. Game.MaxFps is read straight from its setting (pointer cached at
+  // 82C24C68 on the first call), 30 by default.
+  // With a limit, the timer counts Game.MaxFps ticks per second (+48), but every
+  // tick still lasts 1/rate (+44, 30), so a limit above 30 makes the game run
+  // fast. With 0 (no limit) it counts +44 ticks per second of real time. So the
+  // client's timers get 0 and VdSwap (gpu.cpp) caps the frame rate at --max-fps.
+  // The server's timer (mode 1, only while hosting: one tick per loop, paced by
+  // sleeping 1/Game.MaxFps) keeps 30, else it spins. The setting is shared and
+  // read at the start of each call, so it's set per call.
   if (uint32_t max_fps = Ld32(0x82C24C68)) {
-    float f = float(g_max_fps);
+    float f = Ld32(ctx.r3.u32 + 40) == 1 ? 30.0f : 0.0f;
     uint32_t bits;
     memcpy(&bits, &f, 4);
     St32(max_fps, bits);
   }
+  HostFromMainLoop(ctx, base);
   __imp__sub_8229B708(ctx, base);
 }
 
@@ -104,6 +159,7 @@ GAME_PATCH(8228CCD8) {
 // button (up, down, left, right, a, b, start), pressed 1.5 s apart, so the menus
 // can be driven one step at a time while looking at screenshots.
 #include <thread>
+#include <set>
 #include <string>
 #include <fstream>
 #include <cstdio>
@@ -136,8 +192,9 @@ static const bool g_auto_mp_started = [] {
                    : name == "right" ? XINPUT_GAMEPAD_DPAD_RIGHT : name == "left" ? XINPUT_GAMEPAD_DPAD_LEFT
                    : name == "a" ? XINPUT_GAMEPAD_A : name == "b" ? XINPUT_GAMEPAD_B
                    : name == "start" ? XINPUT_GAMEPAD_START : 0;
+        if (name == "wait") std::this_thread::sleep_for(std::chrono::seconds(3));
         if (!b) continue;
-        press(b, 20);
+        press(b, 150);  // long enough for the menu to see it at ~40 fps (two instances)
         RT_INFO("auto mp: pressed %s (step %zu)", name.c_str(), done);
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
       }
@@ -189,3 +246,104 @@ static const bool g_replay_started = [] {
   }).detach();
   return true;
 }();
+
+// Server message handler (same code as bf1943's 82413BC0: r4 = message, r5 = sub id,
+// r6 = server object; 39/16 creates the server, +44 backend 1 = multiplayer UDP).
+// A multiplayer server is listed on Arcadia (net.cpp RegisterHostedGame).
+GAME_PATCH(823D1568) {
+  { static std::map<uint32_t, int> n; if (n[ctx.r4.u32 << 16 | ctx.r5.u32]++ < 3) RT_INFO("TEMP server msg %u sub %u at %llu", ctx.r4.u32, ctx.r5.u32, (unsigned long long)GetTickCount64()); }
+  bool create = ctx.r4.u32 == 39 && ctx.r5.u32 == 16;
+  uint32_t server = ctx.r6.u32;
+  // --host / --join (lan.cpp): a multiplayer server (+44 = 1, real UDP) that
+  // isn't bound to 127.0.0.1 only (+41), as bf1943's 82413BC0 patch does.
+  if (create) RT_INFO("server: create, backend %u, localhost only %u", Ld32(server + 44), *G<uint8_t>(server + 41));
+  if (create && g_lan_host) {
+    St32(server + 44, 1);
+    St8(server + 41, 0);
+  }
+  __imp__sub_823D1568(ctx, base);
+  if (g_join_address) return;  // a joiner's own server isn't listed
+  // Listed with the VDP port (1000): a joiner first sends its session handshake
+  // there (to the listed port, from its own VDP socket), not to the server's 1003.
+  if (create && Ld32(server + 44) == 1)
+    RegisterHostedGame(uint16_t(1000 + g_port_offset), g_host_map.empty() ? std::string("bfbc1") : g_host_map);
+}
+
+// Server setup (r3 = server): copies Server.LoadingTimeout to +556 and
+// Server.IngameTimeout to +560 (seconds). With --host / --join a player who
+// hasn't pressed Ready on the loading screen, or idles, isn't sent back to the
+// menu (which also closes a host's server), so both are made very long.
+GAME_PATCH(8236DED8) {
+  uint32_t server = ctx.r3.u32;
+  __imp__sub_8236DED8(ctx, base);
+  if (!g_lan_host) return;
+  float loading, ingame, never = 1e7f;
+  uint32_t v = Ld32(server + 556), w = Ld32(server + 560), n;
+  memcpy(&loading, &v, 4), memcpy(&ingame, &w, 4), memcpy(&n, &never, 4);
+  RT_INFO("server: loading timeout %.0f s, ingame timeout %.0f s -> off", loading, ingame);
+  St32(server + 556, n);
+  St32(server + 560, n);
+}
+
+// Menu callback dispatcher (bf1943's 8246D918): r3 = UI manager, r4 = callback
+// name, r5 = its argument string. Kept for hosting from the main loop.
+static uint32_t g_bc_ui_manager = 0;
+GAME_PATCH(823C6EF0) {
+  g_bc_ui_manager = ctx.r3.u32;
+  if (ctx.r4.u32 && ctx.r4.u32 < 0xF0000000u) {
+    static std::set<std::string> seen;
+    std::string nm(G<char>(ctx.r4.u32));
+    if (seen.insert(nm).second) RT_INFO("TEMP ui callback %s r5=%08X", nm.c_str(), ctx.r5.u32);
+  }
+  __imp__sub_823C6EF0(ctx, base);
+}
+
+// TEMP DIAG: which name lookup caller gets the menu callbacks (startSingleplayer...).
+static void LogNameArg(const char* fn, PPCContext& ctx) {
+  static std::set<std::string> seen;
+  uint32_t a = ctx.r4.u32;
+  if (a < 0x40000000u || a >= 0xF0000000u || !IsCommitted(a)) return;
+  std::string key = std::string(fn) + " " + std::string(G<char>(a)).substr(0, 40);
+  if (seen.insert(key).second) RT_INFO("TEMP lookup caller %s r5=%08X", key.c_str(), ctx.r5.u32);
+}
+#define TRACE_NAME(addr, tag) GAME_PATCH(addr) { LogNameArg(tag, ctx); __imp__sub_##addr(ctx, base); }
+TRACE_NAME(8242DBF8, "cb_A")
+// Menu callback dispatcher: r3 = menu manager, r4 = callback name, r5 = its
+// arguments as one string ("Movies/UIMAIntro", "0"; several are comma separated).
+// startBackgroundMovie is called once the main menu is up.
+
+GAME_PATCH(8242F698) {
+  g_menu_manager = ctx.r3.u32;
+  g_menu_thread = GetCurrentThreadId();
+  if (!strcmp(G<char>(ctx.r4.u32), "startBackgroundMovie") && !g_menu_up_ms)
+    g_menu_up_ms = GetTickCount64();
+  uint32_t a = ctx.r5.u32;
+  RT_INFO("TEMP menu cb this=%08X tid=%lu %s(%s)", ctx.r3.u32, GetCurrentThreadId(), G<char>(ctx.r4.u32),
+          a >= 0x40000000u && a < 0xF0000000u && IsCommitted(a) ? std::string(G<char>(a)).substr(0, 80).c_str() : "?");
+  // MULTIPLAYER on the main menu logs in to EA's servers (gone) and opens the
+  // game's online menu: ours (bc_mp_menu.cpp, LAN host/join) opens instead.
+  if (!g_internal_call && g_online_server.empty() && !strcmp(G<char>(ctx.r4.u32), "presenceRequestOnline")) {
+    bcmp::Open();
+    return;
+  }
+  __imp__sub_8242F698(ctx, base);
+}
+
+static void CallMenu(PPCContext& ctx, uint8_t* base, const std::string& cb, const std::string& arg) {
+  static uint32_t strs = g_system_heap->Alloc(512, 16);
+  snprintf(G<char>(strs), 64, "%s", cb.c_str());
+  snprintf(G<char>(strs + 64), 448, "%s", arg.c_str());
+  PPCContext c = ctx;
+  c.r3.u64 = g_menu_manager;
+  c.r4.u64 = strs;
+  c.r5.u64 = strs + 64;
+  g_internal_call = true;
+  sub_8242F698(c, base);
+  g_internal_call = false;
+}
+TRACE_NAME(823B3E48, "fn_1")
+TRACE_NAME(8240A3B0, "fn_2")
+TRACE_NAME(82410100, "fn_3")
+TRACE_NAME(82433CB0, "fn_4")
+TRACE_NAME(82437DF0, "fn_5")
+TRACE_NAME(824384B0, "fn_6")

@@ -63,9 +63,11 @@ public class FeslHandler
             ["fsys/Ping"] = HandlePing,
             ["fsys/GetPingSites"] = HandleGetPingSites,
             ["fsys/Goodbye"] = HandleGoodbye,
+            ["blob/ListBlobInfo"] = HandleListBlobInfo,  // Bad Company 360: no stored blobs
             ["pnow/Start"] = HandlePlayNow,
             ["acct/NuPS3Login"] = HandleNuPs3Login,
             ["acct/NuXBL360Login"] = HandleNuXbl360Login,
+            ["acct/XBL360Login"] = HandleNuXbl360Login,  // Bad Company 360 (bfbc1 port)
             ["acct/NuXBL360AddAccount"] = HandleAddAccount,
             ["acct/PS3Login"] = HandlePs3Login,
             ["acct/NuLogin"] = HandleNuLogin,
@@ -205,6 +207,17 @@ public class FeslHandler
         return Task.CompletedTask;
     }
 
+    // Bad Company 360 asks for its stored blobs (e.g. settings) before hosting; an
+    // empty list lets it carry on instead of waiting for an answer.
+    private async Task HandleListBlobInfo(Packet request)
+    {
+        await _conn.SendPacket(new(request.Type, FeslTransmissionType.SinglePacketResponse, request.Id, new()
+        {
+            { "TXN", request.TXN },
+            { "infos.[]", "0" },
+        }));
+    }
+
     private async Task HandleGoodbye(Packet request)
     {
         var response = new Dictionary<string, string> { { "TXN", request.TXN } };
@@ -251,6 +264,15 @@ public class FeslHandler
                 pnowResult.Add($"props.{{games}}.{i}.gid", $"{servers[i].GID}");
                 pnowResult.Add($"props.{{games}}.{i}.lid", $"{servers[i].LID}");
             }
+        }
+        else if (_session?.PartitionId.EndsWith("BFBC") == true)
+        {
+            // Bad Company 360 (bfbc1 port): nothing to join. The 360 client can't host
+            // through Play Now: CREATE only notifies a listener whose handler is empty
+            // (824BD728), and CREATE_PROXY needs it to be in a Theater game already.
+            pnowResult.Add("props.{}", "2");
+            pnowResult.Add("props.{resultType}", PlayNowResultType.CREATE_PROXY);
+            pnowResult.Add("props.{availableServerCount}", "1");
         }
         else if (_session?.PartitionId.EndsWith("MOHAIR") == true)
         {

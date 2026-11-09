@@ -125,6 +125,7 @@ void SetBotSlot(const std::string& shared_name, int slot);  // bots.cpp: bot pro
 extern bool g_lan_host;            // --host: local game over real UDP (LAN server)
 extern std::string g_host_map;     // --host-map: level hosted from the main menu
 extern uint32_t g_join_address;    // lan.cpp: the joined host (network order, 0 none)
+extern uint16_t g_join_port;       // lan.cpp: the joined host's server port (network order)
 void RequestHost();                // game_patches.cpp: host g_host_map from the main loop
 extern bool g_log_ui;              // --log-ui: log menu callbacks (name and argument)
 extern std::string g_log_settings; // --log-settings A.B,C.D: log these engine settings
@@ -140,6 +141,7 @@ extern std::atomic<bool> g_level_menu;   // game_patches.cpp: a menu over a leve
 extern std::atomic<bool> g_online_ready;  // net.cpp: the Theater login has answered
 extern std::string g_guest_args;     // --args: the game's own command line (ExLoadedCommandLine)
 extern std::string g_online_server;  // --online-server: EA host names (*.ea.com) resolve here
+extern bool g_report_live;          // xam.cpp: report the profile signed in to LIVE without --online-server
 extern uint32_t g_lan_ip;            // --lan-ip: address in our XNADDR (network order)
 void RegisterHostedGame(uint16_t port, const std::string& map);  // net.cpp: list on Arcadia
 extern uint16_t g_port_offset;       // --port-offset: added to bound ports
