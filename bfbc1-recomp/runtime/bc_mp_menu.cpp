@@ -9,8 +9,12 @@
 #include "lan.h"
 #include "xenia_bridge.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <Xinput.h>
 #include <objidl.h>
@@ -59,17 +63,35 @@ struct Map {
   const wchar_t* name;
   const wchar_t* desc;
 };
+// The level folders' maps (names and descriptions are the game's own strings).
 const Map kMaps[] = {
     {"mp_harbour_day1", L"VALLEY RUN",
      L"At the head of a long valley, Russians are expanding and fortifying a dam facility when the US gets wind "
      L"of large amounts of gold hidden in the area."},
-    {"mp_harbour_day2", L"OVER AND OUT", L""},
-    {"mp_beachhead_day1", L"OASIS", L""},
-    {"mp_beachhead_day2", L"DECONSTRUCTION", L""},
-    {"mp_monastery_day1", L"ASCENSION", L""},
-    {"mp_monastery_day2", L"HARVEST DAY", L""},
-    {"mp_ignition_day1", L"END OF THE LINE", L""},
-    {"mp_ignition_day2", L"FINAL IGNITION", L""},
+    {"mp_harbour_day2", L"DECONSTRUCTION",
+     L"With the water facility captured, the US has a foothold for assaulting the construction area. Girders, "
+     L"pipes, and scaffolding make this a tight, labyrinthine scramble and the fight to take the bridge will be "
+     L"gruelling."},
+    {"mp_ignition_day1", L"OASIS",
+     L"A normally arid gully has been flooded after a local dam burst, threatening to overflow a local MEC "
+     L"industrial gas facility."},
+    {"mp_ignition_day2", L"FINAL IGNITION",
+     L"The grimy gas facility is in stark contrast to the irrigated town and plantations surrounding it, and the "
+     L"US will have a hard time dislodging the defenders from the fortress like facility."},
+    {"mp_monastery_day1", L"END OF THE LINE",
+     L"US forces have landed on the windswept plain below the imposing, secluded hilltop monastery, which houses a "
+     L"secret listening station. Before they make their way to the top, they have to get rid of the Russians' "
+     L"vehicle defense."},
+    {"mp_monastery_day2", L"ASCENSION",
+     L"The monastery's location means the area is, geographically speaking, easily defensible. The attackers are "
+     L"well armed, but taking the defender's gold will be no easy task, as every window may contain an enemy "
+     L"sniper."},
+    {"mp_beachhead_day1", L"HARVEST DAY",
+     L"Farms are torn apart by heavy caliber gunfire, as the Americans are forced to retreat to the local town "
+     L"with their hard-won gold - will they be able to halt the rampaging Russian bear?"},
+    {"mp_beachhead_day2", L"OVER AND OUT",
+     L"Having been pushed out of the plains, the Americans have made off with large amounts of bullion, and holed "
+     L"up in a captured Russian communication centre."},
 };
 constexpr int kMapCount = int(sizeof(kMaps) / sizeof(kMaps[0]));
 std::wstring MapName(const std::string& level) {
