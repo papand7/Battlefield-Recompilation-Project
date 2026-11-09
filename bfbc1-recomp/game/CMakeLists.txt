@@ -5,7 +5,11 @@ cmake_minimum_required(VERSION 3.25)
 project(bfbc1_game LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(BC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-set(ROOT ${BC}/../bf1943-recomp)   # shared code; the included .cmake files use ROOT
+# Shared code (the included .cmake files use ROOT): next to this tree in the
+# repo; the launcher's setup passes -DROOT=<release>/src.
+if(NOT ROOT)
+  set(ROOT ${BC}/../bf1943-recomp)
+endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 file(GLOB PPC_SOURCES CONFIGURE_DEPENDS ${BC}/generated/ppc/*.cpp)

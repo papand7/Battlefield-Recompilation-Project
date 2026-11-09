@@ -1,30 +1,56 @@
-// First-run setup, run by the launcher: builds Battlefield 1943 for this PC
-// from the player's own copy of the game. Nothing of the game ships with the
-// launcher; this makes it here:
-//   1. the game files: an Xbox 360 package (STFS) is unpacked, a folder with
-//      default.xex is copied, into <root>/original/v106 (v1.06 only: the
-//      recompiler's addresses are for that build);
+// First-run setup, run by the launcher: builds a game for this PC from the
+// player's own copy. Nothing of the games ships with the launcher; this makes
+// it here, per game (kGames):
+//   1. the game files: Battlefield 1943's Xbox 360 package (STFS) or Bad
+//      Company's disc image (.iso) is unpacked, a folder with default.xex is
+//      copied, into <root>/original/<game> (one exact build each: the
+//      recompiler's addresses are for it);
 //   2. the build tools, through winget where missing: LLVM (clang), CMake,
 //      Ninja, Python, the Visual Studio C++ build tools, the Vulkan SDK;
-//   3. XenonRecomp turns default.xex into C++ (src/generated/ppc);
-//   4. CMake + Ninja build bf1943.exe, copied to <root>/game.
-// Layout (release): <root>/Launcher/BF1943Launcher.exe, <root>/src (this repo).
+//   3. XenonRecomp turns default.xex into C++ (<tree>/generated/ppc);
+//   4. CMake + Ninja build the exe, copied to its folder under <root>.
+// Layout (release): <root>/Launcher/BF1943Launcher.exe, <root>/src (bf1943-recomp,
+// also the code both games share), <root>/src-bfbc1 (bfbc1-recomp).
 const { spawn, execFileSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const kXexSha1 = 'b5aaa325ff358d66a116000931b7204da3f14534';  // default.xex v1.06
-const kXexSha1V105 = '1c1f22606fa1eff15bf0409214279118dc805c28';
+const kGames = {
+  bf1943: {
+    title: 'Battlefield 1943',
+    sha1: 'b5aaa325ff358d66a116000931b7204da3f14534',  // default.xex v1.06
+    wrongSha1: { '1c1f22606fa1eff15bf0409214279118dc805c28':
+      'This is version 1.05 of the game. Use the 1.06 package (the game updated on the console).' },
+    expected: 'Battlefield 1943 version 1.06',
+    unpacker: 'stfs_extract.py',
+    data: 'original/v106', gameDir: 'game', exe: 'bf1943.exe', config: 'bf1943_config.toml',
+  },
+  bfbc1: {
+    title: 'Battlefield: Bad Company',
+    sha1: 'c1ad8ac5c18b1b0b23a4c3476721462852af1a93',  // default.xex of the US disc
+    wrongSha1: {},
+    expected: 'Battlefield: Bad Company (USA disc)',
+    unpacker: 'xiso_extract.py',
+    data: 'original/bfbc1', gameDir: 'game-bfbc1', exe: 'bfbc1.exe', config: 'bfbc1_config.toml',
+  },
+};
 
-// The build tree: <root>/src in a release, the repo itself when run from source.
-function paths(launcherDir) {
+// The build trees: <root>/src and <root>/src-bfbc1 in a release, the repo's
+// bf1943-recomp and bfbc1-recomp when run from source (installing under
+// bf1943-recomp/build/install). tree = the game's own tree, src = the shared one.
+function paths(launcherDir, game = 'bf1943') {
+  const g = kGames[game];
+  if (!g) return null;
   for (const src of [path.join(path.dirname(launcherDir), 'src'), path.resolve(__dirname, '..')]) {
     if (fs.existsSync(path.join(src, 'tools', 'stfs_extract.py')) && fs.existsSync(path.join(src, 'game', 'CMakeLists.txt'))) {
-      // From source (no release layout): installs under build/install.
-      const root = path.basename(src) === 'src' ? path.dirname(src) : path.join(src, 'build', 'install');
-      return { root, src, data: path.join(root, 'original', 'v106'), gameDir: path.join(root, 'game') };
+      const release = path.basename(src) === 'src';
+      const root = release ? path.dirname(src) : path.join(src, 'build', 'install');
+      const tree = game === 'bf1943' ? src
+        : release ? path.join(root, 'src-bfbc1') : path.resolve(src, '..', 'bfbc1-recomp');
+      if (!fs.existsSync(path.join(tree, 'game', 'CMakeLists.txt'))) return null;
+      return { root, src, tree, game: g, data: path.join(root, g.data), gameDir: path.join(root, g.gameDir) };
     }
   }
   return null;
@@ -111,21 +137,21 @@ function run(cmd, args, opts, onLine) {
 }
 
 // ---- the steps ----------------------------------------------------------------------
-function status(launcherDir) {
-  const p = paths(launcherDir);
+function status(launcherDir, game) {
+  const p = paths(launcherDir, game);
   if (!p) return { ok: false, error: 'The build files (src folder) are missing next to the launcher.' };
   const tools = findTools();
   return {
     ok: true,
     gameFiles: fs.existsSync(path.join(p.data, 'default.xex')),
-    built: fs.existsSync(path.join(p.gameDir, 'bf1943.exe')),
+    built: fs.existsSync(path.join(p.gameDir, p.game.exe)),
     tools: Object.fromEntries(Object.keys(kToolNames).map((k) => [k, !!tools[k]])),
   };
 }
 
 // send({step, state: 'run'|'done'|'fail', text}) and send({log}), send({progress: 0-1})
-async function setup(launcherDir, gamePath, send) {
-  const p = paths(launcherDir);
+async function setup(launcherDir, game, gamePath, send) {
+  const p = paths(launcherDir, game);
   if (!p) throw new Error('The build files (src folder) are missing next to the launcher.');
   const log = (line) => send({ log: line });
   const step = async (name, text, fn) => {
@@ -149,20 +175,22 @@ async function setup(launcherDir, gamePath, send) {
         log(`Copying ${path.dirname(gamePath)}`);
         fs.cpSync(path.dirname(gamePath), p.data, { recursive: true });
       } else {
-        // An Xbox 360 package: unpack it (needs Python).
+        // An Xbox 360 package (BF1943) or disc image (Bad Company): unpack it (needs Python).
         if (!tools.python) {
-          log('Installing Python to unpack the package…');
+          log('Installing Python to unpack the game…');
           await run('winget', ['install', '-e', '--accept-package-agreements', '--accept-source-agreements', ...kWinget.python], {}, log);
           tools = findTools();
         }
         log(`Unpacking ${gamePath}`);
-        await run(tools.python, ['-I', path.join(p.src, 'tools', 'stfs_extract.py'), gamePath, p.data], {}, log);
+        let n = 0;  // a disc has thousands of files: every 50th is shown
+        await run(tools.python, ['-I', path.join(p.src, 'tools', p.game.unpacker), gamePath, p.data], {},
+          (line) => { if (game !== 'bfbc1' || ++n % 50 === 0) log(line); });
       }
     }
     if (!fs.existsSync(xex)) throw new Error('No default.xex found in the game files.');
     const h = sha1(xex);
-    if (h === kXexSha1V105) throw new Error('This is version 1.05 of the game. Use the 1.06 package (the game updated on the console).');
-    if (h !== kXexSha1) throw new Error('This default.xex is not Battlefield 1943 version 1.06 (SHA-1 ' + h + ').');
+    if (p.game.wrongSha1[h]) throw new Error(p.game.wrongSha1[h]);
+    if (h !== p.game.sha1) throw new Error(`This default.xex is not ${p.game.expected} (SHA-1 ${h}).`);
   });
 
   // 2. Build tools.
@@ -180,11 +208,11 @@ async function setup(launcherDir, gamePath, send) {
 
   // 3. Recompile: the config with this PC's path to default.xex.
   await step('recompile', 'Recompiling the game code…', async () => {
-    const gen = path.join(p.src, 'generated');
-    const cfgIn = path.join(gen, 'bf1943_config.toml');
+    const gen = path.join(p.tree, 'generated');
+    const cfgIn = path.join(gen, p.game.config);
     const cfg = fs.readFileSync(cfgIn, 'utf8').replace(/^file_path = ".*"$/m,
       `file_path = "${path.join(p.data, 'default.xex').replace(/\\/g, '/')}"`);
-    const cfgOut = path.join(gen, 'bf1943_config.local.toml');
+    const cfgOut = path.join(gen, p.game.config.replace('.toml', '.local.toml'));
     fs.writeFileSync(cfgOut, cfg);
     const recomp = firstExisting([path.join(p.src, 'tools', 'bin', 'XenonRecomp.exe'),
       path.join(p.src, 'build', 'xenonrecomp-clang', 'XenonRecomp', 'XenonRecomp.exe')]);
@@ -193,13 +221,14 @@ async function setup(launcherDir, gamePath, send) {
     let n = 0;
     // Paths relative to generated/: XenonRecomp finds the config's folder by
     // '/' only and crashes on an absolute Windows path.
-    await run(recomp, [path.basename(cfgOut), '../thirdparty/XenonRecomp/XenonUtils/ppc_context.h'], { cwd: gen },
+    const header = path.relative(gen, path.join(p.src, 'thirdparty', 'XenonRecomp', 'XenonUtils', 'ppc_context.h'));
+    await run(recomp, [path.basename(cfgOut), header.split(path.sep).join('/')], { cwd: gen },
       (line) => { if (++n % 200 === 0) log(line); });
   });
 
   // 4. Build.
   await step('build', 'Building the game (about 20-60 minutes)…', async () => {
-    const bat = path.join(p.src, 'build', 'launcher_build.bat');
+    const bat = path.join(p.tree, 'build', 'launcher_build.bat');
     fs.mkdirSync(path.dirname(bat), { recursive: true });
     const q = (s) => `"${s}"`;
     fs.writeFileSync(bat, [
@@ -207,8 +236,10 @@ async function setup(launcherDir, gamePath, send) {
       `call ${q(tools.vs)} >nul 2>&1 || exit /b 1`,
       `set "VULKAN_SDK=${tools.vulkan}"`,
       `set "PATH=${path.dirname(tools.ninja)};${path.dirname(tools.cmake)};${path.dirname(tools.python)};%PATH%"`,
-      `cd /d ${q(p.src)}`,
-      `cmake -S game -B build\\game -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER=${tools.clang.replace(/\\/g, '/')}" "-DCMAKE_CXX_COMPILER=${tools.clang.replace(/\\/g, '/')}" || exit /b 1`,
+      `cd /d ${q(p.tree)}`,
+      `cmake -S game -B build\\game -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_C_COMPILER=${tools.clang.replace(/\\/g, '/')}" "-DCMAKE_CXX_COMPILER=${tools.clang.replace(/\\/g, '/')}"` +
+        // Bad Company's tree builds with the shared code from src.
+        (p.tree !== p.src ? ` "-DROOT=${p.src.replace(/\\/g, '/')}"` : '') + ' || exit /b 1',
       'cmake --build build\\game || exit /b 1',
     ].join('\r\n'));
     await run('cmd.exe', ['/d', '/c', bat], {}, (line) => {
@@ -216,9 +247,9 @@ async function setup(launcherDir, gamePath, send) {
       if (m) send({ progress: Number(m[1]) / Number(m[2]) });
       if (!m || Number(m[1]) % 25 === 0) log(line.length > 160 ? line.slice(0, 160) + '…' : line);
     });
-    const built = path.join(p.src, 'build', 'game');
+    const built = path.join(p.tree, 'build', 'game');
     fs.mkdirSync(p.gameDir, { recursive: true });
-    fs.copyFileSync(path.join(built, 'bf1943.exe'), path.join(p.gameDir, 'bf1943.exe'));
+    fs.copyFileSync(path.join(built, p.game.exe), path.join(p.gameDir, p.game.exe));
     for (const f of ['pbr_shaders.txt']) {
       if (fs.existsSync(path.join(built, f))) fs.copyFileSync(path.join(built, f), path.join(p.gameDir, f));
     }
@@ -226,4 +257,4 @@ async function setup(launcherDir, gamePath, send) {
   });
 }
 
-module.exports = { status, setup, kToolNames };
+module.exports = { status, setup, kToolNames, kGames };

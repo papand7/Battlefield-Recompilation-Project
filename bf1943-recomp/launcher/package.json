@@ -1,7 +1,7 @@
 {
   "name": "bf1943-launcher",
   "productName": "BF1943 Launcher",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Launcher for the Battlefield 1943 PC recompilation",
   "main": "main.js",
   "private": true,

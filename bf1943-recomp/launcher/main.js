@@ -52,8 +52,8 @@ const scanGames = () => ({
   },
   bfbc1: {
     title: 'Battlefield: Bad Company',
-    exe: find('bfbc1.exe', 'bfbc1-recomp/build/game/bfbc1.exe'),
-    data: findDir('bfbc1/extracted/default.xex'),
+    exe: find('bfbc1.exe', 'game-bfbc1/bfbc1.exe', 'bfbc1-recomp/build/game/bfbc1.exe'),
+    data: findDir('original/bfbc1/default.xex', 'bfbc1/extracted/default.xex'),
     textures: findDir('texpack_bfbc1/install/replacements.txt'),
     dataHint: 'bfbc1\extracted',
   },
@@ -120,10 +120,14 @@ ipcMain.handle('play', (_, s) => {
   });
 });
 
-// First-run setup (setup.js): status, choosing the game files, running it.
-ipcMain.handle('setup-status', () => setup.status(launcherDir));
-ipcMain.handle('setup-pick', async () => {
-  const r = await dialog.showOpenDialog(win, {
+// First-run setup (setup.js), per game: status, choosing the game files, running it.
+ipcMain.handle('setup-status', (_, game) => setup.status(launcherDir, game));
+ipcMain.handle('setup-pick', async (_, game) => {
+  const r = await dialog.showOpenDialog(win, game === 'bfbc1' ? {
+    title: 'Your Battlefield: Bad Company disc: the disc image (.iso), or default.xex in an unpacked folder',
+    properties: ['openFile'],
+    filters: [{ name: 'Disc image or default.xex', extensions: ['iso', 'xex'] }, { name: 'All files', extensions: ['*'] }],
+  } : {
     title: 'Your Battlefield 1943 game: the Xbox 360 package file, or default.xex in an unpacked folder',
     properties: ['openFile'],
     filters: [{ name: 'Game package or default.xex', extensions: ['*'] }],
@@ -131,11 +135,11 @@ ipcMain.handle('setup-pick', async () => {
   return r.canceled ? null : r.filePaths[0];
 });
 let setupRunning = false;
-ipcMain.handle('setup-run', async (_, gamePath) => {
+ipcMain.handle('setup-run', async (_, game, gamePath) => {
   if (setupRunning) return { error: 'Setup is already running.' };
   setupRunning = true;
   try {
-    await setup.setup(launcherDir, gamePath, (ev) => win.webContents.send('setup-event', ev));
+    await setup.setup(launcherDir, game, gamePath, (ev) => win.webContents.send('setup-event', ev));
     games = scanGames();
     return {};
   } catch (e) {

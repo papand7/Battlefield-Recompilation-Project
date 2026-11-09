@@ -62,17 +62,39 @@ function selectGame(key) {
   document.title = g.title;
   setStatus(g.error || '', !!g.error);
   $('play').disabled = !!g.error;
-  showSetup(key === 'bf1943' && !!g.error);
+  showSetup(key, !!g.error);
 }
 
 // ---- first-run setup: the game built here from the player's own copy ----------
+const setupText = {
+  bf1943: ['Set up Battlefield 1943', 'The game is built on this PC from your own copy. Choose your game files: the Xbox 360 '
+    + 'package of Battlefield 1943 (version 1.06), or <b>default.xex</b> in a folder you unpacked.'],
+  bfbc1: ['Set up Bad Company', 'The game is built on this PC from your own copy. Choose your game files: the disc image '
+    + '(<b>.iso</b>) of Battlefield: Bad Company (USA), or <b>default.xex</b> in a folder you unpacked. '
+    + 'The game files take about 5 GB.'],
+};
 let gamePath = null;
+let setupGame = null;
 let setupState = null;
-async function showSetup(on) {
+let setupBusy = false;
+async function showSetup(key, on) {
   $('setupcard').hidden = !on;
   $('graphicscard').hidden = on;
-  if (!on) return;
-  setupState = await window.launcher.setupStatus();
+  if (!on || setupBusy) return;
+  if (setupGame !== key) {  // another game: its own files to choose
+    setupGame = key;
+    gamePath = null;
+    $('pickpath').textContent = 'No files chosen';
+    document.querySelectorAll('.steps li').forEach((li) => (li.className = ''));
+    logLines.length = 0;
+    $('setuplog').textContent = '';
+    $('barfill').style.width = '0%';
+    $('install').textContent = 'INSTALL';
+  }
+  $('setuptitle').textContent = setupText[key][0];
+  $('setuphint').innerHTML = setupText[key][1];
+  $('pick').disabled = false;
+  setupState = await window.launcher.setupStatus(key);
   if (!setupState.ok) {
     setStatus(setupState.error, true);
     $('pick').disabled = $('install').disabled = true;
@@ -96,7 +118,7 @@ function addLog(line) {
   $('setuplog').textContent = logLines.join('\n');
 }
 $('pick').onclick = async () => {
-  const p = await window.launcher.setupPick();
+  const p = await window.launcher.setupPick(setupGame);
   if (!p) return;
   gamePath = p;
   $('pickpath').textContent = p;
@@ -108,7 +130,11 @@ $('install').onclick = async () => {
   $('install').disabled = $('pick').disabled = true;
   $('install').textContent = 'INSTALLING…';
   setStatus('Setting up… keep the launcher open.');
-  const r = await window.launcher.setupRun(gamePath);
+  setupBusy = true;
+  document.querySelectorAll('.game').forEach((t) => (t.disabled = true));  // one setup at a time
+  const r = await window.launcher.setupRun(setupGame, gamePath);
+  setupBusy = false;
+  document.querySelectorAll('.game').forEach((t) => (t.disabled = false));
   if (r.error) {
     setStatus(r.error, true);
     $('install').textContent = 'TRY AGAIN';
@@ -141,8 +167,7 @@ async function init() {
   $('hdr').checked = !!settings.hdr;
   for (const tab of document.querySelectorAll('.game')) {
     const g = games[tab.dataset.game];
-    tab.disabled = !!g.error;       // a port without its exe or game files stays greyed out
-    const badge = tab.querySelector('.soon');
+    const badge = tab.querySelector('.soon');  // not installed yet: its tab opens the setup
     if (badge) badge.hidden = !g.error;
     tab.onclick = () => selectGame(tab.dataset.game);
   }
