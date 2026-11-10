@@ -1616,8 +1616,11 @@ static void FakeBrain(uint32_t in) {
   dx /= len, dz /= len;
   float rx = LdF(so + 0x300), rz = LdF(so + 0x308);
   bool arrived = best < 1.0f && step >= route.size();
-  float forward = arrived ? 0.0f : dx * fx + dz * fz;
-  float strafe = arrived ? 0.0f : -(dx * rx + dz * rz);  // strafe right is minus the +300 row
+  // The soldier moves relative to where it looks (its aim object, steered
+  // toward the next point below), not to its body: aim there, walk forward.
+  float forward = arrived ? 0.0f : 1.0f;
+  float strafe = 0.0f;
+  (void)rx, (void)rz;
   float m = std::max(std::max(std::fabs(forward), std::fabs(strafe)), 0.001f);  // full speed
   forward /= m, strafe /= m;
   // Stuck (under 0.3 m in 1.5 s while trying to move): jump (A: its held time
@@ -1710,7 +1713,9 @@ static void FakeBrain(uint32_t in) {
     // Facing the next point: the yaw whose heading points there. Heading
     // atan2(fx, fz) was minus the aim object's value (-2.57 vs 2.57).
     float want = std::atan2(tx - x, tz - z);
-    g_bot_aim_obj = aim_obj, g_bot_want_heading = want, g_bot_steer = true;
+    // Walking forward with the aim at "want" went the opposite way: the aim's
+    // convention is half a turn from atan2(dx, dz).
+    g_bot_aim_obj = aim_obj, g_bot_want_heading = want + 3.14159265f, g_bot_steer = true;
     static int64_t aim_log = 0;
     if (now - aim_log > 3000) {
       aim_log = now;
