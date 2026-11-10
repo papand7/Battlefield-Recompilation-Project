@@ -35,6 +35,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -54,6 +55,7 @@ const Kind kKinds[] = {
     {"capture point", 0x820168C0},       // ServerCapturePointEntity (822F4080)
     {"human player", 0x820149E8},        // ServerHumanPlayerEntity (822D76D0)
     {"team", 0x820133C8},                // ServerTeamEntity (822D8058)
+    {"squad", 0x82047AA8},               // Squad, campaign AI (8263CA18)
 };
 
 // Every live object with this vtable in the heaps.
@@ -145,6 +147,87 @@ void LogChanges(uint32_t o) {
   if (!part_changes.empty()) RT_INFO("bot scan: soldier %08X parts changed:%s", o, part_changes.c_str());
 }
 
+// An object's type name: its vtable's slot 2 is getType (lis rX; addi r3, rX;
+// blr), the type object's +4 points at the record whose first word is the name.
+}  // namespace
+std::string TypeName(uint32_t o) {
+  if (o < 0x40000000 || o >= 0xC0000000 || (o & 3) || !IsCommitted(o)) return {};
+  uint32_t vt = Ld32(o);
+  if (vt < 0x82000000 || vt >= 0x82F00000) return {};
+  uint32_t get = Ld32(vt + 8);
+  if (get < 0x82000000 || get >= 0x82F00000) return {};
+  uint32_t w1 = Ld32(get), w2 = Ld32(get + 4), w3 = Ld32(get + 8);
+  if ((w1 >> 26) != 15 || (w2 >> 26) != 14 || ((w2 >> 21) & 31) != 3 || w3 != 0x4E800020) return {};
+  uint32_t type = ((w1 & 0xFFFF) << 16) + uint32_t(int16_t(w2 & 0xFFFF));
+  if (!IsCommitted(type)) return {};
+  uint32_t record = Ld32(type + 4);
+  if (record < 0x82000000 || record >= 0x83000000) return {};
+  uint32_t name = Ld32(record);
+  if (name < 0x82000000 || name >= 0x83000000) return {};
+  return std::string(G<char>(name)).substr(0, 48);
+}
+
+namespace {
+// A soldier's squad (campaign AI), once per squad: what it points at, two
+// levels down.
+void DescribeSquad(uint32_t o) {
+  static std::set<uint32_t> squads;
+  // Its squad (campaign AI): what that points at, two levels down.
+  for (uint32_t off = 0; off < 0x800; off += 4) {
+    uint32_t sq = off ? Ld32(o + off) : o;  // o itself may be the squad
+    if (TypeName(sq) != "Squad" || !squads.insert(sq).second) continue;
+    std::string sq_out;
+    for (uint32_t so = 4; so < 0x400; so += 4) {
+      uint32_t q = Ld32(sq + so);
+      std::string n = TypeName(q);
+      if (n.empty()) continue;
+      sq_out += " +" + std::to_string(so) + ":" + n;
+      std::string inner;
+      for (uint32_t io = 4; io < 0x200; io += 4) {
+        std::string m = TypeName(Ld32(q + io));
+        if (!m.empty()) inner += " +" + std::to_string(io) + ":" + m;
+      }
+      if (!inner.empty()) sq_out += "{" + inner.substr(0, 300) + "}";
+    }
+    RT_INFO("bot scan: soldier %08X squad +%X %08X:%s", o, off, sq, sq_out.substr(0, 2500).c_str());
+  }}
+
+// What a soldier points at (first 0x800 bytes) and what points at it, by type:
+// tells an AI soldier (campaign) from a player's (BF_BOT_SCAN, once per soldier).
+void DescribeLinks(uint32_t o) {
+  static std::set<uint32_t> done;
+  if (!done.insert(o).second) return;
+  std::string out;
+  for (uint32_t off = 4; off < 0x800; off += 4) {
+    std::string n = TypeName(Ld32(o + off));
+    if (!n.empty()) out += " +" + std::to_string(off) + ":" + n;
+  }
+  RT_INFO("bot scan: soldier %08X points at:%s", o, out.substr(0, 1500).c_str());
+
+  std::string refs;
+  uint32_t want = _byteswap_ulong(o);
+  for (uint64_t page = 0x40000000; page < 0xC0000000 && refs.size() < 1500; page += 0x1000) {
+    if (page >= 0x80000000 && page < 0xA0000000) continue;
+    if (!IsCommitted(uint32_t(page))) continue;
+    const uint32_t* p = reinterpret_cast<const uint32_t*>(g_base + page);
+    for (int i = 0; i < 1024; ++i) {
+      if (p[i] != want) continue;
+      uint32_t at = uint32_t(page) + i * 4;
+      // The object holding it: the nearest named object start below (within 0x400).
+      for (uint32_t back = 0; back <= 0x400 && back <= at - 0x40000000; back += 4) {
+        std::string n = TypeName(at - back);
+        if (!n.empty()) {
+          char buf[96];
+          snprintf(buf, sizeof(buf), " %s(%08X)+%X", n.c_str(), at - back, back);
+          refs += buf;
+          break;
+        }
+      }
+    }
+  }
+  RT_INFO("bot scan: soldier %08X pointed at by:%s", o, refs.c_str());
+}
+
 const bool g_scan_started = [] {
   if (!getenv("BF_BOT_SCAN")) return false;
   std::thread([] {
@@ -156,7 +239,10 @@ const bool g_scan_started = [] {
       for (uint32_t o : Scan(kKinds[0].vtable)) {
         DescribeFields("soldier", o);
         LogChanges(o);
+        DescribeLinks(o);
+        DescribeSquad(o);
       }
+      for (uint32_t o : Scan(0x82047AA8)) DescribeSquad(o);
       for (uint32_t o : Scan(kKinds[2].vtable)) DescribeFields("tactical objective", o);
       for (uint32_t o : Scan(kKinds[3].vtable)) {
         DescribeFields("mission objective", o);
@@ -202,7 +288,14 @@ using namespace rt;
 //   loads; later ones right after ServerSoldierSpawnEntity +14 (82321550,
 //   probably its event handler). Multiplayer: the deploying player's soldier
 //   from the same factory, with no soldier spawn entity call.
-//   Where the campaign's soldiers get their AI isn't known yet.
+//   Campaign AI is organised in Squad objects (vtable 82047AA8, 5 on level 1)
+//   holding inline SquadMember entries (0xD0 apart, +14 back to the squad).
+//   An AI soldier is made in this order: 82638400 (r3 an AI object, r4 the
+//   soldier's level data at 6005xxxx) -> 8264DA80, the squad hub (r3 the AI
+//   system, r4 the squad, -1 for a new one; it makes Squads and SquadMembers)
+//   -> ServerSoldierSpawnEntity +90 (82322508: r4 the spawn transform, r6
+//   the spawn entity) -> the soldier factory. So the AI asks a soldier spawn
+//   entity for its soldier. Multiplayer soldiers have no squad.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -254,6 +347,16 @@ PPC_FUNC(sub_822BDCB8) {
             r3, vt(r3), r4, vt(r4), r5, vt(r5), r6, made, vt(made));
   }
 }
+// The AI squad hub (makes squads and squad members) and its three callers.
+#define TRACE_AI(addr, label)                                                            PPC_FUNC(sub_##addr) {                                                                   if (g_trace) {                                                                           static int n = 0;                                                                      if (n++ < 40)                                                                            RT_INFO("bot trace: %s %s r3=%08X(%s) r4=%08X(%s) r5=%08X(%s) r6=%08X", label, #addr,                 ctx.r3.u32, TypeName(ctx.r3.u32).c_str(), ctx.r4.u32, TypeName(ctx.r4.u32).c_str(),                 ctx.r5.u32, TypeName(ctx.r5.u32).c_str(), ctx.r6.u32);                     }                                                                                      __imp__sub_##addr(ctx, base);                                                        }
+extern "C" PPC_FUNC(__imp__sub_8264DA80);
+extern "C" PPC_FUNC(__imp__sub_82614F78);
+extern "C" PPC_FUNC(__imp__sub_82638400);
+extern "C" PPC_FUNC(__imp__sub_82638520);
+TRACE_AI(8264DA80, "ai hub")
+TRACE_AI(82614F78, "ai caller 1")
+TRACE_AI(82638400, "ai caller 2")
+TRACE_AI(82638520, "ai caller 3 (virtual)")
 TRACE_VFN(822B8428, "ctor A")
 TRACE_VFN(822BD818, "ctor B")
 TRACE_VFN(82321550, "+14")
