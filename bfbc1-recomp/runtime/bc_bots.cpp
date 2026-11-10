@@ -31,7 +31,9 @@
 #include "../../bf1943-recomp/tools/msvc_compat/crash_diag.h"  // PrintStack
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <queue>
 #include <filesystem>
 #include <functional>
 #include <cmath>
@@ -45,6 +47,7 @@
 #include <vector>
 
 namespace rt {
+uint32_t g_bot_soldier_for_trails = 0;  // the bot's soldier: its moves aren't learnt from
 namespace {
 
 struct Kind {
@@ -573,6 +576,50 @@ const bool g_input_probe_started = [] {
   return true;
 }();
 
+// Learning routes from play: every half second, each real player's soldier
+// (not a bot) leaves a trail point every metre in nav/<map>.txt ("x y z" per
+// line; "-" starts a new trail: a respawn or a jump of over 5 m). Bots route
+// along these trails. On while hosting (--host); BF_BOT_NAV_RECORD=0 turns it off.
+void RecordTrails() {
+  static std::map<uint32_t, std::array<float, 3>> last;  // per soldier
+  if (!g_lan_host || g_host_map.empty()) return;
+  std::filesystem::create_directories("nav");
+  FILE* f = fopen(("nav/" + g_host_map + ".txt").c_str(), "a");
+  if (!f) return;
+  std::set<uint32_t> alive;
+  for (uint32_t so : Scan(0x820118D0)) {
+    if (so == g_bot_soldier_for_trails) continue;
+    alive.insert(so);
+    float x = LdF(so + 0x200), y = LdF(so + 0x204), z = LdF(so + 0x208);
+    if (!std::isfinite(x) || !std::isfinite(z)) continue;
+    auto it = last.find(so);
+    if (it == last.end()) {
+      fprintf(f, "-\n%.2f %.2f %.2f\n", x, y, z);
+      last[so] = {x, y, z};
+      continue;
+    }
+    float d = std::hypot(x - it->second[0], z - it->second[2]);
+    if (d < 1.0f) continue;
+    if (d > 5.0f) fprintf(f, "-\n");
+    fprintf(f, "%.2f %.2f %.2f\n", x, y, z);
+    it->second = {x, y, z};
+  }
+  for (auto it = last.begin(); it != last.end();) it = alive.count(it->first) ? std::next(it) : last.erase(it);
+  fclose(f);
+}
+
+const bool g_trails_started = [] {
+  const char* env = getenv("BF_BOT_NAV_RECORD");
+  if (env && !strcmp(env, "0")) return false;
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      RecordTrails();
+    }
+  }).detach();
+  return true;
+}();
+
 const bool g_census_started = [] {
   if (!getenv("BF_BOT_CENSUS") && !getenv("BF_BOT_PLAYER_DUMP") && !getenv("BF_BOT_DUMP_VT")) return false;
   std::thread([] {
@@ -905,6 +952,92 @@ static void DriveFake() {
   (void)set;
 }
 
+// Routes from the learnt trails (nav/<map>.txt, RecordTrails): points linked
+// along each trail and to other trails' points within 2.5 m (height within
+// 1.5 m); A* from the point nearest the bot to the one nearest its goal.
+struct NavGraph {
+  std::vector<std::array<float, 3>> p;
+  std::vector<std::vector<int>> next;
+  size_t file_size = 0;
+};
+static NavGraph g_nav;
+static void LoadNav() {
+  std::string path = "nav/" + g_host_map + ".txt";
+  std::error_code ec;
+  size_t size = size_t(std::filesystem::file_size(path, ec));
+  if (ec || size == g_nav.file_size) return;
+  NavGraph g;
+  g.file_size = size;
+  FILE* f = fopen(path.c_str(), "r");
+  if (!f) return;
+  char line[96];
+  int prev = -1;
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '-' && (line[1] == '\n' || line[1] == '\r' || line[1] == 0)) {  // a lone "-": a new trail
+      prev = -1;
+      continue;
+    }
+    std::array<float, 3> q;
+    if (sscanf(line, "%f %f %f", &q[0], &q[1], &q[2]) != 3) continue;
+    g.p.push_back(q);
+    g.next.emplace_back();
+    int i = int(g.p.size()) - 1;
+    if (prev >= 0) g.next[i].push_back(prev), g.next[prev].push_back(i);
+    prev = i;
+  }
+  fclose(f);
+  // Join trails where they pass close (a grid of 4 m cells).
+  std::map<std::pair<int, int>, std::vector<int>> cells;
+  for (int i = 0; i < int(g.p.size()); ++i) cells[{int(std::floor(g.p[i][0] / 4)), int(std::floor(g.p[i][2] / 4))}].push_back(i);
+  for (int i = 0; i < int(g.p.size()); ++i) {
+    int cx = int(std::floor(g.p[i][0] / 4)), cz = int(std::floor(g.p[i][2] / 4));
+    for (int ox = -1; ox <= 1; ++ox)
+      for (int oz = -1; oz <= 1; ++oz) {
+        auto it = cells.find({cx + ox, cz + oz});
+        if (it == cells.end()) continue;
+        for (int j : it->second)
+          if (j > i && std::hypot(g.p[i][0] - g.p[j][0], g.p[i][2] - g.p[j][2]) < 2.5f &&
+              std::fabs(g.p[i][1] - g.p[j][1]) < 1.5f)
+            g.next[i].push_back(j), g.next[j].push_back(i);
+      }
+  }
+  RT_INFO("bot nav: %zu route points from %s", g.p.size(), path.c_str());
+  g_nav = std::move(g);
+}
+static int NearestNav(float x, float z, float* dist) {
+  int best = -1;
+  float bd = 1e9f;
+  for (int i = 0; i < int(g_nav.p.size()); ++i) {
+    float d = std::hypot(g_nav.p[i][0] - x, g_nav.p[i][2] - z);
+    if (d < bd) bd = d, best = i;
+  }
+  *dist = bd;
+  return best;
+}
+static std::vector<int> RouteNav(int from, int to) {
+  std::vector<float> cost(g_nav.p.size(), 1e30f);
+  std::vector<int> came(g_nav.p.size(), -1);
+  using Item = std::pair<float, int>;
+  std::priority_queue<Item, std::vector<Item>, std::greater<Item>> open;
+  auto h = [&](int i) { return std::hypot(g_nav.p[i][0] - g_nav.p[to][0], g_nav.p[i][2] - g_nav.p[to][2]); };
+  cost[from] = 0;
+  open.push({h(from), from});
+  while (!open.empty()) {
+    int i = open.top().second;
+    open.pop();
+    if (i == to) break;
+    for (int j : g_nav.next[i]) {
+      float c = cost[i] + std::hypot(g_nav.p[i][0] - g_nav.p[j][0], g_nav.p[i][2] - g_nav.p[j][2]);
+      if (c < cost[j]) cost[j] = c, came[j] = i, open.push({c + h(j), j});
+    }
+  }
+  std::vector<int> route;
+  if (came[to] < 0 && from != to) return route;
+  for (int i = to; i >= 0; i = came[i]) route.push_back(i);
+  std::reverse(route.begin(), route.end());
+  return route;
+}
+
 // A first brain for the fake soldier: to the nearest gold crate (mission
 // objective, position +C0). Heading from the soldier's world matrix (forward
 // row +320/+328 in x/z); turning right lowers atan2(x, z).
@@ -924,6 +1057,23 @@ static void FakeBrain(uint32_t in) {
     if (d < best) best = d, tx = cx, tz = cz;
   }
   if (best > 1e8f) return;
+  // Along the learnt routes when there are some near both ends: the next route
+  // point instead of the crate (re-planned every 5 s, next point within 1.5 m).
+  static std::vector<int> route;
+  static size_t step = 0;
+  static int64_t planned = 0;
+  int64_t now_ms = int64_t(GetTickCount64());
+  if (now_ms - planned > 5000) {
+    planned = now_ms;
+    LoadNav();
+    route.clear(), step = 0;
+    float d_bot, d_goal;
+    int a = NearestNav(x, z, &d_bot), b = NearestNav(tx, tz, &d_goal);
+    if (a >= 0 && b >= 0 && d_bot < 15.0f && d_goal < 25.0f) route = RouteNav(a, b);
+    if (!route.empty()) RT_INFO("bot nav: route of %zu points (start %.0f m away, end %.0f m from the crate)", route.size(), d_bot, d_goal);
+  }
+  while (step < route.size() && std::hypot(g_nav.p[route[step]][0] - x, g_nav.p[route[step]][2] - z) < 1.5f) ++step;
+  if (step < route.size()) tx = g_nav.p[route[step]][0], tz = g_nav.p[route[step]][2];
   float diff = std::atan2(tx - x, tz - z) - std::atan2(fx, fz);
   while (diff > 3.14159265f) diff -= 6.2831853f;
   while (diff < -3.14159265f) diff += 6.2831853f;
@@ -933,8 +1083,9 @@ static void FakeBrain(uint32_t in) {
   float dx = tx - x, dz = tz - z, len = std::max(std::hypot(dx, dz), 0.001f);
   dx /= len, dz /= len;
   float rx = LdF(so + 0x300), rz = LdF(so + 0x308);
-  float forward = best < 3.0f ? 0.0f : dx * fx + dz * fz;
-  float strafe = best < 3.0f ? 0.0f : -(dx * rx + dz * rz);  // strafe right is minus the +300 row
+  bool arrived = best < 3.0f && step >= route.size();
+  float forward = arrived ? 0.0f : dx * fx + dz * fz;
+  float strafe = arrived ? 0.0f : -(dx * rx + dz * rz);  // strafe right is minus the +300 row
   float m = std::max(std::max(std::fabs(forward), std::fabs(strafe)), 0.001f);  // full speed
   forward /= m, strafe /= m;
   // Stuck (under 0.3 m in 1.5 s while trying to move): jump (A: its held time
@@ -1113,6 +1264,7 @@ PPC_FUNC(sub_823D1DD0) {
   for (uint32_t so : Scan(0x820118D0))
     if (std::find(soldiers_before.begin(), soldiers_before.end(), so) == soldiers_before.end()) g_fake_soldier = so;
   RT_INFO("bot fake: its soldier %08X", g_fake_soldier);
+  g_bot_soldier_for_trails = g_fake_soldier;
   RT_INFO("bot fake: deploy returned r3=%08X, %zu soldiers now", c.r3.u32, Scan(0x820118D0).size());
 }
 extern "C" PPC_FUNC(__imp__sub_82705810);
