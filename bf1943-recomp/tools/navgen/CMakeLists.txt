@@ -1,0 +1,12 @@
+# navgen: the bots' navigation meshes from a map's collision (see navgen.cpp).
+cmake_minimum_required(VERSION 3.25)
+project(navgen LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(RCN ${CMAKE_CURRENT_SOURCE_DIR}/../../thirdparty/recastnavigation)
+file(GLOB RECAST_SOURCES ${RCN}/Recast/Source/*.cpp)
+file(GLOB DETOUR_SOURCES ${RCN}/Detour/Source/*.cpp)
+add_executable(navgen navgen.cpp ${RECAST_SOURCES} ${DETOUR_SOURCES})
+target_include_directories(navgen PRIVATE ${RCN}/Recast/Include ${RCN}/Detour/Include)
+if(MSVC)
+  target_compile_definitions(navgen PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
