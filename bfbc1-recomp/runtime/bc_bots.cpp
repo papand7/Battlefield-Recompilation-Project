@@ -1049,6 +1049,9 @@ using namespace rt;
 //   bytes). Holding X 0.8 m from the first crate for 30 s changes nothing in
 //   the crate's object; interacting probably needs facing it
 //   (PlayerInteractAimAngle), which needs turning.
+//   A joiner's record also carries its aim: +90 yaw and +94 pitch (radians;
+//   pitch rises looking up). Writing +90 for the fake soldier (BF_BOT_YAW_TEST:
+//   0, 1.57, 3.14) doesn't turn it either.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -1556,6 +1559,22 @@ static void FakeBrain(uint32_t in) {
   set(0x8, forward);
   set(0xC, strafe);
   set(0x1C, turn);
+  // BF_BOT_YAW_TEST=1: the absolute aim (+90 yaw, +94 pitch, radians, as a
+  // joiner's showed) set to 0, 1.57 and 3.14 in turn, 5 s each, with the
+  // soldier's heading logged: how yaw maps to facing.
+  static const bool yaw_test = getenv("BF_BOT_YAW_TEST") != nullptr;
+  if (yaw_test) {
+    static int64_t t0 = now;
+    float test = float(((now - t0) / 5000) % 3) * 1.5708f;
+    set(0x90, test);
+    set(0x94, 0.0f);
+    set(0x8, 0.0f), set(0xC, 0.0f);
+    static int64_t last_log = 0;
+    if (now - last_log > 2500) {
+      last_log = now;
+      RT_INFO("bot yaw test: +90 = %.2f, heading atan2(fx, fz) = %.2f (fx %.2f fz %.2f)", test, std::atan2(fx, fz), fx, fz);
+    }
+  }
   // The server takes a remote soldier's heading from a stored yaw (minus the
   // heading: *(*(soldier + C)) + 198, BF_BOT_FIND_YAW), not from the turn input:
   // turned there directly.
