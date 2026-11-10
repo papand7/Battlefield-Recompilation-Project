@@ -703,8 +703,11 @@ using namespace rt;
 //   soldier at +4, analog actions as floats: +8 turn, +C look up/down, +14
 //   forward (0.96 for a full stick). The fake soldier has one too, but values
 //   written there before each server update (823D1DD0) are back at 0 by the
-//   next one and the soldier doesn't move: they have to go in where the
-//   server reads them.
+//   next one: the soldier update (822B92C8 <- 822C2C38 <- 822ACCD8 <- 82275A38,
+//   seen with BF_BOT_WATCH_INPUT) copies them in every time with 821BF2A8 from
+//   the player's received input (r4, vtable 8200DC48; +8 forward). Writing
+//   forward there before that copy moves the fake soldier: it walked from its
+//   spawn (-461, -221) to (-483, -188) on Valley Run.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -832,6 +835,9 @@ static void DriveFake() {
       RT_INFO("bot fake: input state of soldier %08X: %08X", g_fake_soldier, g_fake_input);
     }
     if (!g_fake_input) return;
+    // BF_BOT_WATCH_INPUT=1: log the call stack of every write to its analog
+    // fields (the runtime's --watch-write): what clears them each update.
+    if (getenv("BF_BOT_WATCH_INPUT")) StartWriteWatch(g_fake_input + 8, 0x10, 0);
   }
   auto set = [](uint32_t a, float f) {
     uint32_t u;
@@ -847,6 +853,58 @@ static void DriveFake() {
     RT_INFO("bot fake: before writing: forward %.2f turn %.2f; soldier at %.1f %.1f", fwd, turn,
             LdF(g_fake_soldier + 0x200), LdF(g_fake_soldier + 0x208));
   }
+  (void)set;
+}
+
+// The soldier update (822B92C8 <- 822C2C38 <- 822ACCD8 <- 82275A38, BF_BOT_WATCH_INPUT)
+// fills a soldier's input state from its player's received input through
+// 821BF2A8, which writes all its analog fields: for the fake soldier, the
+// bot's values go in right after that, before the soldier uses them.
+extern "C" PPC_FUNC(__imp__sub_821BF2A8);
+PPC_FUNC(sub_821BF2A8) {
+  uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
+  // The source is the player's received input (vtable 8200DC48; a walking
+  // joiner's has 0.96 at +8): for the fake soldier, fill it before the copy.
+  if (g_fake_input && r3 == g_fake_input && IsCommitted(r4) && Ld32(r4) == 0x8200DC48) {
+    float f = 1.0f;
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    St32(r4 + 8, u);
+  }
+  __imp__sub_821BF2A8(ctx, base);
+  // The source (r4) of every copy, when a word in it looks like a full stick
+  // (the host walking), and for the fake soldier's: its layout.
+  {
+    static int src_logged = 0;
+    bool stick = false;
+    for (uint32_t k = 0; k < 24; ++k) {
+      float f;
+      uint32_t u = IsCommitted(r4 + k * 4) ? Ld32(r4 + k * 4) : 0;
+      memcpy(&f, &u, 4);
+      stick |= f > 0.9f && f < 1.01f;
+    }
+    if ((stick || r3 == g_fake_input) && src_logged < 12) {
+      ++src_logged;
+      std::string w;
+      for (uint32_t k = 0; k < 24; ++k) {
+        char buf[12];
+        snprintf(buf, sizeof(buf), " %08X", IsCommitted(r4 + k * 4) ? Ld32(r4 + k * 4) : 0);
+        w += buf;
+      }
+      RT_INFO("bot fake: copy source %08X -> %08X%s:%s", r4, r3, r3 == g_fake_input ? " (fake)" : "", w.c_str());
+    }
+  }
+  static int logged = 0;
+  if (g_fake_input && logged < 3 && (r3 == g_fake_input || r4 == g_fake_input || r5 == g_fake_input)) {
+    ++logged;
+    RT_INFO("bot fake: input copy 821BF2A8 r3=%08X r4=%08X r5=%08X (input %08X)", r3, r4, r5, g_fake_input);
+  }
+  if (!g_fake_input || (r3 != g_fake_input && r4 != g_fake_input && r5 != g_fake_input)) return;
+  auto set = [](uint32_t a, float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    St32(a, u);
+  };
   set(g_fake_input + 0x14, 1.0f);  // forward
   set(g_fake_input + 0x8, 0.3f);   // turn right
 }
@@ -1181,6 +1239,44 @@ static const bool g_conn_count_started = [] {
       for (int i = 0; i < 64; ++i)
         if (uint32_t n = g_conn_calls[i].exchange(0)) out += std::string(" ") + g_conn_names[i] + "=" + std::to_string(n);
       RT_INFO("bot conn calls (5 s):%s", out.c_str());
+    }
+  }).detach();
+  return true;
+}();
+
+// BF_BOT_INPUT_FNS=1 (testing): the input state's virtual functions (vtable
+// 82010C98): calls on an input state counted every 5 s, and the first call of
+// each with its arguments and call stack: who clears and who reads the input.
+static const bool g_input_fns = getenv("BF_BOT_INPUT_FNS") != nullptr;
+static std::atomic<uint32_t> g_input_calls[32];
+static const char* g_input_names[32];
+#define INPUT_FN(i, addr)                                                          extern "C" PPC_FUNC(__imp__sub_##addr);                                         PPC_FUNC(sub_##addr) {                                                            if (g_input_fns && ctx.r3.u32 >= 0x40000000 && ctx.r3.u32 < 0xC0000000 &&           IsCommitted(ctx.r3.u32) && Ld32(ctx.r3.u32) == 0x82010C98) {                  g_input_names[i] = #addr;                                                       if (g_input_calls[i]++ == 0) {                                                    RT_INFO("bot input fn %s on %08X r4=%08X r5=%08X r6=%08X", #addr,                       ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);                        bf_crash_diag::PrintStack(nullptr);                                           }                                                                             }                                                                               __imp__sub_##addr(ctx, base);                                                 }
+INPUT_FN(0, 822AB128)
+INPUT_FN(1, 822AB140)
+INPUT_FN(2, 822AB150)
+INPUT_FN(3, 822AB198)
+INPUT_FN(4, 822AB1B0)
+INPUT_FN(5, 822AB1B8)
+INPUT_FN(6, 822AB1C8)
+INPUT_FN(7, 822AB1E0)
+INPUT_FN(8, 822B2618)
+INPUT_FN(9, 822B2678)
+INPUT_FN(10, 822B82B8)
+INPUT_FN(11, 825165C8)
+INPUT_FN(12, 825165F0)
+INPUT_FN(13, 825E8378)
+INPUT_FN(14, 825E9178)
+INPUT_FN(15, 825E91A0)
+INPUT_FN(16, 82679EA0)
+static const bool g_input_fns_started = [] {
+  if (!g_input_fns) return false;
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      std::string out;
+      for (int i = 0; i < 32; ++i)
+        if (uint32_t n = g_input_calls[i].exchange(0)) out += std::string(" ") + g_input_names[i] + "=" + std::to_string(n);
+      RT_INFO("bot input fn calls (5 s):%s", out.c_str());
     }
   }).detach();
   return true;
