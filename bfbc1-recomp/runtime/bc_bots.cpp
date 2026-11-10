@@ -1616,3 +1616,24 @@ static const bool g_input_fns_started = [] {
   return true;
 }();
 
+// BF_BOT_RAY_STACK=1 (testing): Havok's ray casters' virtual functions
+// (hkWorldRayCaster 820BD6A8, hkSimpleWorldRayCaster 820BD73C, found through
+// their RTTI): the first call of each prints its call stack, which shows the
+// world's cast function and the game code that casts rays.
+static const bool g_ray_stack = getenv("BF_BOT_RAY_STACK") != nullptr;
+#define RAY_FN(addr)                                                  extern "C" PPC_FUNC(__imp__sub_##addr);                            PPC_FUNC(sub_##addr) {                                               static std::atomic<int> n{0};                                      if (g_ray_stack && n++ < 2) {                                        RT_INFO("bot ray: %s r3=%08X r4=%08X r5=%08X r6=%08X", #addr,               ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);           bf_crash_diag::PrintStack(nullptr);                              }                                                                  __imp__sub_##addr(ctx, base);                                    }
+RAY_FN(82B09FE8)
+RAY_FN(82A00B88)
+RAY_FN(82B0A510)
+RAY_FN(82A020B0)
+RAY_FN(82A02168)
+RAY_FN(82A068B0)
+RAY_FN(82A068B8)
+
+// The game's ray casts: 824BA540 -> 824BA3B8 -> 829E8CD0 (builds an
+// hkWorldRayCaster) and 824BA4F8 -> 824BA238 -> 829E98C8 (hkSimpleWorldRayCaster).
+#define RAY_TRACE(addr)                                                             extern "C" PPC_FUNC(__imp__sub_##addr);                                          PPC_FUNC(sub_##addr) {                                                             static std::atomic<int> n{0};                                                    if (g_ray_stack && n++ < 3) {                                                      TraceAi("ray " #addr, ctx);                                                      if (n == 1) bf_crash_diag::PrintStack(nullptr);                                }                                                                                __imp__sub_##addr(ctx, base);                                                  }
+RAY_TRACE(824BA540)
+RAY_TRACE(824BA3B8)
+RAY_TRACE(824BA4F8)
+RAY_TRACE(824BA238)
