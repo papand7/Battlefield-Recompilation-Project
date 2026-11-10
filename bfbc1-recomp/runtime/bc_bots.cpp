@@ -651,6 +651,246 @@ const bool g_navmesh_check_started = [] {
   return true;
 }();
 
+// BF_BOT_DUMP_COLLISION=<file.obj> (the navigation tool, private: it is made
+// from the player's own copy and stays on that PC): once the level is up,
+// every Havok rigid body in memory (vtable 820BDE74, found through its RTTI)
+// and its shapes, as triangles in map coordinates. A body's transform at +B0
+// (rotation columns +B0/+C0/+D0, translation +E0), its shape at +10. The game
+// fills in what the level files leave out (placements, mesh pointers), so the
+// live world has the whole collision. Shapes (Havok 4.6, no RTTI) told apart
+// by their fields: a MOPP tree (+14 its child, +18 its code), an extended mesh
+// (+50 triangle subparts: 64 bytes, +10 triangles, +14 vertices, +18 vertex
+// stride, +1C vertex count, +24 indices, +34 index stride, +38 1 for 16-bit;
+// +58 shape subparts: 64 bytes, +10 child pointer array, +20 translation, +30
+// rotation), a convex hull (+40 FourVectors vertices, +4C their count, +50
+// plane equations, +54 their count).
+static bool Ptr(uint32_t a) { return a >= 0x40000000 && a < 0xC0000000 && !(a & 3) && IsCommitted(a); }
+struct Mat { float c[3][3]; float t[3]; };
+static void Apply(const Mat& m, const float v[3], float out[3]) {
+  for (int i = 0; i < 3; ++i) out[i] = m.c[0][i] * v[0] + m.c[1][i] * v[1] + m.c[2][i] * v[2] + m.t[i];
+}
+static Mat FromQuat(const float q[4], const float t[3]) {
+  float x = q[0], y = q[1], z = q[2], w = q[3];
+  Mat m;
+  m.c[0][0] = 1 - 2 * (y * y + z * z), m.c[0][1] = 2 * (x * y + z * w), m.c[0][2] = 2 * (x * z - y * w);
+  m.c[1][0] = 2 * (x * y - z * w), m.c[1][1] = 1 - 2 * (x * x + z * z), m.c[1][2] = 2 * (y * z + x * w);
+  m.c[2][0] = 2 * (x * z + y * w), m.c[2][1] = 2 * (y * z - x * w), m.c[2][2] = 1 - 2 * (x * x + y * y);
+  for (int i = 0; i < 3; ++i) m.t[i] = t[i];
+  return m;
+}
+static Mat Mul(const Mat& a, const Mat& b) {  // a after b
+  Mat m;
+  for (int j = 0; j < 3; ++j) Apply(Mat{{{a.c[0][0], a.c[0][1], a.c[0][2]}, {a.c[1][0], a.c[1][1], a.c[1][2]},
+                                         {a.c[2][0], a.c[2][1], a.c[2][2]}}, {0, 0, 0}}, b.c[j], m.c[j]);
+  Apply(a, b.t, m.t);
+  return m;
+}
+struct CollisionOut {
+  FILE* f;
+  size_t verts = 0, tris = 0;
+  void Tri(const Mat& m, const float a[3], const float b[3], const float c[3]) {
+    float w[3][3];
+    Apply(m, a, w[0]), Apply(m, b, w[1]), Apply(m, c, w[2]);
+    for (auto& v : w) fprintf(f, "v %.3f %.3f %.3f\n", v[0], v[1], v[2]);
+    fprintf(f, "f %zu %zu %zu\n", verts + 1, verts + 2, verts + 3);
+    verts += 3, ++tris;
+  }
+};
+static void ConvexOut(CollisionOut& out, const Mat& m, uint32_t s) {
+  uint32_t vp = Ld32(s + 0x40), n = Ld32(s + 0x4C), pp = Ld32(s + 0x50), np = Ld32(s + 0x54);
+  if (!Ptr(vp) || !Ptr(pp) || n < 3 || n > 4096 || np > 4096) return;
+  std::vector<std::array<float, 3>> v(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t blk = vp + 48 * (i / 4), j = i % 4;
+    v[i] = {LdF(blk + 4 * j), LdF(blk + 16 + 4 * j), LdF(blk + 32 + 4 * j)};
+  }
+  float size = 0.01f;
+  for (auto& q : v)
+    for (float c : q) size = std::max(size, std::fabs(c));
+  for (uint32_t k = 0; k < np; ++k) {
+    float nx = LdF(pp + 16 * k), ny = LdF(pp + 16 * k + 4), nz = LdF(pp + 16 * k + 8), d = LdF(pp + 16 * k + 12);
+    std::vector<std::array<float, 3>> on;
+    for (auto& q : v)
+      if (std::fabs(nx * q[0] + ny * q[1] + nz * q[2] + d) < 0.01f * size + 1e-3f) on.push_back(q);
+    if (on.size() < 3) continue;
+    float cx = 0, cy = 0, cz = 0;
+    for (auto& q : on) cx += q[0], cy += q[1], cz += q[2];
+    cx /= on.size(), cy /= on.size(), cz /= on.size();
+    float ax[3] = {1, 0, 0};
+    if (std::fabs(nx) > 0.9f) ax[0] = 0, ax[1] = 1;
+    float ux[3] = {ny * ax[2] - nz * ax[1], nz * ax[0] - nx * ax[2], nx * ax[1] - ny * ax[0]};
+    float ul = std::max(std::sqrt(ux[0] * ux[0] + ux[1] * ux[1] + ux[2] * ux[2]), 1e-6f);
+    for (float& c : ux) c /= ul;
+    float vx[3] = {ny * ux[2] - nz * ux[1], nz * ux[0] - nx * ux[2], nx * ux[1] - ny * ux[0]};
+    std::sort(on.begin(), on.end(), [&](const auto& p, const auto& q) {
+      auto ang = [&](const auto& r) {
+        float d0 = r[0] - cx, d1 = r[1] - cy, d2 = r[2] - cz;
+        return std::atan2(d0 * vx[0] + d1 * vx[1] + d2 * vx[2], d0 * ux[0] + d1 * ux[1] + d2 * ux[2]);
+      };
+      return ang(p) < ang(q);
+    });
+    for (size_t i = 1; i + 1 < on.size(); ++i) out.Tri(m, on[0].data(), on[i].data(), on[i + 1].data());
+  }
+}
+// A box (half extents at +20) as 12 triangles.
+static void BoxOut(CollisionOut& out, const Mat& m, uint32_t s) {
+  float h[3] = {LdF(s + 0x20), LdF(s + 0x24), LdF(s + 0x28)};
+  if (!(h[0] > 0 && h[1] > 0 && h[2] > 0 && h[0] < 1e4f && h[1] < 1e4f && h[2] < 1e4f)) return;
+  float c[8][3];
+  for (int i = 0; i < 8; ++i)
+    c[i][0] = (i & 1) ? h[0] : -h[0], c[i][1] = (i & 2) ? h[1] : -h[1], c[i][2] = (i & 4) ? h[2] : -h[2];
+  static const int faces[6][4] = {{0, 1, 3, 2}, {4, 6, 7, 5}, {0, 4, 5, 1}, {2, 3, 7, 6}, {0, 2, 6, 4}, {1, 5, 7, 3}};
+  for (auto& f : faces) out.Tri(m, c[f[0]], c[f[1]], c[f[2]]), out.Tri(m, c[f[0]], c[f[2]], c[f[3]]);
+}
+// Havok 4.6 shape types (hkShape +C): 3 sphere, 6 box, 7 capsule, 8 convex
+// vertices, 10 list, 11 MOPP tree, 15 extended mesh, 0x18 the terrain's
+// sampled heightfield (the terrain comes from its own file).
+static void ShapeOut(CollisionOut& out, const Mat& m, uint32_t s, int depth) {
+  if (!Ptr(s) || depth > 4) return;
+  uint32_t type = Ld32(s + 0xC);
+  if (type == 8) {
+    ConvexOut(out, m, s);
+    return;
+  }
+  if (type == 6) {
+    BoxOut(out, m, s);
+    return;
+  }
+  if (type == 11) {  // MOPP tree: its child
+    ShapeOut(out, m, Ld32(s + 0x14), depth + 1);
+    return;
+  }
+  if (type == 10) {  // list: +18 child entries (16 bytes, the shape first), +1C their count
+    uint32_t arr = Ld32(s + 0x18), n = Ld32(s + 0x1C);
+    for (uint32_t i = 0; Ptr(arr) && i < n && i < 4096; ++i) ShapeOut(out, m, Ld32(arr + 16 * i), depth + 1);
+    return;
+  }
+  uint32_t tri = Ld32(s + 0x50), ntri = Ld32(s + 0x54), sub = Ld32(s + 0x58), nsub = Ld32(s + 0x5C);
+  if (type == 15) {
+    for (uint32_t e = 0; Ptr(tri) && e < ntri && e < 100000; ++e) {
+      uint32_t t = tri + 64 * e;
+      uint32_t n = Ld32(t + 0x10), vb = Ld32(t + 0x14), vs = Ld32(t + 0x18), ib = Ld32(t + 0x24), is = Ld32(t + 0x34);
+      bool i16 = (Ld32(t + 0x38) >> 24) == 1;
+      if (!Ptr(vb) || !Ptr(ib) || n > 1000000 || vs < 12 || is < 6) continue;
+      for (uint32_t k = 0; k < n; ++k) {
+        uint32_t idx[3];
+        for (int j = 0; j < 3; ++j)
+          idx[j] = i16 ? (Ld32(ib + is * k + 2 * j) >> ((j & 1) ? 0 : 16) & 0xFFFF) : Ld32(ib + is * k + 4 * j);
+        if (i16) {  // two 16-bit indices per word, big-endian
+          uint32_t w0 = Ld32(ib + is * k), w1 = Ld32(ib + is * k + 4);
+          idx[0] = w0 >> 16, idx[1] = w0 & 0xFFFF, idx[2] = w1 >> 16;
+        }
+        float v[3][3];
+        for (int j = 0; j < 3; ++j)
+          for (int c = 0; c < 3; ++c) v[j][c] = LdF(vb + vs * idx[j] + 4 * c);
+        out.Tri(m, v[0], v[1], v[2]);
+      }
+    }
+    for (uint32_t e = 0; Ptr(sub) && e < nsub && e < 100000; ++e) {
+      uint32_t t = sub + 64 * e;
+      uint32_t arr = Ld32(t + 0x10);
+      if (!Ptr(arr)) continue;
+      float q[4] = {LdF(t + 0x30), LdF(t + 0x34), LdF(t + 0x38), LdF(t + 0x3C)};
+      float tr[3] = {LdF(t + 0x20), LdF(t + 0x24), LdF(t + 0x28)};
+      ShapeOut(out, Mul(m, FromQuat(q, tr)), Ld32(arr), depth + 1);
+    }
+  }
+}
+static void DumpCollision(const char* path) {
+  FILE* f = fopen(path, "w");
+  if (!f) return;
+  CollisionOut out{f};
+  size_t bodies = 0;
+  std::map<uint32_t, std::array<uint32_t, 4>> kinds;
+  size_t templates = 0;
+  for (uint32_t b : Scan(0x820BDE74)) {
+    Mat m;
+    for (int j = 0; j < 3; ++j)
+      for (int i = 0; i < 3; ++i) m.c[j][i] = LdF(b + 0xB0 + 16 * j + 4 * i);
+    for (int i = 0; i < 3; ++i) m.t[i] = LdF(b + 0xE0 + 4 * i);
+    size_t before = out.tris;
+    uint32_t shape = Ld32(b + 0x10);
+    // Only bodies in the physics world (hkWorldObject +8, the hkWorld: vtable
+    // 820BD8A0); the others are templates loaded with the level's assets.
+    uint32_t world = Ld32(b + 8);
+    bool in_world = Ptr(world) && Ld32(world) == 0x820BD8A0;
+    if (in_world) ShapeOut(out, m, shape, 0);
+    else ++templates;
+    ++bodies;
+    // What the shapes are: per shape vtable, bodies, triangles, and the child's vtable.
+    uint32_t vt = Ptr(shape) ? Ld32(shape) : 0, child = Ptr(shape) ? Ld32(shape + 0x14) : 0;
+    auto& k = kinds[vt];
+    k[0]++, k[1] += out.tris - before;
+    if (Ptr(child)) k[2] = Ld32(child);
+    if (k[0] == 1) k[3] = b;
+  }
+  // Where the world transform is: in the first bodies of each kind, rotation
+  // columns (orthonormal, 16 bytes apart) followed by a translation in the map.
+  for (auto& [vt, k] : kinds) {
+    uint32_t b = k[3];
+    std::string hits;
+    for (uint32_t off = 0; off < 0x400; off += 4) {
+      float c[3][3];
+      for (int j = 0; j < 3; ++j)
+        for (int i = 0; i < 3; ++i) c[j][i] = LdF(b + off + 16 * j + 4 * i);
+      bool ok = true;
+      for (int j = 0; j < 3 && ok; ++j) {
+        float l = c[j][0] * c[j][0] + c[j][1] * c[j][1] + c[j][2] * c[j][2];
+        ok = std::isfinite(l) && std::fabs(l - 1) < 1e-3f;
+      }
+      for (int i = 0; i < 3 && ok; ++i)
+        for (int j = i + 1; j < 3 && ok; ++j)
+          ok = std::fabs(c[i][0] * c[j][0] + c[i][1] * c[j][1] + c[i][2] * c[j][2]) < 1e-3f;
+      if (!ok) continue;
+      float t[3] = {LdF(b + off + 48), LdF(b + off + 52), LdF(b + off + 56)};
+      char buf[80];
+      snprintf(buf, sizeof(buf), " +%X(%.1f %.1f %.1f)", off, t[0], t[1], t[2]);
+      hits += buf;
+    }
+    RT_INFO("bot nav: kind %08X body %08X transforms:%s", vt, b, hits.substr(0, 400).c_str());
+  }
+  // A shape of each kind (and its child): its first 0x70 bytes.
+  for (auto& [vt, k] : kinds) {
+    uint32_t shape = Ld32(k[3] + 0x10);
+    for (uint32_t obj : {shape, Ptr(shape) ? Ld32(shape + 0x14) : 0u}) {
+      if (!Ptr(obj)) continue;
+      std::string w;
+      for (uint32_t off = 0; off < 0x70; off += 4) {
+        uint32_t u = Ld32(obj + off);
+        float fv = LdF(obj + off);
+        char buf[32];
+        if (std::isfinite(fv) && std::fabs(fv) > 1e-4f && std::fabs(fv) < 1e5f) snprintf(buf, sizeof(buf), " +%X:%.2f", off, fv);
+        else snprintf(buf, sizeof(buf), " +%X:%08X", off, u);
+        if (u) w += buf;
+      }
+      RT_INFO("bot nav: kind %08X %s %08X:%s", vt, obj == shape ? "shape" : "child", obj, w.c_str());
+    }
+  }
+  for (auto& [vt, k] : kinds)
+    RT_INFO("bot nav: shape vtable %08X: %u bodies, %u triangles, child vtable %08X, e.g. body %08X at %.0f %.0f %.0f", vt,
+            k[0], k[1], k[2], k[3], LdF(k[3] + 0xE0), LdF(k[3] + 0xE4), LdF(k[3] + 0xE8));
+  fclose(f);
+  RT_INFO("bot nav: collision of %zu rigid bodies (%zu not in the world), %zu triangles, to %s", bodies, templates,
+          out.tris, path);
+}
+const bool g_dump_collision_started = [] {
+  const char* path = getenv("BF_BOT_DUMP_COLLISION");
+  if (!path) return false;
+  std::string p = path;
+  std::thread([p] {
+    // When the level's bodies are up and their number stopped changing.
+    size_t last = 0;
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(10));
+      size_t n = Scan(0x820BDE74).size();
+      if (n > 10 && n == last) break;
+      last = n;
+    }
+    DumpCollision(p.c_str());
+  }).detach();
+  return true;
+}();
+
 const bool g_census_started = [] {
   if (!getenv("BF_BOT_CENSUS") && !getenv("BF_BOT_PLAYER_DUMP") && !getenv("BF_BOT_DUMP_VT")) return false;
   std::thread([] {
