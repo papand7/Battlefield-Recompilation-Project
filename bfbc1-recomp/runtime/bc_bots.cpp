@@ -1772,8 +1772,44 @@ static void FakeBrain(uint32_t in) {
 uint32_t g_bot_aim_obj = 0;
 float g_bot_want_heading = 0;
 bool g_bot_steer = false;
+// BF_BOT_AIM_CHAIN=1 (testing): the aim's update chain (822C6170 -> 822ACB88 ->
+// 822BDE38 -> 824ADEE8): every 5 s, per function, the distinct first
+// arguments it ran with and how often, the bot's soldier and aim object
+// marked: does it run for the bot at all?
+static const bool g_aim_chain = getenv("BF_BOT_AIM_CHAIN") != nullptr;
+static std::mutex g_aim_chain_mutex;
+static std::map<std::string, std::map<uint32_t, int>> g_aim_chain_calls;
+static void AimChainNote(const char* fn, uint32_t r3) {
+  std::lock_guard l(g_aim_chain_mutex);
+  g_aim_chain_calls[fn][r3]++;
+  static int64_t last = 0;
+  int64_t now = int64_t(GetTickCount64());
+  if (now - last < 5000) return;
+  last = now;
+  for (auto& [name, calls] : g_aim_chain_calls) {
+    std::string out;
+    for (auto& [obj, n] : calls) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), " %08X(vt %08X)x%d%s", obj, IsCommitted(obj) ? Ld32(obj) : 0, n,
+               obj == g_bot_aim_obj ? "=BOT AIM" : obj == g_bot_soldier_for_trails ? "=BOT SOLDIER" : "");
+      out += buf;
+    }
+    RT_INFO("bot aim chain %s:%s", name.c_str(), out.substr(0, 700).c_str());
+  }
+  g_aim_chain_calls.clear();
+}
+#define AIM_CHAIN(addr)                                    \
+  extern "C" PPC_FUNC(__imp__sub_##addr);                  \
+  PPC_FUNC(sub_##addr) {                                   \
+    if (g_aim_chain) AimChainNote(#addr, ctx.r3.u32);      \
+    __imp__sub_##addr(ctx, base);                          \
+  }
+AIM_CHAIN(822C6170)
+AIM_CHAIN(822ACB88)
+AIM_CHAIN(822BDE38)
 extern "C" PPC_FUNC(__imp__sub_824ADEE8);
 PPC_FUNC(sub_824ADEE8) {
+  if (g_aim_chain) AimChainNote("824ADEE8", ctx.r3.u32);
   static const bool trace = getenv("BF_BOT_AIM_TRACE") != nullptr;
   static int n = 0;
   uint32_t r3 = ctx.r3.u32;
@@ -1791,6 +1827,16 @@ PPC_FUNC(sub_824ADEE8) {
   float before = IsCommitted(r3 + 0x134) ? LdF(r3 + 0x134) : 0;
   PPCContext in = ctx;
   __imp__sub_824ADEE8(ctx, base);
+  if (g_bot_steer && r3 == g_bot_aim_obj) {
+    static int64_t last = 0;
+    int64_t now = int64_t(GetTickCount64());
+    if (now - last > 3000) {
+      last = now;
+      uint32_t so = g_bot_soldier_for_trails;
+      RT_INFO("bot aim check: wanted heading %.2f, stored +134 %.2f (minus it %.2f), soldier heading %.2f", g_bot_want_heading,
+              LdF(r3 + 0x134), -LdF(r3 + 0x134), so ? std::atan2(LdF(so + 0x320), LdF(so + 0x328)) : 0.0f);
+    }
+  }
   if (trace && n++ < 6) {
     RT_INFO("bot aim set: r3=%08X(vt %08X) r4=%08X r5=%08X r6=%08X f1=%.3f f2=%.3f f3=%.3f; +134 %.3f -> %.3f", r3,
             IsCommitted(r3) ? Ld32(r3) : 0, in.r4.u32, in.r5.u32, in.r6.u32, in.f1.f64, in.f2.f64, in.f3.f64, before,
