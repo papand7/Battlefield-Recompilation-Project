@@ -788,9 +788,14 @@ static Mat Mul(const Mat& a, const Mat& b) {  // a after b
 struct CollisionOut {
   FILE* f;
   size_t verts = 0, tris = 0;
+  float clip_r = 0, clip_x = 0, clip_z = 0;
+  std::map<uint64_t, std::pair<int, uint32_t>> unhandled;  // shapes left out: (type, vtable) -> count, one of them  // clip_r > 0: only triangles touching that circle
   void Tri(const Mat& m, const float a[3], const float b[3], const float c[3]) {
     float w[3][3];
     Apply(m, a, w[0]), Apply(m, b, w[1]), Apply(m, c, w[2]);
+    if (clip_r > 0 && std::hypot(w[0][0] - clip_x, w[0][2] - clip_z) > clip_r &&
+        std::hypot(w[1][0] - clip_x, w[1][2] - clip_z) > clip_r && std::hypot(w[2][0] - clip_x, w[2][2] - clip_z) > clip_r)
+      return;
     for (auto& v : w) fprintf(f, "v %.3f %.3f %.3f\n", v[0], v[1], v[2]);
     fprintf(f, "f %zu %zu %zu\n", verts + 1, verts + 2, verts + 3);
     verts += 3, ++tris;
@@ -865,13 +870,29 @@ static void ShapeOut(CollisionOut& out, const Mat& m, uint32_t s, int depth) {
     for (uint32_t i = 0; Ptr(arr) && i < n && i < 4096; ++i) ShapeOut(out, m, Ld32(arr + 16 * i), depth + 1);
     return;
   }
+  if (type != 15) {  // not turned into triangles: noted (type, vtable -> count, an example)
+    float o[3] = {0, 0, 0}, w[3];
+    if (type == 7) o[0] = LdF(s + 0x20), o[1] = LdF(s + 0x24), o[2] = LdF(s + 0x28);  // a capsule: its first end
+    Apply(m, o, w);
+    if (out.clip_r > 0 && std::hypot(w[0] - out.clip_x, w[2] - out.clip_z) > out.clip_r) return;
+    auto& u = out.unhandled[(uint64_t(type) << 32) | Ld32(s)];
+    if (!u.first++) u.second = s;
+    return;
+  }
   uint32_t tri = Ld32(s + 0x50), ntri = Ld32(s + 0x54), sub = Ld32(s + 0x58), nsub = Ld32(s + 0x5C);
   if (type == 15) {
     for (uint32_t e = 0; Ptr(tri) && e < ntri && e < 100000; ++e) {
       uint32_t t = tri + 64 * e;
-      uint32_t n = Ld32(t + 0x10), vb = Ld32(t + 0x14), vs = Ld32(t + 0x18), ib = Ld32(t + 0x24), is = Ld32(t + 0x34);
+      // A triangles subpart (Havok 4.6): +10 triangles, +14 vertices, +18 their
+      // stride, +1C their count, +20 the extrusion (a vector), +30 indices, +34
+      // their stride, +38 the index type (1: 16-bit).
+      uint32_t n = Ld32(t + 0x10), vb = Ld32(t + 0x14), vs = Ld32(t + 0x18), ib = Ld32(t + 0x30), is = Ld32(t + 0x34);
       bool i16 = (Ld32(t + 0x38) >> 24) == 1;
-      if (!Ptr(vb) || !Ptr(ib) || n > 1000000 || vs < 12 || is < 6) continue;
+      if (!Ptr(vb) || !Ptr(ib) || n > 1000000 || vs < 12 || is < 6) {
+        auto& u = out.unhandled[(uint64_t(0x100 | (Ld32(t + 0x38) >> 24)) << 32) | is];  // skipped: 0x100 | index type, stride
+        if (!u.first++) u.second = t;
+        continue;
+      }
       for (uint32_t k = 0; k < n; ++k) {
         uint32_t idx[3];
         for (int j = 0; j < 3; ++j)
@@ -973,6 +994,38 @@ static void DumpCollision(const char* path) {
   RT_INFO("bot nav: collision of %zu rigid bodies (%zu not in the world), %zu triangles, to %s", bodies, templates,
           out.tris, path);
 }
+// The physics world's triangles within r of (x, z), one .obj group per rigid
+// body (named by its address, shape vtable and whether in the world).
+static void DumpCollisionNear(const char* path, float x, float z, float r) {
+  FILE* f = fopen(path, "w");
+  if (!f) return;
+  CollisionOut out{f};
+  out.clip_r = r, out.clip_x = x, out.clip_z = z;
+  for (uint32_t b : Scan(0x820BDE74)) {
+    Mat m;
+    for (int j = 0; j < 3; ++j)
+      for (int i = 0; i < 3; ++i) m.c[j][i] = LdF(b + 0xB0 + 16 * j + 4 * i);
+    for (int i = 0; i < 3; ++i) m.t[i] = LdF(b + 0xE0 + 4 * i);
+    uint32_t shape = Ld32(b + 0x10), world = Ld32(b + 8);
+    bool in_world = Ptr(world) && Ld32(world) == 0x820BD8A0;
+    fprintf(f, "g body_%08X_vt%08X%s_w%08X_wvt%08X_type%u\n", b, Ptr(shape) ? Ld32(shape) : 0, in_world ? "" : "_out",
+            world, Ptr(world) ? Ld32(world) : 0, Ptr(shape) ? Ld32(shape + 0xC) : 0);
+    ShapeOut(out, m, shape, 0);
+  }
+  fclose(f);
+  RT_INFO("bot nav: %zu triangles within %.0f m of %.1f %.1f to %s", out.tris, r, x, z, path);
+  for (auto& [k, u] : out.unhandled) {
+    std::string w;
+    for (uint32_t off = 0; off < 0x60 && Ptr(u.second + off); off += 4) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), " %08X", Ld32(u.second + off));
+      w += buf;
+    }
+    RT_INFO("bot nav: shapes left out: type %u vtable %08X: %d, e.g. %08X:%s", uint32_t(k >> 32), uint32_t(k), u.first,
+            u.second, w.c_str());
+  }
+}
+
 const bool g_dump_collision_started = [] {
   const char* path = getenv("BF_BOT_DUMP_COLLISION");
   if (!path) return false;
@@ -1150,6 +1203,11 @@ using namespace rt;
 //   A joiner's record also carries its aim: +90 yaw and +94 pitch (radians;
 //   pitch rises looking up). Writing +90 for the fake soldier (BF_BOT_YAW_TEST:
 //   0, 1.57, 3.14) doesn't turn it either.
+//   What turns it: the soldier moves relative to its aim object (vtable
+//   820264A8, minus the yaw at +134), and that object's setter 824ADEE8 takes
+//   the new aim from a record (r4: +34 minus the yaw, +0/+8 its sine and
+//   cosine). Filling that record for the fake soldier's aim object, with
+//   atan2(dx, dz) + pi, makes forward walk toward the point.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -1541,6 +1599,7 @@ static std::vector<std::array<float, 3>> RouteMesh(const float a[3], const float
 }
 
 extern uint32_t g_bot_aim_obj;
+extern std::atomic<int> g_bot_setter_calls;
 extern float g_bot_want_heading;
 extern bool g_bot_steer;
 // The aim object's +134 holds minus the heading (atan2 of the forward row).
@@ -1570,6 +1629,43 @@ static void FakeBrain(uint32_t in) {
     if (d < best) best = d, tx = cx, tz = cz;
   }
   if (best > 1e8f) return;
+  // BF_BOT_CRATE_PROBE=1 (testing): every 20 s, each mission objective's +C0
+  // triple and the transforms (three orthonormal rows, then a translation in
+  // the map) in its first 0x400 bytes and in the objects it points to.
+  static int64_t crate_probe = 0;
+  if (getenv("BF_BOT_CRATE_PROBE") && int64_t(GetTickCount64()) - crate_probe > 20000) {
+    crate_probe = int64_t(GetTickCount64());
+    auto transforms = [](uint32_t o, uint32_t size) {
+      std::string hits;
+      for (uint32_t off = 0; off + 64 <= size && IsCommitted(o + off + 60); off += 4) {
+        float c[3][3];
+        for (int j = 0; j < 3; ++j)
+          for (int i = 0; i < 3; ++i) c[j][i] = LdF(o + off + 16 * j + 4 * i);
+        bool ok = true;
+        for (int j = 0; j < 3 && ok; ++j) {
+          float l = c[j][0] * c[j][0] + c[j][1] * c[j][1] + c[j][2] * c[j][2];
+          ok = std::isfinite(l) && std::fabs(l - 1) < 1e-3f;
+        }
+        float t[3] = {LdF(o + off + 48), LdF(o + off + 52), LdF(o + off + 56)};
+        if (!ok || !(std::fabs(t[0]) > 1 && std::fabs(t[0]) < 2000 && std::fabs(t[2]) < 2000)) continue;
+        char buf[64];
+        snprintf(buf, sizeof(buf), " +%X(%.1f %.1f %.1f)", off, t[0], t[1], t[2]);
+        hits += buf;
+      }
+      return hits;
+    };
+    for (uint32_t crate : Scan(0x82013AF0)) {
+      std::string out = transforms(crate, 0x400);
+      for (uint32_t off = 0; off < 0x400; off += 4) {
+        uint32_t q = Ld32(crate + off);
+        if (!Ptr(q) || q == crate) continue;
+        std::string h = transforms(q, 0x200);
+        if (!h.empty()) out += " | +" + std::to_string(off) + "->" + TypeName(q) + ":" + h;
+      }
+      RT_INFO("bot crate probe: %08X C0 %.1f %.1f %.1f:%s", crate, LdF(crate + 0xC0), LdF(crate + 0xC4),
+              LdF(crate + 0xC8), out.substr(0, 1200).c_str());
+    }
+  }
   // Along the learnt routes when there are some near both ends: the next route
   // point instead of the crate (re-planned every 5 s, next point within 1.5 m).
   static std::vector<std::array<float, 3>> route;  // the route's points
@@ -1610,19 +1706,22 @@ static void FakeBrain(uint32_t in) {
   while (diff > 3.14159265f) diff -= 6.2831853f;
   while (diff < -3.14159265f) diff += 6.2831853f;
   float turn = std::clamp(-diff * 2.0f, -1.0f, 1.0f);
-  // Turning doesn't work yet: move toward the target with forward and strafe
-  // instead, its direction split along the soldier's forward and right rows.
-  float dx = tx - x, dz = tz - z, len = std::max(std::hypot(dx, dz), 0.001f);
-  dx /= len, dz /= len;
-  float rx = LdF(so + 0x300), rz = LdF(so + 0x308);
   bool arrived = best < 1.0f && step >= route.size();
+  // BF_BOT_TRACE_AT=x,z (testing): every tick within 4 m of there, the
+  // soldier's position, height, aim and target, the first 400 times.
+  static float trace_x = 1e9f, trace_z = 1e9f;
+  static int traced = 0;
+  if (trace_x > 1e8f && getenv("BF_BOT_TRACE_AT")) sscanf(getenv("BF_BOT_TRACE_AT"), "%f,%f", &trace_x, &trace_z);
+  if (traced < 400 && std::hypot(x - trace_x, z - trace_z) < 4.0f) {
+    ++traced;
+    RT_INFO("bot trace: %lld at %.2f %.3f %.2f target %.1f %.1f forward row %.2f %.2f aim %.2f setter calls %d",
+            (long long)GetTickCount64(), x, LdF(so + 0x204), z, tx, tz, fx, fz,
+            g_bot_aim_obj ? -LdF(g_bot_aim_obj + 0x134) : 0.0f, g_bot_setter_calls.exchange(0));
+  }
   // The soldier moves relative to where it looks (its aim object, steered
   // toward the next point below), not to its body: aim there, walk forward.
   float forward = arrived ? 0.0f : 1.0f;
   float strafe = 0.0f;
-  (void)rx, (void)rz;
-  float m = std::max(std::max(std::fabs(forward), std::fabs(strafe)), 0.001f);  // full speed
-  forward /= m, strafe /= m;
   // Stuck (under 0.3 m in 1.5 s while trying to move): jump (A: its held time
   // at +44, low half) and go sideways for 2 s.
   static float sx = 0, sz = 0;
@@ -1634,6 +1733,78 @@ static void FakeBrain(uint32_t in) {
     side = -side;
     unstick_until = now + 2000, jump_until = now + 300, since = now;
     RT_INFO("bot brain: stuck at %.1f %.1f: jump and sidestep %s", x, z, side > 0 ? "right" : "left");
+    // BF_BOT_STUCK_PROBE=1 (testing): the rigid bodies placed within 8 m (shape
+    // vtable and type, its child's, whether in the world): what holds it.
+    if (getenv("BF_BOT_STUCK_PROBE")) {
+      std::string close;
+      for (uint32_t b : Scan(0x820BDE74)) {
+        float bx = LdF(b + 0xE0), by = LdF(b + 0xE4), bz = LdF(b + 0xE8);
+        if (std::hypot(bx - x, bz - z) > 8.0f) continue;
+        uint32_t s = Ld32(b + 0x10), w = Ld32(b + 8), c = Ptr(s) ? Ld32(s + 0x14) : 0;
+        char buf[128];
+        snprintf(buf, sizeof(buf), " [%08X at %.1f %.1f %.1f shape vt %08X type %u child %08X%s]", b, bx, by, bz,
+                 Ptr(s) ? Ld32(s) : 0, Ptr(s) ? Ld32(s + 0xC) : 0, Ptr(c) ? Ld32(c) : 0,
+                 Ptr(w) && Ld32(w) == 0x820BD8A0 ? "" : " not in world");
+        close += buf;
+      }
+      RT_INFO("bot brain: bodies near:%s", close.substr(0, 1500).c_str());
+      std::string soldiers;
+      for (uint32_t o : Scan(0x820118D0)) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), " %08X%s at %.1f %.1f %.1f", o, o == so ? "(bot)" : "", LdF(o + 0x200), LdF(o + 0x204),
+                 LdF(o + 0x208));
+        soldiers += buf;
+      }
+      RT_INFO("bot brain: soldiers:%s", soldiers.c_str());
+      static int stuck_dumps = 0;
+      if (stuck_dumps < 12) DumpCollisionNear(("stuck" + std::to_string(stuck_dumps++) + ".obj").c_str(), x, z, 6.0f);
+      // Everything in the physics world, whatever its class: objects whose +8
+      // is the hkWorld, per vtable (count, shape type at +10, an example).
+      static bool world_census = false;
+      if (!world_census) {
+        world_census = true;
+        uint32_t world = 0;
+        for (uint32_t b : Scan(0x820BDE74))
+          if (Ptr(Ld32(b + 8)) && Ld32(Ld32(b + 8)) == 0x820BD8A0) world = Ld32(b + 8);
+        std::map<uint32_t, std::pair<int, uint32_t>> kinds;
+        uint32_t want = _byteswap_ulong(world);
+        for (uint64_t page = 0x40000000; world && page < 0xC0000000; page += 0x1000) {
+          if (page >= 0x80000000 && page < 0xA0000000) continue;
+          if (!IsCommitted(uint32_t(page))) continue;
+          const uint32_t* p = reinterpret_cast<const uint32_t*>(g_base + page);
+          for (int i = 2; i < 1024; ++i) {
+            if (p[i] != want) continue;
+            uint32_t o = uint32_t(page) + (i - 2) * 4, vt = Ld32(o);
+            if (vt < 0x82000000 || vt >= 0x83000000) continue;
+            auto& k = kinds[vt];
+            if (!k.first++) k.second = o;
+          }
+        }
+        // Shapes left out of the triangles, over all bodies in any world.
+        if (FILE* nul = fopen("NUL", "w")) {
+          CollisionOut all{nul};
+          for (uint32_t b : Scan(0x820BDE74)) {
+            uint32_t w = Ld32(b + 8);
+            if (!Ptr(w) || Ld32(w) != 0x820BD8A0) continue;
+            Mat m;
+            for (int j = 0; j < 3; ++j)
+              for (int i = 0; i < 3; ++i) m.c[j][i] = LdF(b + 0xB0 + 16 * j + 4 * i);
+            for (int i = 0; i < 3; ++i) m.t[i] = LdF(b + 0xE0 + 4 * i);
+            ShapeOut(all, m, Ld32(b + 0x10), 0);
+          }
+          fclose(nul);
+          for (auto& [k, u] : all.unhandled)
+            RT_INFO("bot brain: level shapes left out: type %u vtable %08X: %d, e.g. %08X", uint32_t(k >> 32), uint32_t(k),
+                    u.first, u.second);
+        }
+        for (auto& [vt, k] : kinds) {
+          uint32_t o = k.second, s = Ld32(o + 0x10);
+          RT_INFO("bot brain: world %08X holds vtable %08X (%s) x%d, e.g. %08X: shape %08X type %u, +E0 %.1f %.1f %.1f", world,
+                  vt, TypeName(o).c_str(), k.first, o, s, Ptr(s) ? Ld32(s + 0xC) : 0, LdF(o + 0xE0), LdF(o + 0xE4),
+                  LdF(o + 0xE8));
+        }
+      }
+    }
     // Stuck twice near the same spot while following a navigation mesh route:
     // the corner it was heading for is somewhere it can't get to.
     static float last_sx = 1e9f, last_sz = 1e9f;
@@ -1688,7 +1859,11 @@ static void FakeBrain(uint32_t in) {
   }
   set(0x8, forward);
   set(0xC, strafe);
-  set(0x1C, turn);
+  // The turn stick stays centred: the aim setter below turns it (the stick,
+  // full over whenever the target was far from the fixed body heading, turned
+  // the aim against it).
+  (void)turn;
+  set(0x1C, 0.0f);
   // The soldier's aim (BF_BOT_YAW_HUNT on a turning joiner): an object with
   // vtable 820264A8 holds minus its yaw at +134. The bot's, found from its
   // soldier (two levels of pointers), gets the yaw toward its target.
@@ -1713,6 +1888,21 @@ static void FakeBrain(uint32_t in) {
     // Facing the next point: the yaw whose heading points there. Heading
     // atan2(fx, fz) was minus the aim object's value (-2.57 vs 2.57).
     float want = std::atan2(tx - x, tz - z);
+    // BF_BOT_DIR_TEST=1 (testing): 8 fixed directions, 4 s each, and how far
+    // each one went: does the speed depend on the direction?
+    if (getenv("BF_BOT_DIR_TEST")) {
+      static int64_t t0 = now;
+      static float px = x, pz = z;
+      static int seg = -1;
+      int s = int((now - t0) / 4000) % 8;
+      if (s != seg) {
+        if (seg >= 0)
+          RT_INFO("bot dir test: direction %.2f went %.2f m (dir %.2f)", seg * 0.785398f - 3.14159f,
+                  std::hypot(x - px, z - pz), std::atan2(x - px, z - pz));
+        seg = s, px = x, pz = z;
+      }
+      want = s * 0.785398f - 3.14159f;
+    }
     // Walking forward with the aim at "want" went the opposite way: the aim's
     // convention is half a turn from atan2(dx, dz).
     g_bot_aim_obj = aim_obj, g_bot_want_heading = want + 3.14159265f, g_bot_steer = true;
@@ -1777,6 +1967,7 @@ static void FakeBrain(uint32_t in) {
 uint32_t g_bot_aim_obj = 0;
 float g_bot_want_heading = 0;
 bool g_bot_steer = false;
+std::atomic<int> g_bot_setter_calls{0};  // the setter steering the bot (counted for BF_BOT_TRACE_AT)
 // BF_BOT_AIM_CHAIN=1 (testing): the aim's update chain (822C6170 -> 822ACB88 ->
 // 822BDE38 -> 824ADEE8): every 5 s, per function, the distinct first
 // arguments it ran with and how often, the bot's soldier and aim object
@@ -1828,6 +2019,7 @@ PPC_FUNC(sub_824ADEE8) {
     put(ctx.r4.u32 + 0x34, -h);
     put(ctx.r4.u32 + 0x0, std::sin(h));
     put(ctx.r4.u32 + 0x8, std::cos(h));
+    ++g_bot_setter_calls;
   }
   float before = IsCommitted(r3 + 0x134) ? LdF(r3 + 0x134) : 0;
   PPCContext in = ctx;
