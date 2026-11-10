@@ -39,6 +39,9 @@ target_include_directories(bfbc1_xexload PUBLIC ${XU} ${XT}/simde
 file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS ${ROOT}/runtime/*.cpp)
 list(REMOVE_ITEM RUNTIME_SOURCES ${ROOT}/runtime/game_patches.cpp ${ROOT}/runtime/bots.cpp)
 file(GLOB BC_RUNTIME_SOURCES CONFIGURE_DEPENDS ${BC}/runtime/*.cpp)
+# The bots' navigation meshes (tools/navgen) are read and routed with Detour.
+file(GLOB DETOUR_SOURCES CONFIGURE_DEPENDS ${ROOT}/thirdparty/recastnavigation/Detour/Source/*.cpp)
+list(APPEND BC_RUNTIME_SOURCES ${DETOUR_SOURCES})
 set(STUBS ${CMAKE_CURRENT_BINARY_DIR}/import_stubs.cpp)
 add_custom_command(OUTPUT ${STUBS}
   COMMAND Python3::Interpreter ${ROOT}/tools/gen_import_stubs.py
@@ -46,7 +49,7 @@ add_custom_command(OUTPUT ${STUBS}
   DEPENDS ${RUNTIME_SOURCES} ${ROOT}/tools/gen_import_stubs.py ${BC}/generated/ppc/ppc_recomp_shared.h)
 
 add_executable(bfbc1 ${RUNTIME_SOURCES} ${BC_RUNTIME_SOURCES} ${STUBS})
-target_include_directories(bfbc1 PRIVATE ${ROOT}/runtime)
+target_include_directories(bfbc1 PRIVATE ${ROOT}/runtime ${ROOT}/thirdparty/recastnavigation/Detour/Include)
 target_compile_options(bfbc1 PRIVATE -march=x86-64-v3 -fno-strict-aliasing /Z7)
 target_link_libraries(bfbc1 PRIVATE bfbc1_ppc bfbc1_xexload xenia_gpu xinput dbghelp dxgi d3d11 shcore dwmapi winmm bcrypt ws2_32 synchronization)
 target_link_options(bfbc1 PRIVATE /DEBUG /OPT:REF /OPT:ICF)

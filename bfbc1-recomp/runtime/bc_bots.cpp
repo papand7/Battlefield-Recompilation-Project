@@ -28,6 +28,8 @@
 // there are, and for the soldiers the words that look like a team (1 or 2) and
 // float triplets that look like a world position, to find the fields to read.
 #include "kernel.h"
+#include "DetourNavMesh.h"
+#include "DetourNavMeshQuery.h"
 #include "../../bf1943-recomp/tools/msvc_compat/crash_diag.h"  // PrintStack
 
 #include <algorithm>
@@ -1315,6 +1317,74 @@ static std::vector<int> RouteNav(int from, int to) {
   return route;
 }
 
+// The map's navigation mesh (tools/navgen: nav/<map>.nav, "BFNV", version, size,
+// Detour data), routed with Detour: the nearest polygons to both ends (within
+// 3 m across, 6 m up and down), A* between them, then the straight path's
+// corners. Without one, the learnt trails.
+static dtNavMesh* g_navmesh = nullptr;
+static dtNavMeshQuery* g_navquery = nullptr;
+static bool LoadNavMesh() {
+  static bool tried = false;
+  if (tried) return g_navquery != nullptr;
+  tried = true;
+  std::string path = "nav/" + g_host_map + ".nav";
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return false;
+  char magic[4];
+  int version = 0, size = 0;
+  bool ok = fread(magic, 1, 4, f) == 4 && !memcmp(magic, "BFNV", 4) && fread(&version, 4, 1, f) == 1 &&
+            version == 1 && fread(&size, 4, 1, f) == 1 && size > 0;
+  unsigned char* data = ok ? static_cast<unsigned char*>(dtAlloc(size, DT_ALLOC_PERM)) : nullptr;
+  ok = ok && data && fread(data, 1, size_t(size), f) == size_t(size);
+  fclose(f);
+  if (!ok) {
+    if (data) dtFree(data);
+    RT_WARN("bot nav: %s isn't a navigation mesh", path.c_str());
+    return false;
+  }
+  g_navmesh = dtAllocNavMesh();
+  if (dtStatusFailed(g_navmesh->init(data, size, DT_TILE_FREE_DATA))) {
+    RT_WARN("bot nav: Detour couldn't read %s", path.c_str());
+    return false;
+  }
+  g_navquery = dtAllocNavMeshQuery();
+  g_navquery->init(g_navmesh, 4096);
+  RT_INFO("bot nav: navigation mesh %s (%d bytes)", path.c_str(), size);
+  return true;
+}
+// The corners of a route from a to b on the navigation mesh (empty if none).
+static std::vector<std::array<float, 3>> RouteMesh(const float a[3], const float b[3]) {
+  std::vector<std::array<float, 3>> out;
+  if (!LoadNavMesh()) return out;
+  dtQueryFilter filter;
+  const float ext[3] = {3, 6, 3};
+  dtPolyRef sa = 0, sb = 0;
+  float pa[3], pb[3];
+  dtStatus s1 = g_navquery->findNearestPoly(a, ext, &filter, &sa, pa);
+  // The goal (a crate) can be up on a structure or in a spot too tight to walk:
+  // the nearest walkable place within 8 m across and 60 m up or down.
+  const float goal_ext[3] = {8, 60, 8};
+  dtStatus s2 = g_navquery->findNearestPoly(b, goal_ext, &filter, &sb, pb);
+  static int said = 0;
+  bool log = said++ < 4;
+  if (log)
+    RT_INFO("bot nav: from %.1f %.1f %.1f: poly %llx (%08X); to %.1f %.1f %.1f: poly %llx (%08X) at %.1f %.1f %.1f", a[0], a[1],
+            a[2], (unsigned long long)sa, s1, b[0], b[1], b[2], (unsigned long long)sb, s2, pb[0], pb[1], pb[2]);
+  if (!sa || !sb) return out;
+  dtPolyRef polys[512];
+  int npolys = 0;
+  dtStatus s3 = g_navquery->findPath(sa, sb, pa, pb, &filter, polys, &npolys, 512);
+  if (log) RT_INFO("bot nav: path %d polygons (%08X)", npolys, s3);
+  if (!npolys) return out;
+  float corners[256 * 3];
+  unsigned char flags[256];
+  dtPolyRef refs[256];
+  int n = 0;
+  g_navquery->findStraightPath(pa, pb, polys, npolys, corners, flags, refs, &n, 256);
+  for (int i = 0; i < n; ++i) out.push_back({corners[3 * i], corners[3 * i + 1], corners[3 * i + 2]});
+  return out;
+}
+
 // A first brain for the fake soldier: to the nearest gold crate (mission
 // objective, position +C0). Heading from the soldier's world matrix (forward
 // row +320/+328 in x/z); turning right lowers atan2(x, z).
@@ -1336,21 +1406,30 @@ static void FakeBrain(uint32_t in) {
   if (best > 1e8f) return;
   // Along the learnt routes when there are some near both ends: the next route
   // point instead of the crate (re-planned every 5 s, next point within 1.5 m).
-  static std::vector<int> route;
+  static std::vector<std::array<float, 3>> route;  // the route's points
   static size_t step = 0;
   static int64_t planned = 0;
   int64_t now_ms = int64_t(GetTickCount64());
   if (now_ms - planned > 5000) {
     planned = now_ms;
-    LoadNav();
     route.clear(), step = 0;
-    float d_bot, d_goal;
-    int a = NearestNav(x, z, &d_bot), b = NearestNav(tx, tz, &d_goal);
-    if (a >= 0 && b >= 0 && d_bot < 15.0f && d_goal < 25.0f) route = RouteNav(a, b);
-    if (!route.empty()) RT_INFO("bot nav: route of %zu points (start %.0f m away, end %.0f m from the crate)", route.size(), d_bot, d_goal);
+    float from[3] = {x, LdF(so + 0x204), z}, to[3] = {tx, LdF(so + 0x204), tz};
+    for (uint32_t crate : Scan(0x82013AF0))
+      if (std::fabs(LdF(crate + 0xC0) - tx) < 0.01f && std::fabs(LdF(crate + 0xC8) - tz) < 0.01f) to[1] = LdF(crate + 0xC4);
+    route = RouteMesh(from, to);
+    if (!route.empty()) {
+      RT_INFO("bot nav: navigation mesh route of %zu corners to the crate", route.size());
+    } else {
+      LoadNav();
+      float d_bot, d_goal;
+      int a = NearestNav(x, z, &d_bot), b = NearestNav(tx, tz, &d_goal);
+      if (a >= 0 && b >= 0 && d_bot < 15.0f && d_goal < 25.0f)
+        for (int i : RouteNav(a, b)) route.push_back(g_nav.p[i]);
+      if (!route.empty()) RT_INFO("bot nav: trail route of %zu points", route.size());
+    }
   }
-  while (step < route.size() && std::hypot(g_nav.p[route[step]][0] - x, g_nav.p[route[step]][2] - z) < 1.5f) ++step;
-  if (step < route.size()) tx = g_nav.p[route[step]][0], tz = g_nav.p[route[step]][2];
+  while (step < route.size() && std::hypot(route[step][0] - x, route[step][2] - z) < 1.5f) ++step;
+  if (step < route.size()) tx = route[step][0], tz = route[step][2];
   float diff = std::atan2(tx - x, tz - z) - std::atan2(fx, fz);
   while (diff > 3.14159265f) diff -= 6.2831853f;
   while (diff < -3.14159265f) diff += 6.2831853f;
