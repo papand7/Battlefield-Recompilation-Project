@@ -458,8 +458,13 @@ using namespace rt;
 //   +4 family 2 and port (1501 for the host's own client, 1511 for a joiner),
 //   +8 the IP (127.0.0.1). BF_BOT_FAKE joins a copy of only that record (port
 //   1599): the join returns, then the server crashes on its next update
-//   (826F3A40 <- 8234E390 <- 822D6CC8), so a fake player needs a whole fake
-//   connection object.
+//   (826F3A40 <- 8234E390 <- 822D6CC8). The connection object is 0x60 bytes
+//   (r4 - 4: vtable 82055080; +4 the address object, vtable 82068EB0; +48
+//   flags, +4C a per-connection value, +50 a per-connection pointer; the
+//   host's sit in an array of 0x60-byte slots). Joining a copy of the whole
+//   object crashes the same way: 826F3A40 reads +14 of a per-player part
+//   (vtable 8201B140, inside the 8201B118 object) that a real client's
+//   messages after the join fill in and a fake player never gets.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -578,6 +583,23 @@ PPC_FUNC(sub_82364C78) {
       RT_INFO("bot trace:   join arg %08X:%s", r, out.c_str());
     }
   }
+  // The connection object around the address record: r4 - 0x40 .. r4 + 0x400,
+  // vtable-looking words and named types marked.
+  if (g_trace) {
+    std::string out;
+    for (int32_t off = -0x40; off < 0x400; off += 4) {
+      uint32_t a2 = ctx.r4.u32 + off;
+      if (!IsCommitted(a2)) continue;
+      uint32_t v = Ld32(a2);
+      if (!v) continue;
+      bool vt = v >= 0x82000000 && v < 0x82180000 && Ld32(v) >= 0x82180000 && Ld32(v) < 0x82F00000;
+      std::string tn = TypeName(v);
+      char buf[80];
+      snprintf(buf, sizeof(buf), " %+X:%08X%s%s%s", off, v, vt ? "(vt)" : "", tn.empty() ? "" : ":", tn.c_str());
+      out += buf;
+    }
+    RT_INFO("bot trace:   connection around %08X:%s", ctx.r4.u32, out.substr(0, 3500).c_str());
+  }
   // BF_BOT_FAKE=1 (experiment): before the first join (the host's own client),
   // join a player with a copy of its address record on port 1599, nobody's,
   // on a snapshot of the join's working record (r5 and what follows, restored
@@ -586,8 +608,11 @@ PPC_FUNC(sub_82364C78) {
   static bool done = false;
   if (fake && !done) {
     done = true;
-    static uint32_t copy = g_system_heap->Alloc(0x100, 16);
-    memcpy(G<uint8_t>(copy), G<uint8_t>(ctx.r4.u32), 0x100);
+    // The whole connection object (0x60, from r4 - 4: its vtable 82055080, then
+    // the address object the join gets), with another port.
+    static uint32_t conn = g_system_heap->Alloc(0x60, 16);
+    memcpy(G<uint8_t>(conn), G<uint8_t>(ctx.r4.u32 - 4), 0x60);
+    uint32_t copy = conn + 4;
     St16(copy + 6, 1599);  // the port (sockaddr: family 2, port, address)
     std::vector<uint8_t> snap(0x800);
     memcpy(snap.data(), G<uint8_t>(ctx.r5.u32), snap.size());
