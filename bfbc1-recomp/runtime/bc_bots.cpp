@@ -285,6 +285,91 @@ void DescribeLinks(uint32_t o) {
 
 }
 
+// BF_BOT_CENSUS=1 (testing): every 10 s, the number of live objects per vtable
+// (first words that point at a vtable: in the data section, first entry code),
+// logged where it changed by 1 to 3: what appears when a player joins.
+void Census() {
+  static std::map<uint32_t, int> last;
+  static bool first = true;
+  std::map<uint32_t, int> now;
+  for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+    if (page >= 0x80000000 && page < 0xA0000000) continue;
+    if (!IsCommitted(uint32_t(page))) continue;
+    const uint32_t* q = reinterpret_cast<const uint32_t*>(g_base + page);
+    for (int i = 0; i < 1024; i += 1) {
+      uint32_t w = _byteswap_ulong(q[i]);
+      if (w < 0x82000000 || w >= 0x82180000 || (w & 3)) continue;
+      uint32_t e = Ld32(w);
+      if (e < 0x82180000 || e >= 0x82F00000) continue;
+      now[w]++;
+    }
+  }
+  if (!first) {
+    std::string out;
+    for (auto& [vt, n] : now) {
+      int d = n - (last.count(vt) ? last[vt] : 0);
+      if (d >= 1 && d <= 3) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), " %08X:+%d(%d)", vt, d, n);
+        out += buf;
+      }
+    }
+    for (auto& [vt, n] : last)
+      if (!now.count(vt) || now[vt] < n) {
+        int d = (now.count(vt) ? now[vt] : 0) - n;
+        if (d >= -3) {
+          char buf[48];
+          snprintf(buf, sizeof(buf), " %08X:%d", vt, d);
+          out += buf;
+        }
+      }
+    RT_INFO("bot census:%s", out.substr(0, 3000).c_str());
+  }
+  first = false;
+  last = std::move(now);
+}
+
+// BF_BOT_PLAYER_VTS="vt,vt,..." (testing): for every object with one of these
+// vtables, where in its first 0x800 bytes it holds a player's name (inline or
+// by pointer: "Host", "Joiner") or a soldier: which class is the player.
+void CheckPlayerClasses() {
+  const char* env = getenv("BF_BOT_PLAYER_VTS");
+  if (!env) return;
+  std::string list = env;
+  for (size_t pos = 0; pos < list.size();) {
+    size_t comma = list.find(',', pos);
+    uint32_t vt = uint32_t(strtoul(list.substr(pos, comma - pos).c_str(), nullptr, 16));
+    pos = comma == std::string::npos ? list.size() : comma + 1;
+    for (uint32_t o : Scan(vt)) {
+      std::string hits;
+      for (uint32_t off = 0; off < 0x800 && IsCommitted(o + off + 8); off += 4) {
+        const char* inl = G<char>(o + off);
+        for (const char* nm : {"Host", "Joiner"})
+          if (!memcmp(inl, nm, strlen(nm) + 1)) hits += std::string(" +") + std::to_string(off) + "=\"" + nm + "\"";
+        uint32_t q = Ld32(o + off);
+        if (q >= 0x40000000 && q < 0xC0000000 && IsCommitted(q) && IsCommitted(q + 8)) {
+          for (const char* nm : {"Host", "Joiner"})
+            if (!memcmp(G<char>(q), nm, strlen(nm) + 1)) hits += std::string(" +") + std::to_string(off) + "->\"" + nm + "\"";
+          if (Ld32(q) == 0x820118D0) hits += " +" + std::to_string(off) + "->soldier";
+        }
+      }
+      if (!hits.empty()) RT_INFO("bot players: vt %08X object %08X:%s", vt, o, hits.c_str());
+    }
+  }
+}
+
+const bool g_census_started = [] {
+  if (!getenv("BF_BOT_CENSUS")) return false;
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(10));
+      Census();
+      CheckPlayerClasses();
+    }
+  }).detach();
+  return true;
+}();
+
 const bool g_scan_started = [] {
   if (!getenv("BF_BOT_SCAN")) return false;
   std::thread([] {
@@ -359,6 +444,16 @@ using namespace rt;
 //   templates). The campaign level has 12 and 14 of those; the multiplayer
 //   levels only their type definitions (Valley Run checked), so an AI soldier
 //   there needs templates from elsewhere.
+// The server's players (BF_BOT_CENSUS / BF_BOT_PLAYER_VTS, host + joiner):
+//   52 classes get a second object when a player joins. Two hold the
+//   player's soldier once deployed: a large object (vtable 8201B118, soldier at
+//   +500; 8201B108 at +4, 8201B0E4 at +330, 82055814 at +36C, 820553F4 at +4B4
+//   are inside it) and a small one (8201D338, soldier at +4C; made through
+//   ServerSoldierSpawnEntity +80). On join the server calls 82364C78 on the
+//   player manager (vtable 8201B828, one object) with the new player's
+//   connection-like object (vtable 82068EB0; the host has one too); that runs
+//   8235FD08 -> 8235E9E8, which builds the large object. Neither object holds
+//   the gamertag as a plain string.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -442,6 +537,17 @@ static void TraceAi(const char* label, PPCContext& ctx) {
     }                                              \
     __imp__sub_##addr(ctx, base);                  \
   }
+// The big per-player object (vtable 8201B118): its builders and their callers.
+extern "C" PPC_FUNC(__imp__sub_823548E8);
+extern "C" PPC_FUNC(__imp__sub_8235E9E8);
+extern "C" PPC_FUNC(__imp__sub_82358908);
+extern "C" PPC_FUNC(__imp__sub_8235FD08);
+extern "C" PPC_FUNC(__imp__sub_82364C78);
+TRACE_AI(823548E8, "player obj builder 1")
+TRACE_AI(8235E9E8, "player obj builder 2")
+TRACE_AI(82358908, "player obj caller 1 (virtual)")
+TRACE_AI(8235FD08, "player obj caller 2")
+TRACE_AI(82364C78, "player obj caller 2b (virtual)")
 extern "C" PPC_FUNC(__imp__sub_8264DA80);
 extern "C" PPC_FUNC(__imp__sub_82614F78);
 extern "C" PPC_FUNC(__imp__sub_82638400);
