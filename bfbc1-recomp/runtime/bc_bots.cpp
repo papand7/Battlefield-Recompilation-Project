@@ -192,6 +192,57 @@ void DescribeSquad(uint32_t o) {
     RT_INFO("bot scan: soldier %08X squad +%X %08X:%s", o, off, sq, sq_out.substr(0, 2500).c_str());
   }}
 
+// The server's player for a soldier (BF_BOT_SCAN, testing): objects that hold
+// the gamertag ("Host", inline or by pointer, BF_BOT_NAME to change it) and
+// within 0x400 bytes a pointer to the soldier or one of the objects pointing at it.
+void FindPlayer(uint32_t soldier) {
+  const char* env = getenv("BF_BOT_NAME");
+  std::string name = env ? env : "Host";
+  std::vector<uint32_t> names;  // where the name string is
+  for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+    if (page >= 0x80000000 && page < 0xA0000000) continue;
+    if (!IsCommitted(uint32_t(page))) continue;
+    const char* p = reinterpret_cast<const char*>(g_base + page);
+    for (int i = 0; i + name.size() + 1 < 0x1000; ++i)
+      if (!memcmp(p + i, name.c_str(), name.size() + 1) && (i == 0 || p[i - 1] == 0))
+        names.push_back(uint32_t(page) + i);
+  }
+  std::string out;
+  for (uint32_t at : names) {
+    // Holders of a pointer to the name, plus the name's own place (inline).
+    std::vector<uint32_t> holders = {at};
+    uint32_t want = _byteswap_ulong(at);
+    for (uint64_t page = 0x40000000; page < 0xC0000000 && holders.size() < 8; page += 0x1000) {
+      if (page >= 0x80000000 && page < 0xA0000000) continue;
+      if (!IsCommitted(uint32_t(page))) continue;
+      const uint32_t* q = reinterpret_cast<const uint32_t*>(g_base + page);
+      for (int i = 0; i < 1024; ++i)
+        if (q[i] == want) holders.push_back(uint32_t(page) + i * 4);
+    }
+    for (uint32_t h : holders) {
+      // Look around the holder (0x400 each way) for the soldier pointer.
+      for (int64_t d = -0x400; d <= 0x400; d += 4) {
+        uint32_t a2 = uint32_t(int64_t(h) + d);
+        if (a2 < 0x40000000 || !IsCommitted(a2) || Ld32(a2) != soldier) continue;
+        char buf[200];
+        // The object's start: the nearest vtable-looking word below the soldier pointer.
+        uint32_t start = 0, vt = 0;
+        for (uint32_t back = 0; back <= 0x600; back += 4) {
+          uint32_t w = Ld32(a2 - back);
+          if (w >= 0x82000000 && w < 0x82180000 && Ld32(w) >= 0x82180000 && Ld32(w) < 0x82F00000) {
+            start = a2 - back, vt = w;
+            break;
+          }
+        }
+        snprintf(buf, sizeof(buf), " name@%08X holder@%08X soldier-ptr@%08X; object %08X vt %08X: soldier at +%X, name at +%X",
+                 at, h, a2, start, vt, a2 - start, at - start);
+        out += buf;
+      }
+    }
+  }
+  RT_INFO("bot scan: player of soldier %08X: %zu names;%s", soldier, names.size(), out.substr(0, 1500).c_str());
+}
+
 // What a soldier points at (first 0x800 bytes) and what points at it, by type:
 // tells an AI soldier (campaign) from a player's (BF_BOT_SCAN, once per soldier).
 void DescribeLinks(uint32_t o) {
@@ -213,19 +264,25 @@ void DescribeLinks(uint32_t o) {
     for (int i = 0; i < 1024; ++i) {
       if (p[i] != want) continue;
       uint32_t at = uint32_t(page) + i * 4;
-      // The object holding it: the nearest named object start below (within 0x400).
+      // The object holding it: the nearest object start below (within 0x400): a
+      // named one, or else the nearest word that looks like a vtable (82xxxxxx
+      // in the data section, whose first entry is code).
       for (uint32_t back = 0; back <= 0x400 && back <= at - 0x40000000; back += 4) {
         std::string n = TypeName(at - back);
-        if (!n.empty()) {
-          char buf[96];
-          snprintf(buf, sizeof(buf), " %s(%08X)+%X", n.c_str(), at - back, back);
-          refs += buf;
-          break;
-        }
+        uint32_t w = Ld32(at - back);
+        bool vt = w >= 0x82000000 && w < 0x82180000 && (Ld32(w) >= 0x82180000 && Ld32(w) < 0x82F00000);
+        if (n.empty() && !vt) continue;
+        char buf[96];
+        snprintf(buf, sizeof(buf), " %s(%08X)+%X", n.empty() ? ("vt" + std::to_string(w)).c_str() : n.c_str(),
+                 at - back, back);
+        if (n.empty()) snprintf(buf, sizeof(buf), " [vt %08X](%08X)+%X", w, at - back, back);
+        refs += buf;
+        break;
       }
     }
   }
   RT_INFO("bot scan: soldier %08X pointed at by:%s", o, refs.c_str());
+
 }
 
 const bool g_scan_started = [] {
@@ -241,6 +298,7 @@ const bool g_scan_started = [] {
         LogChanges(o);
         DescribeLinks(o);
         DescribeSquad(o);
+        FindPlayer(o);
       }
       for (uint32_t o : Scan(0x82047AA8)) DescribeSquad(o);
       for (uint32_t o : Scan(kKinds[2].vtable)) DescribeFields("tactical objective", o);
