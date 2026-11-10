@@ -454,6 +454,12 @@ using namespace rt;
 //   connection-like object (vtable 82068EB0; the host has one too); that runs
 //   8235FD08 -> 8235E9E8, which builds the large object. Neither object holds
 //   the gamertag as a plain string.
+//   The join's r4 is the peer's address inside its connection object (r4 - 4):
+//   +4 family 2 and port (1501 for the host's own client, 1511 for a joiner),
+//   +8 the IP (127.0.0.1). BF_BOT_FAKE joins a copy of only that record (port
+//   1599): the join returns, then the server crashes on its next update
+//   (826F3A40 <- 8234E390 <- 822D6CC8), so a fake player needs a whole fake
+//   connection object.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -547,7 +553,53 @@ TRACE_AI(823548E8, "player obj builder 1")
 TRACE_AI(8235E9E8, "player obj builder 2")
 TRACE_AI(82358908, "player obj caller 1 (virtual)")
 TRACE_AI(8235FD08, "player obj caller 2")
-TRACE_AI(82364C78, "player obj caller 2b (virtual)")
+// The join call itself: dump the object it gets (r4), 0x100 bytes, with the
+// type names and text its words point at, and the stack record (r5).
+PPC_FUNC(sub_82364C78) {
+  if (g_trace) {
+    TraceAi("player join 82364C78", ctx);
+    for (uint32_t r : {ctx.r4.u32, ctx.r5.u32}) {
+      std::string out;
+      for (uint32_t off = 0; off < 0x100 && r >= 0x40000000 && IsCommitted(r + off); off += 4) {
+        uint32_t v = Ld32(r + off);
+        std::string tn = TypeName(v);
+        std::string text;
+        if (v >= 0x40000000 && v < 0xC0000000 && IsCommitted(v)) {
+          const char* c = G<char>(v);
+          int n = 0;
+          while (n < 24 && c[n] >= 32 && c[n] < 127) ++n;
+          if (n >= 3 && c[n] == 0) text = std::string(c, n);
+        }
+        char buf[96];
+        snprintf(buf, sizeof(buf), " +%X:%08X%s%s%s%s", off, v, tn.empty() ? "" : ":", tn.c_str(),
+                 text.empty() ? "" : "=", text.c_str());
+        out += buf;
+      }
+      RT_INFO("bot trace:   join arg %08X:%s", r, out.c_str());
+    }
+  }
+  // BF_BOT_FAKE=1 (experiment): before the first join (the host's own client),
+  // join a player with a copy of its address record on port 1599, nobody's,
+  // on a snapshot of the join's working record (r5 and what follows, restored
+  // for the real join): does the server keep a player with no client?
+  static const bool fake = getenv("BF_BOT_FAKE") != nullptr;
+  static bool done = false;
+  if (fake && !done) {
+    done = true;
+    static uint32_t copy = g_system_heap->Alloc(0x100, 16);
+    memcpy(G<uint8_t>(copy), G<uint8_t>(ctx.r4.u32), 0x100);
+    St16(copy + 6, 1599);  // the port (sockaddr: family 2, port, address)
+    std::vector<uint8_t> snap(0x800);
+    memcpy(snap.data(), G<uint8_t>(ctx.r5.u32), snap.size());
+    PPCContext c = ctx;
+    c.r4.u64 = copy;
+    RT_INFO("bot fake: joining a player at 127.0.0.1:1599 (record %08X)", copy);
+    __imp__sub_82364C78(c, base);
+    RT_INFO("bot fake: join returned r3=%08X", c.r3.u32);
+    memcpy(G<uint8_t>(ctx.r5.u32), snap.data(), snap.size());
+  }
+  __imp__sub_82364C78(ctx, base);
+}
 extern "C" PPC_FUNC(__imp__sub_8264DA80);
 extern "C" PPC_FUNC(__imp__sub_82614F78);
 extern "C" PPC_FUNC(__imp__sub_82638400);
