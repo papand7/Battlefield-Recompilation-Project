@@ -29,6 +29,7 @@
 // float triplets that look like a world position, to find the fields to read.
 #include "kernel.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -358,13 +359,75 @@ void CheckPlayerClasses() {
   }
 }
 
+// BF_BOT_PLAYER_DUMP=1 (testing): each per-player object (vtable 8201B118),
+// once, 0x600 bytes: non-zero words with the type names they point at, so a
+// real player's can be compared with a fake one's.
+void DumpPlayers() {
+  if (!getenv("BF_BOT_PLAYER_DUMP")) return;
+  static std::map<uint32_t, int> seen;
+  for (uint32_t o : Scan(0x8201B118)) {
+    if (seen[o]++ != 2) continue;  // the third scan after it appears: 20-30 s in
+    std::string out;
+    for (uint32_t off = 0; off < 0x600; off += 4) {
+      uint32_t v = Ld32(o + off);
+      if (!v) continue;
+      std::string tn = TypeName(v);
+      char buf[72];
+      snprintf(buf, sizeof(buf), " +%X:%08X%s%s", off, v, tn.empty() ? "" : ":", tn.c_str());
+      out += buf;
+    }
+    RT_INFO("bot player %08X:%s", o, out.substr(0, 6000).c_str());
+  }
+}
+
+// BF_BOT_DUMP_VT="vt,vt" (testing): every object with one of these vtables,
+// once (on the third scan it is seen), its first 0x60 bytes with type names.
+void DumpVtables() {
+  const char* env = getenv("BF_BOT_DUMP_VT");
+  if (!env) return;
+  static std::map<uint32_t, int> seen;
+  std::string list = env;
+  for (size_t pos = 0; pos < list.size();) {
+    size_t comma = list.find(',', pos);
+    uint32_t vt = uint32_t(strtoul(list.substr(pos, comma - pos).c_str(), nullptr, 16));
+    pos = comma == std::string::npos ? list.size() : comma + 1;
+    for (uint32_t o : Scan(vt)) {
+      if (seen[o]++ != 2) continue;
+      std::string out;
+      for (uint32_t off = 0; off < 0x60; off += 4) {
+        uint32_t v = Ld32(o + off);
+        std::string tn = TypeName(v);
+        char buf[72];
+        snprintf(buf, sizeof(buf), " +%X:%08X%s%s", off, v, tn.empty() ? "" : ":", tn.c_str());
+        out += buf;
+      }
+      RT_INFO("bot dump vt %08X object %08X:%s", vt, o, out.c_str());
+      // And what its +14 points at (vtable and first words).
+      uint32_t t = Ld32(o + 0x14);
+      if (t >= 0x40000000 && t < 0xC0000000 && IsCommitted(t)) {
+        std::string w;
+        for (uint32_t off = 0; off < 0x80; off += 4) {
+          uint32_t v = Ld32(t + off);
+          std::string tn = TypeName(v);
+          char buf[72];
+          snprintf(buf, sizeof(buf), " +%X:%08X%s%s", off, v, tn.empty() ? "" : ":", tn.c_str());
+          w += buf;
+        }
+        RT_INFO("bot dump vt %08X object %08X +14 -> %08X:%s", vt, o, t, w.c_str());
+      }
+    }
+  }
+}
+
 const bool g_census_started = [] {
-  if (!getenv("BF_BOT_CENSUS")) return false;
+  if (!getenv("BF_BOT_CENSUS") && !getenv("BF_BOT_PLAYER_DUMP") && !getenv("BF_BOT_DUMP_VT")) return false;
   std::thread([] {
     for (;;) {
       std::this_thread::sleep_for(std::chrono::seconds(10));
-      Census();
+      if (getenv("BF_BOT_CENSUS")) Census();
       CheckPlayerClasses();
+      DumpPlayers();
+      DumpVtables();
     }
   }).detach();
   return true;
@@ -465,6 +528,13 @@ using namespace rt;
 //   object crashes the same way: 826F3A40 reads +14 of a per-player part
 //   (vtable 8201B140, inside the 8201B118 object) that a real client's
 //   messages after the join fill in and a fake player never gets.
+//   That +14 (and +28) is the player's network peer (vtable 820550C0). After a
+//   real join the server calls 82705810 on the peer manager (the player
+//   manager + 8) with the player's index, 1 and its connection (vtable
+//   8201B140), which builds the peer (826FD850); the link to the connection
+//   comes later, from the network. BF_BOT_FAKE does the join, that call (index
+//   7) and the link: the fake player then stays (two player objects and
+//   connections with the host's, 4 minutes, no crash) and gets no traffic.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -560,6 +630,7 @@ TRACE_AI(82358908, "player obj caller 1 (virtual)")
 TRACE_AI(8235FD08, "player obj caller 2")
 // The join call itself: dump the object it gets (r4), 0x100 bytes, with the
 // type names and text its words point at, and the stack record (r5).
+extern "C" PPC_FUNC(__imp__sub_82705810);
 PPC_FUNC(sub_82364C78) {
   if (g_trace) {
     TraceAi("player join 82364C78", ctx);
@@ -618,13 +689,45 @@ PPC_FUNC(sub_82364C78) {
     memcpy(snap.data(), G<uint8_t>(ctx.r5.u32), snap.size());
     PPCContext c = ctx;
     c.r4.u64 = copy;
+    std::vector<uint32_t> before = Scan(0x8201B140);
     RT_INFO("bot fake: joining a player at 127.0.0.1:1599 (record %08X)", copy);
     __imp__sub_82364C78(c, base);
     RT_INFO("bot fake: join returned r3=%08X", c.r3.u32);
+    // A real join is followed by the peer's creation: 82705810 on the peer
+    // manager (the player manager + 8) with the player's index, 1 and its
+    // connection object (vtable 8201B140); that fills the connection's +14.
+    for (uint32_t o : Scan(0x8201B140)) {
+      if (std::find(before.begin(), before.end(), o) != before.end()) continue;
+      PPCContext pc = ctx;
+      pc.r3.u64 = ctx.r3.u32 + 8;
+      pc.r4.u64 = 7;
+      pc.r5.u64 = 1;
+      pc.r6.u64 = o;
+      RT_INFO("bot fake: creating its peer (connection %08X, +14 %08X)", o, Ld32(o + 0x14));
+      std::vector<uint32_t> peers_before = Scan(0x820550C0);
+      __imp__sub_82705810(pc, base);
+      RT_INFO("bot fake: peer created, connection +14 now %08X", Ld32(o + 0x14));
+      // Real connections hold their peer (vtable 820550C0) at +14 and +28.
+      for (uint32_t peer : Scan(0x820550C0)) {
+        if (std::find(peers_before.begin(), peers_before.end(), peer) != peers_before.end()) continue;
+        if (!Ld32(o + 0x14)) St32(o + 0x14, peer);
+        if (!Ld32(o + 0x28)) St32(o + 0x28, peer);
+        RT_INFO("bot fake: new peer %08X linked into connection %08X", peer, o);
+      }
+    }
     memcpy(G<uint8_t>(ctx.r5.u32), snap.data(), snap.size());
   }
   __imp__sub_82364C78(ctx, base);
 }
+// The network peer object (vtable 820550C0) behind a player's connection.
+extern "C" PPC_FUNC(__imp__sub_826FB8F0);
+extern "C" PPC_FUNC(__imp__sub_826FD9F0);
+extern "C" PPC_FUNC(__imp__sub_826FD850);
+extern "C" PPC_FUNC(__imp__sub_82705810);
+TRACE_AI(826FB8F0, "peer builder 1")
+TRACE_AI(826FD9F0, "peer caller 1 (virtual)")
+TRACE_AI(826FD850, "peer builder 2")
+TRACE_AI(82705810, "peer caller 2")
 extern "C" PPC_FUNC(__imp__sub_8264DA80);
 extern "C" PPC_FUNC(__imp__sub_82614F78);
 extern "C" PPC_FUNC(__imp__sub_82638400);
