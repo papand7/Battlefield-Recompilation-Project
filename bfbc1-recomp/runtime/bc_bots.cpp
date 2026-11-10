@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -183,4 +184,82 @@ const bool g_scan_started = [] {
 }();
 
 }  // namespace
+
 }  // namespace rt
+
+// Game function hooks: at global scope (C++ names, as bfbc1_game.cpp's
+// GAME_PATCH ones), so they replace the recompiled functions.
+using namespace rt;
+// How soldiers are made (BF_BOT_TRACE, campaign level 1 and Valley Run):
+//   Every soldier, AI or human, comes from one factory, 822F5ED8, a virtual
+//   function of the soldier blueprint (600C0074, vtable 820160E8; the same
+//   object in the campaign and in multiplayer), called with a creation record
+//   on the stack (r4: 5FFE5460 600262E0 <soldier + 2A0> <id> 0 0) and the new
+//   soldier's memory (r5); it runs the constructor 822BD818 (822B8428 is its
+//   destructor). The constructor's third argument (vtable 8206E890, a counter
+//   at +8) is the same kind of object for every soldier.
+//   Campaign: the first soldiers come straight from the level data while it
+//   loads; later ones right after ServerSoldierSpawnEntity +14 (82321550,
+//   probably its event handler). Multiplayer: the deploying player's soldier
+//   from the same factory, with no soldier spawn entity call.
+//   Where the campaign's soldiers get their AI isn't known yet.
+//
+// BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
+// functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
+// with this and r4-r6, and how many soldiers there are after: to see which one
+// spawns a soldier, in the campaign (AI) and in multiplayer.
+static const bool g_trace = getenv("BF_BOT_TRACE") != nullptr;
+static uint32_t Vt(uint32_t o) { return o >= 0x40000000 && o < 0xC0000000 && IsCommitted(o) ? Ld32(o) : 0u; }
+static std::string Words(uint32_t a, int n) {
+  std::string out;
+  for (int i = 0; i < n && a >= 0x40000000 && a < 0xC0000000 && IsCommitted(a + i * 4); ++i) {
+    char buf[12];
+    snprintf(buf, sizeof(buf), " %08X", Ld32(a + i * 4));
+    out += buf;
+  }
+  return out;
+}
+static void TraceSpawn(const char* fn, PPCContext& ctx) {
+  static std::map<std::string, int> n;
+  static std::mutex m;
+  std::lock_guard l(m);
+  if (n[fn]++ < 30)
+    RT_INFO("bot trace: %s this=%08X r4=%08X[%s ] r5=%08X(vt %08X)[%s ] r6=%08X(vt %08X)", fn, ctx.r3.u32, ctx.r4.u32,
+            Words(ctx.r4.u32, 6).c_str(), ctx.r5.u32, Vt(ctx.r5.u32), Words(ctx.r5.u32, 4).c_str(), ctx.r6.u32,
+            Vt(ctx.r6.u32));
+}
+#define TRACE_VFN(addr, slot)                                  extern "C" PPC_FUNC(__imp__sub_##addr);                      PPC_FUNC(sub_##addr) {                                         if (g_trace) TraceSpawn("soldier spawn " slot " " #addr, ctx);     __imp__sub_##addr(ctx, base);                              }
+// The soldier factory (the only caller of ServerSoldierEntity's constructor
+// 822BD818; called through a vtable): what it gets and what it returns.
+extern "C" PPC_FUNC(__imp__sub_822F5ED8);
+PPC_FUNC(sub_822F5ED8) {
+  uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32;
+  auto vt = [](uint32_t o) { return o >= 0x40000000 && o < 0xC0000000 && IsCommitted(o) ? Ld32(o) : 0u; };
+  __imp__sub_822F5ED8(ctx, base);
+  if (g_trace) {
+    uint32_t made = ctx.r3.u32;
+    RT_INFO("bot trace: soldier factory this=%08X(vt %08X) r4=%08X(vt %08X) r5=%08X(vt %08X) r6=%08X -> %08X(vt %08X team %u)",
+            r3, vt(r3), r4, vt(r4), r5, vt(r5), r6, made, vt(made), vt(made) ? Ld32(made + 0x48) : 0);
+  }
+}
+// The other one: 822BDCB8 calls the constructor 822B8428 (also through a vtable).
+extern "C" PPC_FUNC(__imp__sub_822BDCB8);
+PPC_FUNC(sub_822BDCB8) {
+  uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32;
+  auto vt = [](uint32_t o) { return o >= 0x40000000 && o < 0xC0000000 && IsCommitted(o) ? Ld32(o) : 0u; };
+  __imp__sub_822BDCB8(ctx, base);
+  if (g_trace) {
+    uint32_t made = ctx.r3.u32;
+    RT_INFO("bot trace: soldier factory 2 this=%08X(vt %08X) r4=%08X(vt %08X) r5=%08X(vt %08X) r6=%08X -> %08X(vt %08X)",
+            r3, vt(r3), r4, vt(r4), r5, vt(r5), r6, made, vt(made));
+  }
+}
+TRACE_VFN(822B8428, "ctor A")
+TRACE_VFN(822BD818, "ctor B")
+TRACE_VFN(82321550, "+14")
+TRACE_VFN(822F4348, "+44")
+TRACE_VFN(82321820, "+80")
+TRACE_VFN(822FD978, "+84")
+TRACE_VFN(82322508, "+90")
+TRACE_VFN(822F7D50, "+94")
+
