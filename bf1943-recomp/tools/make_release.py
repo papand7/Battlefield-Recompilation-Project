@@ -96,10 +96,12 @@ def main():
         out = os.path.abspath(args[0] if args else os.path.join(ROOT, 'build', 'release'))
         stage(os.path.join(ROOT, 'build', 'release_sources'))  # launcher/package.json extraResources
         print('launcher -> one exe')
-        dist = os.path.join(launcher, 'dist')
+        # Built in the temp folder: something can hold a new .asar under the
+        # source tree for a moment, and electron-builder fails on that (EBUSY).
+        dist = os.path.join(os.environ.get('TEMP', ROOT), 'bf_launcher_dist')
         if os.path.exists(dist):
-            shutil.rmtree(dist)
-        subprocess.run('npm run dist', cwd=launcher, shell=True, check=True)
+            shutil.rmtree(dist, ignore_errors=True)
+        subprocess.run(f'npm run dist -- --config.directories.output="{dist}"', cwd=launcher, shell=True, check=True)
         os.makedirs(out, exist_ok=True)
         for f in os.listdir(dist):
             if f.startswith('BattlefieldLauncher-') and f.endswith('.exe'):
