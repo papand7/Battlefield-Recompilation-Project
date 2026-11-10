@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -708,6 +709,13 @@ using namespace rt;
 //   the player's received input (r4, vtable 8200DC48; +8 forward). Writing
 //   forward there before that copy moves the fake soldier: it walked from its
 //   spawn (-461, -221) to (-483, -188) on Valley Run.
+//   The received input's fields (BF_BOT_INPUT_MAP, a joiner walking,
+//   strafing, turning, looking, firing): +8 forward, +C strafe, +1C turn, +20
+//   look, +28 fire; +2C.. how long each is held (half floats). Turn input
+//   (with or without the held values) doesn't turn the fake soldier: its
+//   heading (written by 822757E8 in the soldier update 822C2C38, seen with
+//   BF_BOT_WATCH_HEADING) comes from somewhere else, not found yet (the yaw
+//   BF_BOT_FIND_YAW matched once was a coincidence).
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -838,6 +846,38 @@ static void DriveFake() {
     // BF_BOT_WATCH_INPUT=1: log the call stack of every write to its analog
     // fields (the runtime's --watch-write): what clears them each update.
     if (getenv("BF_BOT_WATCH_INPUT")) StartWriteWatch(g_fake_input + 8, 0x10, 0);
+    // BF_BOT_FIND_YAW=1: floats in the soldier and the objects it points at (two
+    // levels, 0x800 / 0x400 bytes) equal to its heading in some convention.
+    if (getenv("BF_BOT_FIND_YAW")) {
+      float fx = LdF(g_fake_soldier + 0x320), fz = LdF(g_fake_soldier + 0x328);
+      float h = std::atan2(fx, fz);
+      const float pi = 3.14159265f;
+      float wants[] = {h, -h, pi - h, h - pi, h + pi / 2, h - pi / 2, -h + pi / 2, -h - pi / 2};
+      std::string out;
+      std::function<void(uint32_t, uint32_t, std::string, int)> look = [&](uint32_t o, uint32_t len, std::string path,
+                                                                           int depth) {
+        for (uint32_t off = 0; off < len && IsCommitted(o + off + 4); off += 4) {
+          float f = LdF(o + off);
+          for (float w : wants)
+            if (std::isfinite(f) && std::fabs(f - w) < 0.01f && std::fabs(f) > 0.05f) {
+              char buf[96];
+              snprintf(buf, sizeof(buf), " %s+%X=%.3f", path.c_str(), off, f);
+              out += buf;
+              break;
+            }
+          uint32_t q = Ld32(o + off);
+          if (depth < 2 && q >= 0x40000000 && q < 0xC0000000 && !(q & 3) && IsCommitted(q) && IsCommitted(q + 0x3FC)) {
+            char sub[32];
+            snprintf(sub, sizeof(sub), "%s*(+%X)", path.c_str(), off);
+            look(q, 0x400, sub, depth + 1);
+          }
+        }
+      };
+      look(g_fake_soldier, 0x800, "", 0);
+      RT_INFO("bot fake: heading %.3f (fx %.2f fz %.2f); matching floats:%s", h, fx, fz, out.substr(0, 2500).c_str());
+    }
+    // BF_BOT_WATCH_HEADING=1: the writes to its soldier's rotation rows (+300..+32F).
+    if (getenv("BF_BOT_WATCH_HEADING")) StartWriteWatch(g_fake_soldier + 0x300, 0x30, 0);
   }
   auto set = [](uint32_t a, float f) {
     uint32_t u;
@@ -856,6 +896,63 @@ static void DriveFake() {
   (void)set;
 }
 
+// A first brain for the fake soldier: to the nearest gold crate (mission
+// objective, position +C0). Heading from the soldier's world matrix (forward
+// row +320/+328 in x/z); turning right lowers atan2(x, z).
+static void FakeBrain(uint32_t in) {
+  auto set = [in](uint32_t off, float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    St32(in + off, u);
+  };
+  uint32_t so = g_fake_soldier;
+  if (!so || !IsCommitted(so) || Ld32(so) != 0x820118D0) return;
+  float x = LdF(so + 0x200), z = LdF(so + 0x208), fx = LdF(so + 0x320), fz = LdF(so + 0x328);
+  float best = 1e9f, tx = 0, tz = 0;
+  for (uint32_t crate : Scan(0x82013AF0)) {
+    float cx = LdF(crate + 0xC0), cz = LdF(crate + 0xC8);
+    float d = std::hypot(cx - x, cz - z);
+    if (d < best) best = d, tx = cx, tz = cz;
+  }
+  if (best > 1e8f) return;
+  float diff = std::atan2(tx - x, tz - z) - std::atan2(fx, fz);
+  while (diff > 3.14159265f) diff -= 6.2831853f;
+  while (diff < -3.14159265f) diff += 6.2831853f;
+  float turn = std::clamp(-diff * 2.0f, -1.0f, 1.0f);
+  float forward = best < 3.0f ? 0.0f : std::fabs(diff) < 1.0f ? 1.0f : 0.3f;
+  set(0x8, forward);
+  set(0x1C, turn);
+  // The server takes a remote soldier's heading from a stored yaw (minus the
+  // heading: *(*(soldier + C)) + 198, BF_BOT_FIND_YAW), not from the turn input:
+  // turned there directly.
+  uint32_t a1 = Ld32(so + 0xC);
+  uint32_t a2 = a1 >= 0x40000000 && a1 < 0xC0000000 && IsCommitted(a1) ? Ld32(a1) : 0;
+  uint32_t yaw_at = a2 >= 0x40000000 && a2 < 0xC0000000 && IsCommitted(a2 + 0x198) ? a2 + 0x198 : 0;
+  if (yaw_at) {
+    float yaw = LdF(yaw_at) + turn * 0.05f;
+    uint32_t u;
+    memcpy(&u, &yaw, 4);
+    St32(yaw_at, u);
+  }
+  static bool said = false;
+  if (!said) {
+    said = true;
+    RT_INFO("bot brain: yaw at %08X (soldier +C -> %08X -> %08X), %.3f", yaw_at, a1, a2, yaw_at ? LdF(yaw_at) : 0.0f);
+  }
+  // While a stick is held its "held" values ramp up (two half floats; for turn
+  // and look at +34 low half and +38 high half): turning needs them, at 1.0.
+  if (std::fabs(turn) > 0.05f) {
+    St32(in + 0x34, 0x00003C00);
+    St32(in + 0x38, 0x3C000000);
+  }
+  static int64_t last = 0;
+  if (int64_t(GetTickCount64()) - last > 2000) {
+    last = int64_t(GetTickCount64());
+    RT_INFO("bot brain: at %.1f %.1f, crate at %.1f %.1f, %.1f m, off by %.0f deg, turn %.2f forward %.1f", x, z, tx, tz,
+            best, diff * 57.3f, turn, forward);
+  }
+}
+
 // The soldier update (822B92C8 <- 822C2C38 <- 822ACCD8 <- 82275A38, BF_BOT_WATCH_INPUT)
 // fills a soldier's input state from its player's received input through
 // 821BF2A8, which writes all its analog fields: for the fake soldier, the
@@ -865,13 +962,29 @@ PPC_FUNC(sub_821BF2A8) {
   uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
   // The source is the player's received input (vtable 8200DC48; a walking
   // joiner's has 0.96 at +8): for the fake soldier, fill it before the copy.
-  if (g_fake_input && r3 == g_fake_input && IsCommitted(r4) && Ld32(r4) == 0x8200DC48) {
-    float f = 1.0f;
-    uint32_t u;
-    memcpy(&u, &f, 4);
-    St32(r4 + 8, u);
-  }
+  // Its fields (BF_BOT_INPUT_MAP with a joiner): +8 forward, +C strafe, +1C
+  // turn (right +), +20 look (up +), +28 fire; +2C.. how long each is held.
+  if (g_fake_input && r3 == g_fake_input && IsCommitted(r4) && Ld32(r4) == 0x8200DC48) FakeBrain(r4);
   __imp__sub_821BF2A8(ctx, base);
+  // BF_BOT_INPUT_MAP=1 (testing): a player's received input (r4) whenever its
+  // first 0x60 bytes change, the non-zero words shown: which field is which.
+  static const bool map_input = getenv("BF_BOT_INPUT_MAP") != nullptr;
+  if (map_input && IsCommitted(r4) && Ld32(r4) == 0x8200DC48) {
+    static std::map<uint32_t, std::string> last;
+    std::string w;
+    for (uint32_t k = 1; k < 24; ++k) {
+      uint32_t u = Ld32(r4 + k * 4);
+      if (!u) continue;
+      float f;
+      memcpy(&f, &u, 4);
+      char buf[40];
+      if (std::isfinite(f) && std::fabs(f) > 0.001f && std::fabs(f) < 1000.0f) snprintf(buf, sizeof(buf), " +%X:%.2f", k * 4, f);
+      else snprintf(buf, sizeof(buf), " +%X:%08X", k * 4, u);
+      w += buf;
+    }
+    if (w != last[r4]) RT_INFO("bot input map %08X:%s", r4, w.c_str());
+    last[r4] = w;
+  }
   // The source (r4) of every copy, when a word in it looks like a full stick
   // (the host walking), and for the fake soldier's: its layout.
   {

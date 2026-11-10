@@ -47,12 +47,15 @@ std::string StartBotDirector(int) { return {}; }
 void SetBotSlot(const std::string&, int) {}
 bool BotLookAxis(int, float&) { return false; }
 // Sticks held by the test automation (BF_AUTO_MP "walk", "turn" and "look" steps).
-static std::atomic<int16_t> g_auto_ly{0}, g_auto_rx{0}, g_auto_ry{0};
+static std::atomic<int16_t> g_auto_ly{0}, g_auto_rx{0}, g_auto_ry{0}, g_auto_lx{0};
+static std::atomic<uint8_t> g_auto_rt{0};
 // The pad, every poll: our Multiplayer menu (bc_mp_menu.cpp) takes it while open.
 bool AddBotInput(XINPUT_GAMEPAD& pad) {
   if (int16_t v = g_auto_ly.load()) pad.sThumbLY = v;
   if (int16_t v = g_auto_rx.load()) pad.sThumbRX = v;
   if (int16_t v = g_auto_ry.load()) pad.sThumbRY = v;
+  if (int16_t v = g_auto_lx.load()) pad.sThumbLX = v;
+  if (uint8_t v = g_auto_rt.load()) pad.bRightTrigger = v;
   if (bcmp::Update(pad)) pad = {};
   return false;
 }
@@ -202,6 +205,13 @@ static const bool g_auto_mp_started = [] {
                    : name == "a" ? XINPUT_GAMEPAD_A : name == "b" ? XINPUT_GAMEPAD_B
                    : name == "start" ? XINPUT_GAMEPAD_START : 0;
         if (name == "wait") std::this_thread::sleep_for(std::chrono::seconds(3));
+        if (name == "strafe" || name == "fire") {  // left stick right / right trigger, 1 s
+          if (name == "strafe") g_auto_lx = 32000; else g_auto_rt = 255;
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+          g_auto_lx = 0, g_auto_rt = 0;
+          RT_INFO("auto mp: %s (step %zu)", name.c_str(), done);
+          continue;
+        }
         if (name == "walklong") {  // left stick forward 8 s
           g_auto_ly = 32000;
           std::this_thread::sleep_for(std::chrono::seconds(8));
