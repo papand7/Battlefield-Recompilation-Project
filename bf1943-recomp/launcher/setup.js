@@ -60,6 +60,100 @@ function sha1(file) {
   return crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex');
 }
 
+// ---- the player's game next to the launcher ---------------------------------------
+function readAt(fd, pos, len) {
+  const b = Buffer.alloc(len);
+  return b.subarray(0, fs.readSync(fd, b, 0, len, pos));
+}
+// A disc image (XDVDFS, as tools/xiso_extract.py): the SHA-1 of default.xex in its
+// root directory, or null. Tells Bad Company's disc from any other game's.
+function isoXexSha1(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    for (const base of [0, 0xFD90000, 0x2080000, 0x18300000]) {
+      const vd = readAt(fd, base + 32 * 2048, 28);
+      if (vd.length < 28 || vd.toString('latin1', 0, 20) !== 'MICROSOFT*XBOX*MEDIA') continue;
+      const dir = readAt(fd, base + vd.readUInt32LE(20) * 2048, vd.readUInt32LE(24));
+      const stack = [0];
+      const seen = new Set();
+      while (stack.length) {
+        const o = stack.pop() * 4;
+        if (seen.has(o) || o + 14 > dir.length || dir.readUInt16LE(o) === 0xFFFF) continue;
+        seen.add(o);
+        const name = dir.toString('latin1', o + 14, o + 14 + dir[o + 13]);
+        if (name.toLowerCase() === 'default.xex' && !(dir[o + 12] & 0x10)) {
+          const xex = readAt(fd, base + dir.readUInt32LE(o + 4) * 2048, dir.readUInt32LE(o + 8));
+          return crypto.createHash('sha1').update(xex).digest('hex');
+        }
+        if (dir.readUInt16LE(o)) stack.push(dir.readUInt16LE(o));
+        if (dir.readUInt16LE(o + 2)) stack.push(dir.readUInt16LE(o + 2));
+      }
+      return null;
+    }
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+// An Xbox 360 package (STFS): its title ID and version (0x106 = 1.06), or null.
+function stfsInfo(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const h = readAt(fd, 0, 0x364);
+    if (h.length < 0x364 || !['CON ', 'LIVE', 'PIRS'].includes(h.toString('latin1', 0, 4))) return null;
+    return { title: h.readUInt32BE(0x360), version: h.readUInt32BE(0x358) };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+const kBf1943Title = 0x5841097E;
+const foundCache = new Map();  // path|size|mtime -> what it is
+function identify(file, st) {
+  const key = `${file}|${st.size}|${st.mtimeMs}`;
+  if (!foundCache.has(key)) {
+    let what = null;
+    try {
+      if (/\.iso$/i.test(file)) {
+        if (isoXexSha1(file) === kGames.bfbc1.sha1) what = { game: 'bfbc1' };
+      } else if (path.basename(file).toLowerCase() === 'default.xex') {
+        const h = sha1(file);
+        what = h === kGames.bfbc1.sha1 ? { game: 'bfbc1' } : h === kGames.bf1943.sha1 ? { game: 'bf1943' }
+          : kGames.bf1943.wrongSha1[h] ? { game: 'bf1943', wrong: kGames.bf1943.wrongSha1[h] } : null;
+      } else if (st.size > 1 << 20) {
+        const info = stfsInfo(file);
+        if (info && info.title === kBf1943Title)
+          what = info.version === 0x106 ? { game: 'bf1943' } : { game: 'bf1943', wrong: kGames.bf1943.wrongSha1[
+            '1c1f22606fa1eff15bf0409214279118dc805c28'] };
+      }
+    } catch { /* unreadable: not it */ }
+    foundCache.set(key, what);
+  }
+  return foundCache.get(key);
+}
+// The game's files in dir (the launcher's folder): a disc image or package
+// there, or default.xex in a folder there. { path } or { wrong: why } or null.
+function findGameFiles(dir, game) {
+  if (!dir) return null;
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  let wrong = null;
+  for (const n of names) {
+    const f = path.join(dir, n);
+    let st;
+    try { st = fs.statSync(f); } catch { continue; }
+    const candidates = st.isDirectory() ? [path.join(f, 'default.xex')] : [f];
+    for (const c of candidates) {
+      let cs = st;
+      if (c !== f) { try { cs = fs.statSync(c); } catch { continue; } }
+      const what = identify(c, cs);
+      if (!what || what.game !== game) continue;
+      if (!what.wrong) return { path: c };
+      wrong = wrong || { wrong: `${path.basename(c)}: ${what.wrong}` };
+    }
+  }
+  return wrong;
+}
+
 // ---- tools ------------------------------------------------------------------------
 const PF = process.env.ProgramFiles || 'C:\\Program Files';
 const PF86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
@@ -137,7 +231,7 @@ function run(cmd, args, opts, onLine) {
 }
 
 // ---- the steps ----------------------------------------------------------------------
-function status(launcherDir, game) {
+function status(launcherDir, game, searchDir) {
   const p = paths(launcherDir, game);
   if (!p) return { ok: false, error: 'The build files (src folder) are missing next to the launcher.' };
   const tools = findTools();
@@ -145,6 +239,7 @@ function status(launcherDir, game) {
     ok: true,
     gameFiles: fs.existsSync(path.join(p.data, 'default.xex')),
     built: fs.existsSync(path.join(p.gameDir, p.game.exe)),
+    found: findGameFiles(searchDir, game),
     tools: Object.fromEntries(Object.keys(kToolNames).map((k) => [k, !!tools[k]])),
   };
 }

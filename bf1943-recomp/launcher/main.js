@@ -19,13 +19,15 @@ const defaults = {
   game: 'bf1943',       // which tab: bf1943 | bfbc1
 };
 
-// The single-exe release (electron-builder portable) runs from a temporary
-// folder each time, with the build trees inside (resources/source): the games
-// are built and installed under %LOCALAPPDATA%\BattlefieldRecomp instead, and
-// the build trees are copied there when this version first starts.
+// The folder the player put the launcher (and their game files) in: the
+// single-exe release (electron-builder portable) runs from a temporary copy.
+const playerDir = process.env.PORTABLE_EXECUTABLE_DIR || (app.isPackaged ? path.dirname(process.execPath) : null);
+// That exe has the build trees inside (resources/source): the games are built
+// and installed in <its folder>/BattlefieldRecomp, where the build trees are
+// copied when a new version first starts.
 const bundled = app.isPackaged ? path.join(process.resourcesPath, 'source') : null;
 const installRoot = bundled && fs.existsSync(path.join(bundled, 'src'))
-  ? path.join(process.env.LOCALAPPDATA || app.getPath('appData'), 'BattlefieldRecomp') : null;
+  ? path.join(playerDir, 'BattlefieldRecomp') : null;
 function prepareSources() {
   if (!installRoot) return;
   const stamp = path.join(installRoot, 'src', '.launcher-version');
@@ -141,7 +143,8 @@ ipcMain.handle('play', (_, s) => {
 });
 
 // First-run setup (setup.js), per game: status, choosing the game files, running it.
-ipcMain.handle('setup-status', (_, game) => setup.status(launcherDir, game));
+// The game's disc image, package or unpacked folder is looked for next to the launcher.
+ipcMain.handle('setup-status', (_, game) => setup.status(launcherDir, game, playerDir));
 ipcMain.handle('setup-pick', async (_, game) => {
   const r = await dialog.showOpenDialog(win, game === 'bfbc1' ? {
     title: 'Your Battlefield: Bad Company disc: the disc image (.iso), or default.xex in an unpacked folder',

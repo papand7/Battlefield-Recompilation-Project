@@ -73,6 +73,7 @@ const setupText = {
     + '(<b>.iso</b>) of Battlefield: Bad Company (USA), or <b>default.xex</b> in a folder you unpacked. '
     + 'The game files take about 5 GB.'],
 };
+const foundHint = ' Put them next to the launcher and they are found by themselves.';
 let gamePath = null;
 let setupGame = null;
 let setupState = null;
@@ -92,7 +93,7 @@ async function showSetup(key, on) {
     $('install').textContent = 'INSTALL';
   }
   $('setuptitle').textContent = setupText[key][0];
-  $('setuphint').innerHTML = setupText[key][1];
+  $('setuphint').innerHTML = setupText[key][1] + foundHint;
   $('pick').disabled = false;
   setupState = await window.launcher.setupStatus(key);
   if (!setupState.ok) {
@@ -101,6 +102,15 @@ async function showSetup(key, on) {
     return;
   }
   setStatus('Set up the game first (right).');
+  // The game's files next to the launcher, unless the player chose others.
+  const found = setupState.found;
+  if (!gamePath && found && found.path && !setupState.gameFiles) {
+    gamePath = found.path;
+    $('pickpath').textContent = 'Found next to the launcher: ' + found.path.split(/[\\/]/).slice(-2).join('\\');
+    $('pickpath').title = found.path;
+  } else if (!gamePath && found && found.wrong && !setupState.gameFiles) {
+    $('pickpath').textContent = found.wrong;
+  }
   if (setupState.gameFiles) {
     $('pickpath').textContent = 'Game files already in place';
     markStep('game', 'done');
@@ -188,6 +198,10 @@ $('play').onclick = async () => {
 };
 
 window.launcher.onGameExited(() => { setStatus(''); $('play').disabled = false; });
+// Back to the launcher: game files may have been put next to it meanwhile.
+window.addEventListener('focus', () => {
+  if (!$('setupcard').hidden && setupGame) showSetup(setupGame, true);
+});
 $('min').onclick = () => window.launcher.minimize();
 $('close').onclick = () => window.launcher.close();
 $('name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('play').click(); });

@@ -8,7 +8,7 @@ games goes in: no game files, no recompiled code.
 One exe (default out_dir build/release): BattlefieldLauncher-<version>.exe,
 electron-builder's portable target (npm run dist in launcher/) with src/ and
 src-bfbc1/ below inside it (staged in build/release_sources); it installs
-under %LOCALAPPDATA%/BattlefieldRecomp (launcher/main.js).
+in a BattlefieldRecomp folder next to itself (launcher/main.js).
 
 A folder (default out_dir build/release/BF1943-PC):
   Launcher/        the packed launcher (npm run pack in launcher/)
