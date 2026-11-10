@@ -61,6 +61,7 @@ bool CustomMenus() { return false; }
 bool g_dedicated = false;
 std::vector<std::string> g_map_rotation;
 std::string g_emitter;  // --emitter: bf1943's particle settings (game_patches.cpp), unused here
+void ApplyEmitterNow() {}  // bf1943's (game_patches.cpp): applies g_emitter
 int GameDialogs() { return 0; }
 }  // namespace rt
 
@@ -201,6 +202,13 @@ static const bool g_auto_mp_started = [] {
                    : name == "a" ? XINPUT_GAMEPAD_A : name == "b" ? XINPUT_GAMEPAD_B
                    : name == "start" ? XINPUT_GAMEPAD_START : 0;
         if (name == "wait") std::this_thread::sleep_for(std::chrono::seconds(3));
+        if (name == "walklong") {  // left stick forward 8 s
+          g_auto_ly = 32000;
+          std::this_thread::sleep_for(std::chrono::seconds(8));
+          g_auto_ly = 0;
+          RT_INFO("auto mp: walklong (step %zu)", done);
+          continue;
+        }
         if (name == "walk" || name == "turn" || name == "look") {
           // left stick forward 2 s / right stick right or up 0.5 s
           auto& stick = name == "walk" ? g_auto_ly : name == "turn" ? g_auto_rx : g_auto_ry;

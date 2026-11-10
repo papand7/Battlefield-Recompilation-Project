@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -420,6 +421,157 @@ void DumpVtables() {
   }
 }
 
+// BF_BOT_INPUT_PROBE=1 (testing): twice a second, the float fields (first
+// 0x800 bytes) of every per-player object (BF_BOT_PLAYER_VTS) and of every
+// soldier's entry component (soldier +2B0) that go from about 0 to about +-1
+// or back: where the server keeps a player's received stick input.
+void ProbeInput() {
+  static std::map<uint32_t, std::vector<float>> last;
+  std::vector<uint32_t> objs;
+  if (const char* env = getenv("BF_BOT_PLAYER_VTS")) {
+    std::string list = env;
+    for (size_t pos = 0; pos < list.size();) {
+      size_t comma = list.find(',', pos);
+      uint32_t vt = uint32_t(strtoul(list.substr(pos, comma - pos).c_str(), nullptr, 16));
+      pos = comma == std::string::npos ? list.size() : comma + 1;
+      for (uint32_t o : Scan(vt)) objs.push_back(o);
+    }
+  }
+  for (uint32_t so : Scan(0x820118D0)) {
+    objs.push_back(so);
+    uint32_t entry = Ld32(so + 0x2B0);
+    if (entry >= 0x40000000 && entry < 0xC0000000 && IsCommitted(entry)) objs.push_back(entry);
+  }
+  for (uint32_t o : objs) {
+    std::vector<float> now(0x200);
+    for (uint32_t i = 0; i < 0x200; ++i) {
+      uint32_t u = IsCommitted(o + i * 4) ? Ld32(o + i * 4) : 0;
+      memcpy(&now[i], &u, 4);
+    }
+    auto it = last.find(o);
+    if (it != last.end()) {
+      std::string out;
+      for (uint32_t i = 1; i < 0x200; ++i) {
+        float a = it->second[i], b = now[i];
+        if (!std::isfinite(a) || !std::isfinite(b)) continue;
+        bool on = std::fabs(a) < 0.05f && std::fabs(b) > 0.9f && std::fabs(b) <= 1.0f;
+        bool off = std::fabs(b) < 0.05f && std::fabs(a) > 0.9f && std::fabs(a) <= 1.0f;
+        if (on || off) {
+          char buf[48];
+          snprintf(buf, sizeof(buf), " +%X:%.2f>%.2f", i * 4, a, b);
+          out += buf;
+        }
+      }
+      if (!out.empty()) RT_INFO("bot input: %08X (vt %08X):%s", o, Ld32(o), out.substr(0, 600).c_str());
+    }
+    last[o] = std::move(now);
+  }
+}
+
+// BF_BOT_INPUT_WATCH=vt (testing): every 0.1 s, the non-zero floats in the first
+// 0x200 bytes of each object with that vtable, when they changed: a closer look
+// at a candidate input state while a joiner walks, turns and looks.
+void WatchInput(uint32_t vt) {
+  static std::map<uint32_t, std::string> last;
+  for (uint32_t o : Scan(vt)) {
+    std::string out;
+    for (uint32_t off = 4; off < 0x200; off += 4) {
+      uint32_t u = Ld32(o + off);
+      float f;
+      memcpy(&f, &u, 4);
+      if (!std::isfinite(f) || std::fabs(f) < 0.001f || std::fabs(f) > 100.0f) continue;
+      char buf[32];
+      snprintf(buf, sizeof(buf), " +%X:%.2f", off, f);
+      out += buf;
+    }
+    if (out != last[o]) RT_INFO("bot watch %08X:%s", o, out.substr(0, 900).c_str());
+    last[o] = out;
+  }
+}
+
+const bool g_input_watch_started = [] {
+  const char* env = getenv("BF_BOT_INPUT_WATCH");
+  if (!env) return false;
+  uint32_t vt = uint32_t(strtoul(env, nullptr, 16));
+  std::thread([vt] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      WatchInput(vt);
+    }
+  }).detach();
+  return true;
+}();
+
+// BF_BOT_INPUT_HUNT=1 (testing): the whole server memory in three snapshots,
+// taken when the files hunt1, hunt2 and hunt3 appear in the working folder
+// (a joiner walking, stopped, walking again): the words that read 0.5-1.0,
+// then under 0.05, then 0.5-1.0 again are where a player's stick input lives.
+void HuntInput() {
+  std::vector<uint32_t> cand;
+  auto value = [](uint32_t a) {
+    uint32_t u = Ld32(a);
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+  };
+  auto walking = [](float f) { return std::isfinite(f) && f >= 0.5f && f <= 1.01f; };
+  for (int step = 1; step <= 3; ++step) {
+    std::string flag = "hunt" + std::to_string(step);
+    while (!std::filesystem::exists(flag)) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (step == 1) {
+      for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+        if (page >= 0x80000000 && page < 0xA0000000) continue;
+        if (!IsCommitted(uint32_t(page))) continue;
+        for (uint32_t i = 0; i < 0x1000; i += 4)
+          if (walking(value(uint32_t(page) + i))) cand.push_back(uint32_t(page) + i);
+      }
+    } else {
+      std::vector<uint32_t> keep;
+      for (uint32_t a : cand) {
+        if (!IsCommitted(a)) continue;
+        float f = value(a);
+        if (step == 2 ? std::fabs(f) < 0.05f : walking(f)) keep.push_back(a);
+      }
+      cand.swap(keep);
+    }
+    RT_INFO("bot hunt: snapshot %d, %zu candidates", step, cand.size());
+  }
+  std::string out;
+  for (size_t i = 0; i < cand.size() && i < 60; ++i) {
+    uint32_t a = cand[i];
+    // The object it is in: the nearest vtable-looking word below (0x400).
+    uint32_t start = 0, vt = 0;
+    for (uint32_t back = 0; back <= 0x400; back += 4) {
+      uint32_t w = Ld32(a - back);
+      if (w >= 0x82000000 && w < 0x82180000 && Ld32(w) >= 0x82180000 && Ld32(w) < 0x82F00000) {
+        start = a - back, vt = w;
+        break;
+      }
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), " %08X=%.2f(obj %08X vt %08X +%X)", a, value(a), start, vt, a - start);
+    out += buf;
+  }
+  RT_INFO("bot hunt: %s", out.c_str());
+}
+
+const bool g_input_hunt_started = [] {
+  if (!getenv("BF_BOT_INPUT_HUNT")) return false;
+  std::thread(HuntInput).detach();
+  return true;
+}();
+
+const bool g_input_probe_started = [] {
+  if (!getenv("BF_BOT_INPUT_PROBE")) return false;
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      ProbeInput();
+    }
+  }).detach();
+  return true;
+}();
+
 const bool g_census_started = [] {
   if (!getenv("BF_BOT_CENSUS") && !getenv("BF_BOT_PLAYER_DUMP") && !getenv("BF_BOT_DUMP_VT")) return false;
   std::thread([] {
@@ -546,6 +698,13 @@ using namespace rt;
 //   the spawn screen's kit choice; +30 is the team, +104 the soldier once
 //   deployed, +1D0 the chosen spawn point. With the host's kit borrowed, the
 //   fake player deploys: a team 1 soldier at the attackers' spawn.
+// Input (BF_BOT_INPUT_HUNT, then BF_BOT_INPUT_WATCH=82010C98 with a joiner's
+//   stick): a soldier's input state is an object with vtable 82010C98, the
+//   soldier at +4, analog actions as floats: +8 turn, +C look up/down, +14
+//   forward (0.96 for a full stick). The fake soldier has one too, but values
+//   written there before each server update (823D1DD0) are back at 0 by the
+//   next one and the soldier doesn't move: they have to go in where the
+//   server reads them.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -658,7 +817,41 @@ static uint32_t g_fake_conn = 0;  // its connection (vtable 8201B140)
 static uint32_t g_fake_conn_for_replay = 0;  // the same, once its peer is linked
 extern "C" PPC_FUNC(__imp__sub_82332350);
 extern "C" PPC_FUNC(__imp__sub_823D1DD0);
+// The fake player's soldier and its input state (vtable 82010C98, the soldier at
+// +4; analog actions: +8 turn, +C look up/down, +14 forward, as a joiner's
+// stick showed), driven every server update: forward and a gentle turn.
+static uint32_t g_fake_soldier = 0, g_fake_input = 0;
+static void DriveFake() {
+  if (!g_fake_soldier) return;
+  if (!g_fake_input) {
+    for (uint32_t o : Scan(0x82010C98))
+      if (Ld32(o + 4) == g_fake_soldier) g_fake_input = o;
+    static int64_t logged = 0;
+    if (g_fake_input || int64_t(GetTickCount64()) - logged > 5000) {
+      logged = int64_t(GetTickCount64());
+      RT_INFO("bot fake: input state of soldier %08X: %08X", g_fake_soldier, g_fake_input);
+    }
+    if (!g_fake_input) return;
+  }
+  auto set = [](uint32_t a, float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    St32(a, u);
+  };
+  static int64_t last_log = 0;
+  if (int64_t(GetTickCount64()) - last_log > 2000) {
+    last_log = int64_t(GetTickCount64());
+    float fwd, turn;
+    uint32_t u = Ld32(g_fake_input + 0x14), v = Ld32(g_fake_input + 0x8);
+    memcpy(&fwd, &u, 4), memcpy(&turn, &v, 4);
+    RT_INFO("bot fake: before writing: forward %.2f turn %.2f; soldier at %.1f %.1f", fwd, turn,
+            LdF(g_fake_soldier + 0x200), LdF(g_fake_soldier + 0x208));
+  }
+  set(g_fake_input + 0x14, 1.0f);  // forward
+  set(g_fake_input + 0x8, 0.3f);   // turn right
+}
 PPC_FUNC(sub_823D1DD0) {
+  DriveFake();
   __imp__sub_823D1DD0(ctx, base);
   static int64_t host_seen_ms = 0;
   static bool deployed = false;
@@ -712,7 +905,11 @@ PPC_FUNC(sub_823D1DD0) {
   c.r5.u64 = 0x800;
   c.r6.u64 = 0x20;
   RT_INFO("bot fake: deploying (spawn object %08X, %zu soldiers before)", g_fake_spawner, soldiers);
+  std::vector<uint32_t> soldiers_before = Scan(0x820118D0);
   __imp__sub_82332350(c, base);
+  for (uint32_t so : Scan(0x820118D0))
+    if (std::find(soldiers_before.begin(), soldiers_before.end(), so) == soldiers_before.end()) g_fake_soldier = so;
+  RT_INFO("bot fake: its soldier %08X", g_fake_soldier);
   RT_INFO("bot fake: deploy returned r3=%08X, %zu soldiers now", c.r3.u32, Scan(0x820118D0).size());
 }
 extern "C" PPC_FUNC(__imp__sub_82705810);
@@ -879,4 +1076,113 @@ TRACE_VFN(82321820, "+80")
 TRACE_VFN(822FD978, "+84")
 TRACE_VFN(82322508, "+90")
 TRACE_VFN(822F7D50, "+94")
+
+// BF_BOT_CONN_COUNT=1 (testing): how often each of the connection's virtual
+// functions (vtables 8201B140, 8201B134, 8201B124) runs on a connection,
+// logged every 5 s: the per-tick ones carry the client's input.
+static const bool g_conn_count = getenv("BF_BOT_CONN_COUNT") != nullptr;
+static std::atomic<uint32_t> g_conn_calls[64];
+static const char* g_conn_names[64];
+static bool IsConnection(uint32_t o) {
+  if (o < 0x40000000 || o >= 0xC0000000 || !IsCommitted(o)) return false;
+  uint32_t v = Ld32(o);
+  return v == 0x8201B140 || v == 0x8201B134 || v == 0x8201B124;
+}
+#define COUNT_CONN(i, addr)                                                    extern "C" PPC_FUNC(__imp__sub_##addr);                                     PPC_FUNC(sub_##addr) {                                                        if (g_conn_count && IsConnection(ctx.r3.u32)) {                               g_conn_names[i] = #addr;                                                    g_conn_calls[i]++;                                                        }                                                                           __imp__sub_##addr(ctx, base);                                             }
+COUNT_CONN(0, 82325EB0)
+COUNT_CONN(1, 82325EB8)
+COUNT_CONN(2, 82325EC0)
+COUNT_CONN(3, 82349F80)
+COUNT_CONN(4, 8234A350)
+COUNT_CONN(5, 8234A358)
+COUNT_CONN(6, 8234A360)
+COUNT_CONN(7, 8234A468)
+COUNT_CONN(8, 8234A470)
+// Hot on every connection (about 30 a second): every 10th call, r4/r5 and
+// the 16 words they point at (BF_BOT_CONN_COUNT): does a field follow the stick?
+extern "C" PPC_FUNC(__imp__sub_8234A478);
+PPC_FUNC(sub_8234A478) {
+  if (g_conn_count && IsConnection(ctx.r3.u32)) {
+    g_conn_names[9] = "8234A478";
+    if (g_conn_calls[9]++ % 10 == 0) {
+      std::string w;
+      for (uint32_t r : {ctx.r4.u32, ctx.r5.u32}) {
+        w += " |";
+        for (uint32_t k = 0; k < 16 && r >= 0x40000000 && r < 0xC0000000 && IsCommitted(r + k * 4); ++k) {
+          char buf[12];
+          snprintf(buf, sizeof(buf), " %08X", Ld32(r + k * 4));
+          w += buf;
+        }
+      }
+      RT_INFO("bot hot 8234A478 conn %08X r4=%08X r5=%08X r6=%08X:%s", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, w.c_str());
+    }
+  }
+  __imp__sub_8234A478(ctx, base);
+}
+COUNT_CONN(10, 8234A508)
+COUNT_CONN(11, 8234AC08)
+COUNT_CONN(12, 8234AE40)
+COUNT_CONN(13, 8234D900)
+COUNT_CONN(14, 82351920)
+COUNT_CONN(15, 82351D30)
+COUNT_CONN(16, 82354F00)
+COUNT_CONN(17, 82354FD0)
+COUNT_CONN(18, 82355098)
+COUNT_CONN(19, 82355128)
+COUNT_CONN(20, 82358958)
+COUNT_CONN(21, 8235A1E0)
+COUNT_CONN(22, 8235FEE8)
+COUNT_CONN(23, 82364618)
+// Hot on every connection (about 30 a second): every 10th call, r4/r5 and
+// the 16 words they point at (BF_BOT_CONN_COUNT): does a field follow the stick?
+extern "C" PPC_FUNC(__imp__sub_82368478);
+PPC_FUNC(sub_82368478) {
+  if (g_conn_count && IsConnection(ctx.r3.u32)) {
+    g_conn_names[24] = "82368478";
+    if (g_conn_calls[24]++ % 10 == 0) {
+      std::string w;
+      for (uint32_t r : {ctx.r4.u32, ctx.r5.u32}) {
+        w += " |";
+        for (uint32_t k = 0; k < 16 && r >= 0x40000000 && r < 0xC0000000 && IsCommitted(r + k * 4); ++k) {
+          char buf[12];
+          snprintf(buf, sizeof(buf), " %08X", Ld32(r + k * 4));
+          w += buf;
+        }
+      }
+      RT_INFO("bot hot 82368478 conn %08X r4=%08X r5=%08X r6=%08X:%s", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, w.c_str());
+    }
+  }
+  __imp__sub_82368478(ctx, base);
+}
+COUNT_CONN(25, 824BD728)
+COUNT_CONN(26, 8250E7D0)
+COUNT_CONN(27, 825FE488)
+COUNT_CONN(28, 8267A318)
+COUNT_CONN(29, 826F3A68)
+COUNT_CONN(30, 826F3A80)
+COUNT_CONN(31, 826F3A98)
+COUNT_CONN(32, 826F3AD8)
+COUNT_CONN(33, 826F3B00)
+COUNT_CONN(34, 826F3B18)
+COUNT_CONN(35, 826F3BE8)
+COUNT_CONN(36, 826F3BF0)
+COUNT_CONN(37, 826F62B8)
+COUNT_CONN(38, 826F6A28)
+COUNT_CONN(39, 826F9528)
+COUNT_CONN(40, 826FDF08)
+COUNT_CONN(41, 826FF510)
+COUNT_CONN(42, 82701FD0)
+static const bool g_conn_count_started = [] {
+  if (!g_conn_count) return false;
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      std::string out;
+      for (int i = 0; i < 64; ++i)
+        if (uint32_t n = g_conn_calls[i].exchange(0)) out += std::string(" ") + g_conn_names[i] + "=" + std::to_string(n);
+      RT_INFO("bot conn calls (5 s):%s", out.c_str());
+    }
+  }).detach();
+  return true;
+}();
 
