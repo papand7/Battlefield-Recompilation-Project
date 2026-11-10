@@ -64,10 +64,11 @@ package file, or `default.xex` in an unpacked folder), and/or Battlefield: Bad C
 included here.
 
 1. Download **BattlefieldLauncher-<version>.exe** from the
-   [releases](https://github.com/papand7/Battlefield-Recompilation-Project/releases) and start it.
-   There's nothing to unzip: the games are set up in `%LOCALAPPDATA%\BattlefieldRecomp`.
-2. Pick a game at the top. The first time, the launcher sets it up for you: press **Choose game
-   files…**, pick your game package or disc image, then press **INSTALL**. It:
+   [releases](https://github.com/papand7/Battlefield-Recompilation-Project/releases) and put it in
+   a folder together with your game files (the package, the `.iso`, or an unpacked folder). Start
+   it: it finds them by itself and sets the games up in a `BattlefieldRecomp` folder next to it.
+2. Pick a game at the top and press **INSTALL** (or **Choose game files…** first, if your files
+   are somewhere else). It:
    - copies or unpacks your game files and checks that they are the right version,
    - installs the free build tools it needs (LLVM, CMake, Visual Studio C++ build tools,
      Vulkan SDK) through winget,
