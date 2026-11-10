@@ -224,7 +224,8 @@ h2 {
 }
 .ghost:hover { background: rgba(233, 180, 76, .12); }
 .ghost:disabled { opacity: .5; cursor: default; }
-.path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 280px; }
+.pick .ghost { flex: none; white-space: nowrap; }
+.path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
 .steps { list-style: none; margin-bottom: 10px; }
 .steps li { display: flex; align-items: center; gap: 10px; padding: 4px 0; font-size: 13px; color: var(--muted); }
 .steps .dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--line); flex: none; }
