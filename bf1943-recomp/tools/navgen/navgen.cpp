@@ -5,8 +5,10 @@
 // makes ships.
 //
 //   navgen <out.nav> <in.obj>... [--bounds x0 z0 x1 z1] [--cell 0.3] [--obj walkable.obj]
+//          [--radius 0.7] [--climb 0.4]
 //
-// A soldier: radius 0.4 m, height 1.8 m, step 0.5 m, slopes up to 45 degrees.
+// A soldier: radius 0.7 m (3 cells: more than its body, so routes keep clear of wall
+// corners), height 1.8 m, step 0.4 m, slopes up to 45 degrees.
 // Recast's single-mesh pipeline (as its Sample_SoloMesh): voxelise the
 // walkable triangles, filter ledges and low ceilings, erode by the radius,
 // regions (watershed), contours, polygons, the detail mesh, then Detour's
@@ -98,7 +100,7 @@ int main(int argc, char** argv) {
   std::vector<const char*> inputs;
   float bounds[4] = {-1e9f, -1e9f, 1e9f, 1e9f};
   bool have_bounds = false;
-  float cell = 0.3f;
+  float cell = 0.3f, radius = 0.7f, climb = 0.4f;  // in cells: 3 (0.9 m) and 2 (0.4 m)
   const char* walkable_obj = nullptr;
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--bounds") && i + 4 < argc) {
@@ -106,6 +108,10 @@ int main(int argc, char** argv) {
       have_bounds = true;
     } else if (!strcmp(argv[i], "--cell") && i + 1 < argc) {
       cell = float(atof(argv[++i]));
+    } else if (!strcmp(argv[i], "--radius") && i + 1 < argc) {
+      radius = float(atof(argv[++i]));
+    } else if (!strcmp(argv[i], "--climb") && i + 1 < argc) {
+      climb = float(atof(argv[++i]));
     } else if (!strcmp(argv[i], "--obj") && i + 1 < argc) {
       walkable_obj = argv[++i];
     } else {
@@ -120,7 +126,7 @@ int main(int argc, char** argv) {
   if (!ntris) return 1;
 
   // A soldier.
-  const float agent_height = 1.8f, agent_radius = 0.4f, agent_climb = 0.5f, slope = 45.0f;
+  const float agent_height = 1.8f, agent_radius = radius, agent_climb = climb, slope = 45.0f;
   rcConfig cfg{};
   cfg.cs = cell;
   cfg.ch = 0.2f;

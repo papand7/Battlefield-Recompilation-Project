@@ -1322,6 +1322,7 @@ static std::vector<int> RouteNav(int from, int to) {
 // 3 m across, 6 m up and down), A* between them, then the straight path's
 // corners. Without one, the learnt trails.
 static dtNavMesh* g_navmesh = nullptr;
+static void LoadBlocked();
 static dtNavMeshQuery* g_navquery = nullptr;
 static bool LoadNavMesh() {
   static bool tried = false;
@@ -1350,8 +1351,39 @@ static bool LoadNavMesh() {
   g_navquery = dtAllocNavMeshQuery();
   g_navquery->init(g_navmesh, 4096);
   RT_INFO("bot nav: navigation mesh %s (%d bytes)", path.c_str(), size);
+  LoadBlocked();
   return true;
 }
+// Learnt blockers: polygons a bot couldn't get onto (the navigation mesh can
+// be wrong: a ledge it thinks a soldier steps up, a gap he doesn't fit), off
+// for routing (flag 0) and kept in nav/<map>.blocked (one polygon reference
+// per line) for later matches.
+static void LoadBlocked() {
+  FILE* f = fopen(("nav/" + g_host_map + ".blocked").c_str(), "r");
+  if (!f) return;
+  unsigned long long ref;
+  int n = 0;
+  while (fscanf(f, "%llx", &ref) == 1)
+    if (dtStatusSucceed(g_navmesh->setPolyFlags(dtPolyRef(ref), 0))) ++n;
+  fclose(f);
+  RT_INFO("bot nav: %d blocked polygons learnt before", n);
+}
+static void BlockPoly(const float at[3]) {
+  if (!g_navquery) return;
+  dtQueryFilter filter;
+  const float ext[3] = {1.5f, 3, 1.5f};
+  dtPolyRef ref = 0;
+  float p[3];
+  g_navquery->findNearestPoly(at, ext, &filter, &ref, p);
+  if (!ref) return;
+  g_navmesh->setPolyFlags(ref, 0);
+  if (FILE* f = fopen(("nav/" + g_host_map + ".blocked").c_str(), "a")) {
+    fprintf(f, "%llx\n", (unsigned long long)ref);
+    fclose(f);
+  }
+  RT_INFO("bot nav: blocked polygon %llx at %.1f %.1f %.1f", (unsigned long long)ref, p[0], p[1], p[2]);
+}
+
 // The corners of a route from a to b on the navigation mesh (empty if none).
 static std::vector<std::array<float, 3>> RouteMesh(const float a[3], const float b[3]) {
   std::vector<std::array<float, 3>> out;
@@ -1419,6 +1451,16 @@ static void FakeBrain(uint32_t in) {
     route = RouteMesh(from, to);
     if (!route.empty()) {
       RT_INFO("bot nav: navigation mesh route of %zu corners to the crate", route.size());
+      static int corners_logged = 0;
+      if (corners_logged++ < 2) {
+        std::string c;
+        for (auto& q : route) {
+          char buf[48];
+          snprintf(buf, sizeof(buf), " (%.1f %.1f %.1f)", q[0], q[1], q[2]);
+          c += buf;
+        }
+        RT_INFO("bot nav: corners:%s", c.c_str());
+      }
     } else {
       LoadNav();
       float d_bot, d_goal;
@@ -1455,6 +1497,17 @@ static void FakeBrain(uint32_t in) {
     side = -side;
     unstick_until = now + 2000, jump_until = now + 300, since = now;
     RT_INFO("bot brain: stuck at %.1f %.1f: jump and sidestep %s", x, z, side > 0 ? "right" : "left");
+    // Stuck twice near the same spot while following a navigation mesh route:
+    // the corner it was heading for is somewhere it can't get to.
+    static float last_sx = 1e9f, last_sz = 1e9f;
+    if (std::hypot(x - last_sx, z - last_sz) < 3.0f && step < route.size() && g_navquery) {
+      // Where it can't get through: 1.5 m ahead, toward the corner it is heading for.
+      float dx2 = route[step][0] - x, dz2 = route[step][2] - z, l2 = std::max(std::hypot(dx2, dz2), 0.001f);
+      float ahead[3] = {x + 1.5f * dx2 / l2, LdF(so + 0x204), z + 1.5f * dz2 / l2};
+      BlockPoly(ahead);
+      planned = 0;  // plan again now
+    }
+    last_sx = x, last_sz = z;
   }
   if (now < unstick_until) forward = 0.3f, strafe = float(side);
   St32(in + 0x44, now < jump_until ? 0x00003C00u : 0u);
