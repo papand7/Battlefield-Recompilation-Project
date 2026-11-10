@@ -1045,6 +1045,10 @@ using namespace rt;
 //   LB/RB +50, left stick click +58. Writing A's (+44) doesn't make the fake
 //   soldier jump; sidestepping when stuck doesn't get it past the obstacle 26 m
 //   from the crate: it needs routes (the levels' AI pathfinding data).
+//   A press is a bit at +84 as well (A 0x2000, X 0x200000; the record is 0xB8
+//   bytes). Holding X 0.8 m from the first crate for 30 s changes nothing in
+//   the crate's object; interacting probably needs facing it
+//   (PlayerInteractAimAngle), which needs turning.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -1481,7 +1485,7 @@ static void FakeBrain(uint32_t in) {
   float dx = tx - x, dz = tz - z, len = std::max(std::hypot(dx, dz), 0.001f);
   dx /= len, dz /= len;
   float rx = LdF(so + 0x300), rz = LdF(so + 0x308);
-  bool arrived = best < 3.0f && step >= route.size();
+  bool arrived = best < 1.0f && step >= route.size();
   float forward = arrived ? 0.0f : dx * fx + dz * fz;
   float strafe = arrived ? 0.0f : -(dx * rx + dz * rz);  // strafe right is minus the +300 row
   float m = std::max(std::max(std::fabs(forward), std::fabs(strafe)), 0.001f);  // full speed
@@ -1510,7 +1514,45 @@ static void FakeBrain(uint32_t in) {
     last_sx = x, last_sz = z;
   }
   if (now < unstick_until) forward = 0.3f, strafe = float(side);
-  St32(in + 0x44, now < jump_until ? 0x00003C00u : 0u);
+  // A button pressed: its bit at +84 (A 0x2000, X 0x200000) and its held time
+  // (A +44, X +54; half float, low half), as a joiner's pad showed.
+  bool jump = now < jump_until;
+  static int64_t held_x_since = 0;
+  bool at_crate = best < 2.0f;
+  if (at_crate && !held_x_since) held_x_since = now;
+  if (!at_crate) held_x_since = 0;
+  bool arm = at_crate;
+  St32(in + 0x84, (jump ? 0x2000u : 0u) | (arm ? 0x200000u : 0u));
+  St32(in + 0x44, jump ? 0x00003C00u : 0u);
+  St32(in + 0x54, arm ? 0x00003C00u : 0u);
+  // At the crate: what of its first 0x200 bytes changes while X is held.
+  static uint32_t watched = 0;
+  static std::vector<uint32_t> before_arm;
+  if (arm) {
+    uint32_t crate = 0;
+    for (uint32_t c : Scan(0x82013AF0))
+      if (std::hypot(LdF(c + 0xC0) - x, LdF(c + 0xC8) - z) < 3.0f) crate = c;
+    if (crate && crate != watched) {
+      watched = crate;
+      before_arm.assign(0x80, 0);
+      for (uint32_t k = 0; k < 0x80; ++k) before_arm[k] = Ld32(crate + 4 * k);
+      RT_INFO("bot brain: at crate %08X, holding X", crate);
+    }
+    static int64_t last_diff = 0;
+    if (crate && crate == watched && now - last_diff > 2000) {
+      last_diff = now;
+      std::string d;
+      for (uint32_t k = 0; k < 0x80; ++k) {
+        uint32_t v = Ld32(crate + 4 * k);
+        if (v != before_arm[k]) {
+          char buf[40];
+          snprintf(buf, sizeof(buf), " +%X:%08X>%08X", 4 * k, before_arm[k], v);
+          d += buf;
+        }
+      }
+      RT_INFO("bot brain: crate %08X after %lld ms of X:%s", crate, (long long)(now - held_x_since), d.c_str());
+    }
+  }
   set(0x8, forward);
   set(0xC, strafe);
   set(0x1C, turn);
@@ -1564,7 +1606,7 @@ PPC_FUNC(sub_821BF2A8) {
   if (map_input && IsCommitted(r4) && Ld32(r4) == 0x8200DC48) {
     static std::map<uint32_t, std::string> last;
     std::string w;
-    for (uint32_t k = 1; k < 24; ++k) {
+    for (uint32_t k = 1; k < 64; ++k) {  // the first 0x100 bytes
       uint32_t u = Ld32(r4 + k * 4);
       if (!u) continue;
       float f;
