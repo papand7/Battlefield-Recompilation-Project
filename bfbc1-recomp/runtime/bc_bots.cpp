@@ -296,6 +296,11 @@ using namespace rt;
 //   -> ServerSoldierSpawnEntity +90 (82322508: r4 the spawn transform, r6
 //   the spawn entity) -> the soldier factory. So the AI asks a soldier spawn
 //   entity for its soldier. Multiplayer soldiers have no squad.
+//   82638400's r5 is the spawn request: an id, a flag, -1, then among others
+//   the soldier's SensingTemplateData and BehaviourTemplateData (its AI
+//   templates). The campaign level has 12 and 14 of those; the multiplayer
+//   levels only their type definitions (Valley Run checked), so an AI soldier
+//   there needs templates from elsewhere.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -347,8 +352,38 @@ PPC_FUNC(sub_822BDCB8) {
             r3, vt(r3), r4, vt(r4), r5, vt(r5), r6, made, vt(made));
   }
 }
-// The AI squad hub (makes squads and squad members) and its three callers.
-#define TRACE_AI(addr, label)                                                            PPC_FUNC(sub_##addr) {                                                                   if (g_trace) {                                                                           static int n = 0;                                                                      if (n++ < 40)                                                                            RT_INFO("bot trace: %s %s r3=%08X(%s) r4=%08X(%s) r5=%08X(%s) r6=%08X", label, #addr,                 ctx.r3.u32, TypeName(ctx.r3.u32).c_str(), ctx.r4.u32, TypeName(ctx.r4.u32).c_str(),                 ctx.r5.u32, TypeName(ctx.r5.u32).c_str(), ctx.r6.u32);                     }                                                                                      __imp__sub_##addr(ctx, base);                                                        }
+// Logs an AI call: each argument with its vtable and type name, and the first
+// 12 words of the r4/r5 records with the type names they point at.
+static void TraceAi(const char* label, PPCContext& ctx) {
+  auto one = [](uint32_t v) {
+    std::string tn = TypeName(v);
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%08X(vt %08X%s%s)", v, Vt(v), tn.empty() ? "" : " ", tn.c_str());
+    return std::string(buf);
+  };
+  RT_INFO("bot trace: %s r3=%s r4=%s r5=%s r6=%08X", label, one(ctx.r3.u32).c_str(), one(ctx.r4.u32).c_str(),
+          one(ctx.r5.u32).c_str(), ctx.r6.u32);
+  for (uint32_t r : {ctx.r4.u32, ctx.r5.u32}) {
+    std::string w;
+    for (uint32_t k = 0; k < 12 && r >= 0x40000000 && r < 0xC0000000 && IsCommitted(r + k * 4); ++k) {
+      uint32_t v = Ld32(r + k * 4);
+      std::string tn = TypeName(v);
+      char buf[80];
+      snprintf(buf, sizeof(buf), " %08X%s%s", v, tn.empty() ? "" : ":", tn.c_str());
+      w += buf;
+    }
+    if (!w.empty()) RT_INFO("bot trace:   %08X =%s", r, w.c_str());
+  }
+}
+// The AI squad hub (makes squads and squad members) and its callers.
+#define TRACE_AI(addr, label)                      \
+  PPC_FUNC(sub_##addr) {                           \
+    if (g_trace) {                                 \
+      static int n = 0;                            \
+      if (n++ < 40) TraceAi(label " " #addr, ctx); \
+    }                                              \
+    __imp__sub_##addr(ctx, base);                  \
+  }
 extern "C" PPC_FUNC(__imp__sub_8264DA80);
 extern "C" PPC_FUNC(__imp__sub_82614F78);
 extern "C" PPC_FUNC(__imp__sub_82638400);
