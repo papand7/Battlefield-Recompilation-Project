@@ -2,9 +2,15 @@
 the games from the player's own copies (launcher/setup.js). Nothing of the
 games goes in: no game files, no recompiled code.
 
-  python tools/make_release.py [out_dir] [--zip]
+  python tools/make_release.py [out_dir]                 one exe (default)
+  python tools/make_release.py [out_dir] --folder [--zip]  a folder
 
-out_dir (default build/release/BF1943-PC):
+One exe (default out_dir build/release): BattlefieldLauncher-<version>.exe,
+electron-builder's portable target (npm run dist in launcher/) with src/ and
+src-bfbc1/ below inside it (staged in build/release_sources); it installs
+under %LOCALAPPDATA%/BattlefieldRecomp (launcher/main.js).
+
+A folder (default out_dir build/release/BF1943-PC):
   Launcher/        the packed launcher (npm run pack in launcher/)
   src/             this tree's sources (Battlefield 1943 and the code both games
                    share), the compiled shaders (build/xenia_shaders, so players
@@ -56,9 +62,8 @@ def copy_tree(src_root, dst_root, skip=SKIP):
             shutil.copy2(os.path.join(dirpath, f), os.path.join(dst_root, rel))
 
 
-def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('--')]
-    out = os.path.abspath(args[0] if args else os.path.join(ROOT, 'build', 'release', 'BF1943-PC'))
+def stage(out):
+    """The build trees: <out>/src and <out>/src-bfbc1."""
     if os.path.exists(out):
         shutil.rmtree(out)
     src = os.path.join(out, 'src')
@@ -83,11 +88,30 @@ def main():
     os.makedirs(os.path.join(src, 'tools', 'bin'), exist_ok=True)
     shutil.copy2(recomp, os.path.join(src, 'tools', 'bin', 'XenonRecomp.exe'))
 
-    print('launcher -> Launcher/')
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
     launcher = os.path.join(ROOT, 'launcher')
+    if '--folder' not in sys.argv:
+        out = os.path.abspath(args[0] if args else os.path.join(ROOT, 'build', 'release'))
+        stage(os.path.join(ROOT, 'build', 'release_sources'))  # launcher/package.json extraResources
+        print('launcher -> one exe')
+        dist = os.path.join(launcher, 'dist')
+        if os.path.exists(dist):
+            shutil.rmtree(dist)
+        subprocess.run('npm run dist', cwd=launcher, shell=True, check=True)
+        os.makedirs(out, exist_ok=True)
+        for f in os.listdir(dist):
+            if f.startswith('BattlefieldLauncher-') and f.endswith('.exe'):
+                shutil.copy2(os.path.join(dist, f), os.path.join(out, f))
+                print('done:', os.path.join(out, f))
+        return
+
+    out = os.path.abspath(args[0] if args else os.path.join(ROOT, 'build', 'release', 'BF1943-PC'))
+    stage(out)
+    print('launcher -> Launcher/')
     subprocess.run('npm run pack', cwd=launcher, shell=True, check=True)
     shutil.copytree(os.path.join(launcher, 'dist', 'BF1943Launcher-win32-x64'), os.path.join(out, 'Launcher'))
-
     with open(os.path.join(out, 'README.txt'), 'w', encoding='utf-8') as f:
         f.write('Battlefield 1943 and Battlefield: Bad Company for PC\n\n'
                 'Start Launcher\\BF1943Launcher.exe and pick a game at the top. The first time, it\n'

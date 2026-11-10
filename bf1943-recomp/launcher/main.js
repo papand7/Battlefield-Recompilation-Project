@@ -19,10 +19,28 @@ const defaults = {
   game: 'bf1943',       // which tab: bf1943 | bfbc1
 };
 
-// The launcher may sit next to the game or anywhere above the build folders.
+// The single-exe release (electron-builder portable) runs from a temporary
+// folder each time, with the build trees inside (resources/source): the games
+// are built and installed under %LOCALAPPDATA%\BattlefieldRecomp instead, and
+// the build trees are copied there when this version first starts.
+const bundled = app.isPackaged ? path.join(process.resourcesPath, 'source') : null;
+const installRoot = bundled && fs.existsSync(path.join(bundled, 'src'))
+  ? path.join(process.env.LOCALAPPDATA || app.getPath('appData'), 'BattlefieldRecomp') : null;
+function prepareSources() {
+  if (!installRoot) return;
+  const stamp = path.join(installRoot, 'src', '.launcher-version');
+  if (fs.existsSync(stamp) && fs.readFileSync(stamp, 'utf8') === app.getVersion()) return;
+  for (const tree of ['src', 'src-bfbc1'])  // over an older copy: its builds stay
+    fs.cpSync(path.join(bundled, tree), path.join(installRoot, tree), { recursive: true, force: true });
+  fs.writeFileSync(stamp, app.getVersion());
+}
+prepareSources();
+
+// The launcher may sit next to the game or anywhere above the build folders
+// (or the install folder above, for the single exe).
 function parents() {
   const out = [];
-  for (const start of [app.isPackaged ? path.dirname(process.execPath) : __dirname]) {
+  for (const start of [installRoot || (app.isPackaged ? path.dirname(process.execPath) : __dirname)]) {
     for (let d = start; ; d = path.dirname(d)) {
       out.push(d);
       if (path.dirname(d) === d) break;
@@ -59,7 +77,9 @@ const scanGames = () => ({
   },
 });
 let games = scanGames();
-const launcherDir = app.isPackaged ? path.dirname(process.execPath) : __dirname;
+// setup.js finds the build trees next to this folder (<root>/src, <root>/src-bfbc1).
+const launcherDir = installRoot ? path.join(installRoot, 'Launcher')
+  : app.isPackaged ? path.dirname(process.execPath) : __dirname;
 function problem(g) {
   return !g.exe ? `${g.title}: exe not found next to the launcher.`
        : !g.data ? `${g.title}: game files (${g.dataHint}) not found.` : null;
