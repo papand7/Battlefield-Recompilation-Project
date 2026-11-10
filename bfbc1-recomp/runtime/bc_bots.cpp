@@ -8,6 +8,18 @@
 // vtable has it in slot 2, as in bf1943 (whose soldier vtable 82013A40 has
 // its getType 822ED958 at +8).
 //
+// Confirmed on Valley Run (BF_AUTO_MP walk/turn/look steps, two players):
+//   soldier: team +48 (1 attackers, 2 defenders), position +200/+204/+208
+//     (copies at +330 and +370), world matrix rows at +300 (right), +310 (up),
+//     +320 (forward: walking moves along (+320, +328) in x/z); +148 counts up.
+//     Pitch isn't in it or in the objects it points at (looking up changed
+//     nothing there; *(+A8) is scratch that changes every time).
+//   vehicle: kind name *(*(+14) + C) as in bf1943 (Humvee, M3A3, Pbl, KORD,
+//     Howitzer).
+//   capture point: owner +80, position *(+14) + 60 as in bf1943; in Gold Rush
+//     the teams' bases (the attackers' owned by 1).
+//   mission objective: 8 on Valley Run, likely the gold crates (not read yet).
+//
 // BF_BOT_SCAN=1 (testing): every 10 s, logs how many live objects of each kind
 // there are, and for the soldiers the words that look like a team (1 or 2) and
 // float triplets that look like a world position, to find the fields to read.
@@ -17,6 +29,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -77,6 +90,56 @@ void DescribeFields(const char* kind, uint32_t o) {
   RT_INFO("bot scan: %s %08X positions:%s", kind, o, positions.substr(0, 600).c_str());
 }
 
+// The soldier's float fields that changed since the last scan (its first
+// 0x800 bytes): moving and turning it shows which are its position and aim.
+void LogChanges(uint32_t o) {
+  static std::map<uint32_t, std::vector<uint32_t>> seen;  // per soldier
+  std::vector<uint32_t> now(0x200);
+  for (uint32_t i = 0; i < 0x200; ++i) now[i] = IsCommitted(o + i * 4) ? Ld32(o + i * 4) : 0;
+  auto it = seen.find(o);
+  if (it != seen.end()) {
+    const std::vector<uint32_t>& last = it->second;
+    std::string changes;
+    for (uint32_t i = 1; i < 0x200 && changes.size() < 900; ++i) {
+      if (now[i] == last[i]) continue;
+      float a, b;
+      memcpy(&a, &last[i], 4), memcpy(&b, &now[i], 4);
+      if (!std::isfinite(a) || !std::isfinite(b) || std::fabs(a) > 1e5f || std::fabs(b) > 1e5f ||
+          std::fabs(a - b) < 0.01f)
+        continue;
+      char buf[64];
+      snprintf(buf, sizeof(buf), " +%X:%.2f>%.2f", i * 4, a, b);
+      changes += buf;
+    }
+    RT_INFO("bot scan: soldier %08X changed:%s", o, changes.c_str());
+  }
+  seen[o] = now;
+  // The objects it points at (aim, components): their float fields that changed.
+  static std::map<uint64_t, std::vector<uint32_t>> parts;  // (soldier offset, object) -> words
+  std::string part_changes;
+  for (uint32_t i = 1; i < 0x200; ++i) {
+    uint32_t q = now[i];
+    if (q < 0x40000000 || q >= 0xC0000000 || (q & 3) || !IsCommitted(q) || !IsCommitted(q + 0x7FC)) continue;
+    std::vector<uint32_t> words(0x200);
+    for (uint32_t j = 0; j < 0x200; ++j) words[j] = Ld32(q + j * 4);
+    uint64_t key = uint64_t(i) << 32 | q;
+    auto pit = parts.find(key);
+    if (pit != parts.end())
+      for (uint32_t j = 1; j < 0x200 && part_changes.size() < 1500; ++j) {
+        float a, b;
+        memcpy(&a, &pit->second[j], 4), memcpy(&b, &words[j], 4);
+        if (!std::isfinite(a) || !std::isfinite(b) || std::fabs(a) > 1e5f || std::fabs(b) > 1e5f ||
+            std::fabs(a - b) < 0.01f)
+          continue;
+        char buf[80];
+        snprintf(buf, sizeof(buf), " *(+%X)+%X:%.2f>%.2f", i * 4, j * 4, a, b);
+        part_changes += buf;
+      }
+    parts[key] = std::move(words);
+  }
+  if (!part_changes.empty()) RT_INFO("bot scan: soldier %08X parts changed:%s", o, part_changes.c_str());
+}
+
 const bool g_scan_started = [] {
   if (!getenv("BF_BOT_SCAN")) return false;
   std::thread([] {
@@ -85,7 +148,10 @@ const bool g_scan_started = [] {
       std::string counts;
       for (const Kind& k : kKinds) counts += std::string(" ") + k.name + "=" + std::to_string(Scan(k.vtable).size());
       RT_INFO("bot scan:%s", counts.c_str());
-      for (uint32_t o : Scan(kKinds[0].vtable)) DescribeFields("soldier", o);
+      for (uint32_t o : Scan(kKinds[0].vtable)) {
+        DescribeFields("soldier", o);
+        LogChanges(o);
+      }
       for (uint32_t o : Scan(kKinds[2].vtable)) DescribeFields("tactical objective", o);
       for (uint32_t o : Scan(kKinds[3].vtable)) DescribeFields("mission objective", o);
       // Capture points as bf1943 reads them: owner +80, position *(+14) + 60.

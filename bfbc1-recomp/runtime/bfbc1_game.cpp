@@ -46,8 +46,13 @@ void ApplyShadowSettings() {}
 std::string StartBotDirector(int) { return {}; }
 void SetBotSlot(const std::string&, int) {}
 bool BotLookAxis(int, float&) { return false; }
+// Sticks held by the test automation (BF_AUTO_MP "walk", "turn" and "look" steps).
+static std::atomic<int16_t> g_auto_ly{0}, g_auto_rx{0}, g_auto_ry{0};
 // The pad, every poll: our Multiplayer menu (bc_mp_menu.cpp) takes it while open.
 bool AddBotInput(XINPUT_GAMEPAD& pad) {
+  if (int16_t v = g_auto_ly.load()) pad.sThumbLY = v;
+  if (int16_t v = g_auto_rx.load()) pad.sThumbRX = v;
+  if (int16_t v = g_auto_ry.load()) pad.sThumbRY = v;
   if (bcmp::Update(pad)) pad = {};
   return false;
 }
@@ -195,6 +200,15 @@ static const bool g_auto_mp_started = [] {
                    : name == "a" ? XINPUT_GAMEPAD_A : name == "b" ? XINPUT_GAMEPAD_B
                    : name == "start" ? XINPUT_GAMEPAD_START : 0;
         if (name == "wait") std::this_thread::sleep_for(std::chrono::seconds(3));
+        if (name == "walk" || name == "turn" || name == "look") {
+          // left stick forward 2 s / right stick right or up 0.5 s
+          auto& stick = name == "walk" ? g_auto_ly : name == "turn" ? g_auto_rx : g_auto_ry;
+          stick = 32000;
+          std::this_thread::sleep_for(std::chrono::milliseconds(name == "walk" ? 2000 : 500));
+          stick = 0;
+          RT_INFO("auto mp: %s (step %zu)", name.c_str(), done);
+          continue;
+        }
         if (!b) continue;
         press(b, 150);  // long enough for the menu to see it at ~40 fps (two instances)
         RT_INFO("auto mp: pressed %s (step %zu)", name.c_str(), done);
