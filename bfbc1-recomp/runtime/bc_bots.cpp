@@ -715,7 +715,11 @@ using namespace rt;
 //   (with or without the held values) doesn't turn the fake soldier: its
 //   heading (written by 822757E8 in the soldier update 822C2C38, seen with
 //   BF_BOT_WATCH_HEADING) comes from somewhere else, not found yet (the yaw
-//   BF_BOT_FIND_YAW matched once was a coincidence).
+//   BF_BOT_FIND_YAW matched once was a coincidence). 822757E8 only copies a
+//   ready matrix in. Without turning, the brain moves with forward and strafe
+//   (the direction split along the forward row +320/+328 and the right row
+//   +300/+308; strafe right is minus that row): from the spawn the fake
+//   soldier went from 165 m to 27 m from the first crate, then got stuck.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -919,8 +923,17 @@ static void FakeBrain(uint32_t in) {
   while (diff > 3.14159265f) diff -= 6.2831853f;
   while (diff < -3.14159265f) diff += 6.2831853f;
   float turn = std::clamp(-diff * 2.0f, -1.0f, 1.0f);
-  float forward = best < 3.0f ? 0.0f : std::fabs(diff) < 1.0f ? 1.0f : 0.3f;
+  // Turning doesn't work yet: move toward the target with forward and strafe
+  // instead, its direction split along the soldier's forward and right rows.
+  float dx = tx - x, dz = tz - z, len = std::max(std::hypot(dx, dz), 0.001f);
+  dx /= len, dz /= len;
+  float rx = LdF(so + 0x300), rz = LdF(so + 0x308);
+  float forward = best < 3.0f ? 0.0f : dx * fx + dz * fz;
+  float strafe = best < 3.0f ? 0.0f : -(dx * rx + dz * rz);  // strafe right is minus the +300 row
+  float m = std::max(std::max(std::fabs(forward), std::fabs(strafe)), 0.001f);  // full speed
+  forward /= m, strafe /= m;
   set(0x8, forward);
+  set(0xC, strafe);
   set(0x1C, turn);
   // The server takes a remote soldier's heading from a stored yaw (minus the
   // heading: *(*(soldier + C)) + 198, BF_BOT_FIND_YAW), not from the turn input:
@@ -948,8 +961,8 @@ static void FakeBrain(uint32_t in) {
   static int64_t last = 0;
   if (int64_t(GetTickCount64()) - last > 2000) {
     last = int64_t(GetTickCount64());
-    RT_INFO("bot brain: at %.1f %.1f, crate at %.1f %.1f, %.1f m, off by %.0f deg, turn %.2f forward %.1f", x, z, tx, tz,
-            best, diff * 57.3f, turn, forward);
+    RT_INFO("bot brain: at %.1f %.1f, crate at %.1f %.1f, %.1f m, off by %.0f deg, forward %.2f strafe %.2f", x, z, tx,
+            tz, best, diff * 57.3f, forward, strafe);
   }
 }
 
