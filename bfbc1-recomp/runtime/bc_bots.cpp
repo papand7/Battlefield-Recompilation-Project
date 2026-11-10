@@ -18,7 +18,11 @@
 //     Howitzer).
 //   capture point: owner +80, position *(+14) + 60 as in bf1943; in Gold Rush
 //     the teams' bases (the attackers' owned by 1).
-//   mission objective: 8 on Valley Run, likely the gold crates (not read yet).
+//   mission objective: the gold crates. On Valley Run 8 objects of 0xD0 bytes
+//     side by side, position +C0 (= *(+14) + 60, as for capture points), in
+//     4 pairs about 5 m apart, one pair per base (-297,123,-177 / -302 by the
+//     attackers' first target; then -286/-281,147,-4; -117/-122,139,19;
+//     28/33,145,9). Their state (active, armed, destroyed) isn't read yet.
 //
 // BF_BOT_SCAN=1 (testing): every 10 s, logs how many live objects of each kind
 // there are, and for the soldiers the words that look like a team (1 or 2) and
@@ -153,7 +157,13 @@ const bool g_scan_started = [] {
         LogChanges(o);
       }
       for (uint32_t o : Scan(kKinds[2].vtable)) DescribeFields("tactical objective", o);
-      for (uint32_t o : Scan(kKinds[3].vtable)) DescribeFields("mission objective", o);
+      for (uint32_t o : Scan(kKinds[3].vtable)) {
+        DescribeFields("mission objective", o);
+        uint32_t spatial = Ld32(o + 0x14);
+        if (IsCommitted(spatial))
+          RT_INFO("bot scan: mission objective %08X *(+14)+60: %.1f %.1f %.1f", o, LdF(spatial + 0x60),
+                  LdF(spatial + 0x64), LdF(spatial + 0x68));
+      }
       // Capture points as bf1943 reads them: owner +80, position *(+14) + 60.
       for (uint32_t o : Scan(kKinds[4].vtable)) {
         uint32_t spatial = Ld32(o + 0x14);
