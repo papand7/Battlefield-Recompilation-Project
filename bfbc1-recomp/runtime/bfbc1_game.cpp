@@ -205,6 +205,17 @@ static const bool g_auto_mp_started = [] {
                    : name == "a" ? XINPUT_GAMEPAD_A : name == "b" ? XINPUT_GAMEPAD_B
                    : name == "start" ? XINPUT_GAMEPAD_START : 0;
         if (name == "wait") std::this_thread::sleep_for(std::chrono::seconds(3));
+        if (name.rfind("hold:", 0) == 0) {  // hold:<a|b|x|y|lb|rb|ls|rs|back> 1.5 s
+          std::string btn = name.substr(5);
+          uint16_t bits = btn == "a" ? XINPUT_GAMEPAD_A : btn == "b" ? XINPUT_GAMEPAD_B
+                        : btn == "x" ? XINPUT_GAMEPAD_X : btn == "y" ? XINPUT_GAMEPAD_Y
+                        : btn == "lb" ? XINPUT_GAMEPAD_LEFT_SHOULDER : btn == "rb" ? XINPUT_GAMEPAD_RIGHT_SHOULDER
+                        : btn == "ls" ? XINPUT_GAMEPAD_LEFT_THUMB : btn == "rs" ? XINPUT_GAMEPAD_RIGHT_THUMB
+                        : btn == "back" ? XINPUT_GAMEPAD_BACK : 0;
+          press(bits, 1500);
+          RT_INFO("auto mp: %s (step %zu)", name.c_str(), done);
+          continue;
+        }
         if (name == "strafe" || name == "fire") {  // left stick right / right trigger, 1 s
           if (name == "strafe") g_auto_lx = 32000; else g_auto_rt = 255;
           std::this_thread::sleep_for(std::chrono::seconds(1));

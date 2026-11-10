@@ -720,6 +720,11 @@ using namespace rt;
 //   (the direction split along the forward row +320/+328 and the right row
 //   +300/+308; strafe right is minus that row): from the spawn the fake
 //   soldier went from 165 m to 27 m from the first crate, then got stuck.
+//   Buttons (hold:<button> automation steps with a joiner) show only as held
+//   times (half floats, low half) at +40..+58: A +44, B +48/+4C, X +54, Y +40,
+//   LB/RB +50, left stick click +58. Writing A's (+44) doesn't make the fake
+//   soldier jump; sidestepping when stuck doesn't get it past the obstacle 26 m
+//   from the crate: it needs routes (the levels' AI pathfinding data).
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -932,6 +937,20 @@ static void FakeBrain(uint32_t in) {
   float strafe = best < 3.0f ? 0.0f : -(dx * rx + dz * rz);  // strafe right is minus the +300 row
   float m = std::max(std::max(std::fabs(forward), std::fabs(strafe)), 0.001f);  // full speed
   forward /= m, strafe /= m;
+  // Stuck (under 0.3 m in 1.5 s while trying to move): jump (A: its held time
+  // at +44, low half) and go sideways for 2 s.
+  static float sx = 0, sz = 0;
+  static int64_t since = 0, unstick_until = 0, jump_until = 0;
+  static int side = 1;
+  int64_t now = int64_t(GetTickCount64());
+  if (std::hypot(x - sx, z - sz) > 0.3f) sx = x, sz = z, since = now;
+  if (best >= 3.0f && now - since > 1500 && now > unstick_until) {
+    side = -side;
+    unstick_until = now + 2000, jump_until = now + 300, since = now;
+    RT_INFO("bot brain: stuck at %.1f %.1f: jump and sidestep %s", x, z, side > 0 ? "right" : "left");
+  }
+  if (now < unstick_until) forward = 0.3f, strafe = float(side);
+  St32(in + 0x44, now < jump_until ? 0x00003C00u : 0u);
   set(0x8, forward);
   set(0xC, strafe);
   set(0x1C, turn);
@@ -961,8 +980,8 @@ static void FakeBrain(uint32_t in) {
   static int64_t last = 0;
   if (int64_t(GetTickCount64()) - last > 2000) {
     last = int64_t(GetTickCount64());
-    RT_INFO("bot brain: at %.1f %.1f, crate at %.1f %.1f, %.1f m, off by %.0f deg, forward %.2f strafe %.2f", x, z, tx,
-            tz, best, diff * 57.3f, forward, strafe);
+    RT_INFO("bot brain: at %.1f %.1f height %.1f, crate at %.1f %.1f, %.1f m, forward %.2f strafe %.2f", x, z,
+            LdF(so + 0x204), tx, tz, best, forward, strafe);
   }
 }
 
