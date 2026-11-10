@@ -28,6 +28,7 @@
 // there are, and for the soldiers the words that look like a team (1 or 2) and
 // float triplets that look like a world position, to find the fields to read.
 #include "kernel.h"
+#include "../../bf1943-recomp/tools/msvc_compat/crash_diag.h"  // PrintStack
 
 #include <algorithm>
 #include <chrono>
@@ -535,6 +536,16 @@ using namespace rt;
 //   comes later, from the network. BF_BOT_FAKE does the join, that call (index
 //   7) and the link: the fake player then stays (two player objects and
 //   connections with the host's, 4 minutes, no crash) and gets no traffic.
+// Deploying (BF_BOT_STACK on the soldier factory: the call chain): the
+//   player's message (8235FBD0 on its connection) -> 82332350 on its spawn
+//   object (vtable 82019490; r4 the spawn point, 0 for any of its team's,
+//   r5 0x800, r6 0x20) -> 823207F0 -> ... -> the soldier factory. The spawn
+//   object comes from the client's message after the join (82359A58 on the
+//   connection, r5 0x21): replaying the host's on the fake connection makes
+//   one. 82332350 needs +1D4 (SoldierEntityData) and +1D8 (SoldierWeaponData),
+//   the spawn screen's kit choice; +30 is the team, +104 the soldier once
+//   deployed, +1D0 the chosen spawn point. With the host's kit borrowed, the
+//   fake player deploys: a team 1 soldier at the attackers' spawn.
 //
 // BF_BOT_TRACE=1 (testing): calls to ServerSoldierSpawnEntity's own virtual
 // functions (the ones it overrides from ServerSpawnEntity), the first 30 of each
@@ -567,6 +578,14 @@ extern "C" PPC_FUNC(__imp__sub_822F5ED8);
 PPC_FUNC(sub_822F5ED8) {
   uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32;
   auto vt = [](uint32_t o) { return o >= 0x40000000 && o < 0xC0000000 && IsCommitted(o) ? Ld32(o) : 0u; };
+  // BF_BOT_STACK=1: the call stack of the first 3 soldiers made (the recompiled
+  // functions' names: the guest call chain, virtual calls included).
+  static const bool stack = getenv("BF_BOT_STACK") != nullptr;
+  static int stacks = 0;
+  if (stack && stacks++ < 3) {
+    RT_INFO("bot stack: soldier factory, call %d", stacks);
+    bf_crash_diag::PrintStack(nullptr);
+  }
   __imp__sub_822F5ED8(ctx, base);
   if (g_trace) {
     uint32_t made = ctx.r3.u32;
@@ -630,6 +649,72 @@ TRACE_AI(82358908, "player obj caller 1 (virtual)")
 TRACE_AI(8235FD08, "player obj caller 2")
 // The join call itself: dump the object it gets (r4), 0x100 bytes, with the
 // type names and text its words point at, and the stack record (r5).
+// BF_BOT_FAKE: the fake player's per-player spawn object (vtable 82019490),
+// and its deploy from the server update a few seconds after the host's
+// soldier exists: 82332350 on it, with the host's deploy's arguments
+// (1, 0x800, 0x1E), as the player's deploy message does (8235FBD0).
+static uint32_t g_fake_spawner = 0;
+static uint32_t g_fake_conn = 0;  // its connection (vtable 8201B140)
+static uint32_t g_fake_conn_for_replay = 0;  // the same, once its peer is linked
+extern "C" PPC_FUNC(__imp__sub_82332350);
+extern "C" PPC_FUNC(__imp__sub_823D1DD0);
+PPC_FUNC(sub_823D1DD0) {
+  __imp__sub_823D1DD0(ctx, base);
+  static int64_t host_seen_ms = 0;
+  static bool deployed = false;
+  if (!g_fake_conn || deployed) return;
+  static int64_t last_check = 0;
+  int64_t now = int64_t(GetTickCount64());
+  if (now - last_check < 1000) return;
+  last_check = now;
+  if (!host_seen_ms) {
+    if (!Scan(0x820118D0).empty()) host_seen_ms = now;
+    return;
+  }
+  if (now - host_seen_ms < 5000) return;
+  deployed = true;
+  // The spawn objects and which connection (vtable 8201B140) each points to
+  // within its first 0x400 bytes; the fake player's is the one pointing at its
+  // connection.
+  for (uint32_t o : Scan(0x82019490)) {
+    std::string links;
+    for (uint32_t off = 0; off < 0x400; off += 4) {
+      uint32_t v = Ld32(o + off);
+      if (v >= 0x40000000 && v < 0xC0000000 && IsCommitted(v) && Ld32(v) == 0x8201B140) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), " +%X->conn %08X%s", off, v, v == g_fake_conn ? "(fake)" : "");
+        links += buf;
+
+      }
+    }
+    RT_INFO("bot fake: spawn object %08X:%s +30=%08X +104=%08X +158=%02X +1D0=%08X +1D4=%08X +1D8=%08X", o,
+            links.c_str(), Ld32(o + 0x30), Ld32(o + 0x104), *G<uint8_t>(o + 0x158), Ld32(o + 0x1D0), Ld32(o + 0x1D4),
+            Ld32(o + 0x1D8));
+  }
+  if (!g_fake_spawner) {
+    RT_INFO("bot fake: no spawn object for the fake player");
+    return;
+  }
+  // The deploy needs +1D4 (with +1D8 and the spawn point at +1D0): what a real
+  // client's spawn screen choices (kit) fill in. Borrowed from the host's.
+  for (uint32_t o : Scan(0x82019490)) {
+    if (o == g_fake_spawner || !Ld32(o + 0x1D4)) continue;
+    RT_INFO("bot fake: taking the host's choices: +1D4 %08X(%s) +1D8 %08X(%s)", Ld32(o + 0x1D4),
+            TypeName(Ld32(o + 0x1D4)).c_str(), Ld32(o + 0x1D8), TypeName(Ld32(o + 0x1D8)).c_str());
+    St32(g_fake_spawner + 0x1D4, Ld32(o + 0x1D4));
+    St32(g_fake_spawner + 0x1D8, Ld32(o + 0x1D8));
+    break;
+  }
+  size_t soldiers = Scan(0x820118D0).size();
+  PPCContext c = ctx;
+  c.r3.u64 = g_fake_spawner;
+  c.r4.u64 = 0;  // no spawn point: the game picks one of the player's team's
+  c.r5.u64 = 0x800;
+  c.r6.u64 = 0x20;
+  RT_INFO("bot fake: deploying (spawn object %08X, %zu soldiers before)", g_fake_spawner, soldiers);
+  __imp__sub_82332350(c, base);
+  RT_INFO("bot fake: deploy returned r3=%08X, %zu soldiers now", c.r3.u32, Scan(0x820118D0).size());
+}
 extern "C" PPC_FUNC(__imp__sub_82705810);
 PPC_FUNC(sub_82364C78) {
   if (g_trace) {
@@ -690,9 +775,15 @@ PPC_FUNC(sub_82364C78) {
     PPCContext c = ctx;
     c.r4.u64 = copy;
     std::vector<uint32_t> before = Scan(0x8201B140);
+    std::vector<uint32_t> spawn_before = Scan(0x82019490);
     RT_INFO("bot fake: joining a player at 127.0.0.1:1599 (record %08X)", copy);
     __imp__sub_82364C78(c, base);
     RT_INFO("bot fake: join returned r3=%08X", c.r3.u32);
+    for (uint32_t o : Scan(0x82019490))
+      if (std::find(spawn_before.begin(), spawn_before.end(), o) == spawn_before.end()) {
+        g_fake_spawner = o;
+        RT_INFO("bot fake: its spawn object %08X", o);
+      }
     // A real join is followed by the peer's creation: 82705810 on the peer
     // manager (the player manager + 8) with the player's index, 1 and its
     // connection object (vtable 8201B140); that fills the connection's +14.
@@ -713,12 +804,56 @@ PPC_FUNC(sub_82364C78) {
         if (!Ld32(o + 0x14)) St32(o + 0x14, peer);
         if (!Ld32(o + 0x28)) St32(o + 0x28, peer);
         RT_INFO("bot fake: new peer %08X linked into connection %08X", peer, o);
+        g_fake_conn = o;
+        g_fake_conn_for_replay = o;
       }
     }
     memcpy(G<uint8_t>(ctx.r5.u32), snap.data(), snap.size());
   }
   __imp__sub_82364C78(ctx, base);
 }
+// The deploy path (BF_BOT_STACK on the soldier factory): the player's network
+// message (8235FBD0) and the spawn logic below it.
+extern "C" PPC_FUNC(__imp__sub_8235FBD0);
+extern "C" PPC_FUNC(__imp__sub_82332350);
+extern "C" PPC_FUNC(__imp__sub_823207F0);
+extern "C" PPC_FUNC(__imp__sub_82359C68);
+extern "C" PPC_FUNC(__imp__sub_82359A58);
+TRACE_AI(82359C68, "spawn object: player 1")
+// The message after a join that gives a player its spawn object (vtable
+// 82019490): 82359A58 on its connection, r4 a record (+8 begin, +C end, +10
+// capacity of a small payload; +28 a pointer), r5 0x21, r6 1. BF_BOT_FAKE:
+// when the host's arrives, the same message (a copy of the record and its
+// payload) is given to the fake player's connection.
+PPC_FUNC(sub_82359A58) {
+  if (g_trace) TraceAi("spawn object: player 2 82359A58", ctx);
+  PPCContext saved = ctx;
+  __imp__sub_82359A58(ctx, base);
+  static bool replayed = false;
+  uint32_t fake = g_fake_conn_for_replay;
+  if (!fake || replayed || saved.r3.u32 == fake) return;
+  replayed = true;
+  uint32_t rec = saved.r4.u32;
+  uint32_t b0 = Ld32(rec + 8), e0 = Ld32(rec + 0xC);
+  uint32_t len = e0 >= b0 && e0 - b0 < 0x1000 ? e0 - b0 : 0;
+  static uint32_t copy = g_system_heap->Alloc(0x40, 16);
+  static uint32_t payload = g_system_heap->Alloc(0x1000, 16);
+  memcpy(G<uint8_t>(copy), G<uint8_t>(rec), 0x40);
+  if (len) memcpy(G<uint8_t>(payload), G<uint8_t>(b0), len);
+  St32(copy + 8, payload), St32(copy + 0xC, payload + len), St32(copy + 0x10, payload + len + 1);
+  PPCContext c = saved;
+  c.r3.u64 = fake;
+  c.r4.u64 = copy;
+  RT_INFO("bot fake: replaying the host's message (%u bytes) on connection %08X", len, fake);
+  std::vector<uint32_t> spawners = Scan(0x82019490);
+  __imp__sub_82359A58(c, base);
+  for (uint32_t o : Scan(0x82019490))
+    if (std::find(spawners.begin(), spawners.end(), o) == spawners.end()) g_fake_spawner = o;
+  RT_INFO("bot fake: replayed; its spawn object %08X", g_fake_spawner);
+}
+TRACE_AI(8235FBD0, "deploy: player message")
+TRACE_AI(82332350, "deploy: spawn 1")
+TRACE_AI(823207F0, "deploy: spawn 2")
 // The network peer object (vtable 820550C0) behind a player's connection.
 extern "C" PPC_FUNC(__imp__sub_826FB8F0);
 extern "C" PPC_FUNC(__imp__sub_826FD9F0);

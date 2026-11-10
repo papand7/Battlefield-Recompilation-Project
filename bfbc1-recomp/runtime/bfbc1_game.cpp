@@ -60,6 +60,7 @@ int LocalVehicle() { return kOnFoot; }
 bool CustomMenus() { return false; }
 bool g_dedicated = false;
 std::vector<std::string> g_map_rotation;
+std::string g_emitter;  // --emitter: bf1943's particle settings (game_patches.cpp), unused here
 int GameDialogs() { return 0; }
 }  // namespace rt
 
