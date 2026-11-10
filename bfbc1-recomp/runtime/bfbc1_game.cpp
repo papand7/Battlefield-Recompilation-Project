@@ -65,6 +65,8 @@ bool g_dedicated = false;
 std::vector<std::string> g_map_rotation;
 std::string g_emitter;  // --emitter: bf1943's particle settings (game_patches.cpp), unused here
 void ApplyEmitterNow() {}  // bf1943's (game_patches.cpp): applies g_emitter
+float g_fov = 0.0f;  // --fov: bf1943's field of view (game_patches.cpp), unused here
+std::atomic<bool> g_aiming{false};  // bf1943's sights zoom (game_patches.cpp), unused here
 int GameDialogs() { return 0; }
 }  // namespace rt
 

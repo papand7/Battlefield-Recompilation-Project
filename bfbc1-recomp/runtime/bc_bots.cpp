@@ -561,6 +561,104 @@ void HuntInput() {
   RT_INFO("bot hunt: %s", out.c_str());
 }
 
+// BF_BOT_YAW_HUNT=1 (testing): at the files yaw1, yaw2, yaw3 (a joiner turned
+// between them), every float in memory equal (within 0.002) to the turning
+// player's aim yaw (the record whose +90 changed most since the last
+// snapshot), or to minus it; the addresses that match all three times hold
+// that player's heading.
+}  // namespace
+extern std::mutex g_record_yaw_mutex;
+extern std::map<uint32_t, float> g_record_yaw;
+namespace {
+void HuntYaw() {
+  std::map<uint32_t, float> prev;
+  std::vector<std::pair<uint32_t, int>> cand;  // address, sign
+  for (int step = 1; step <= 3; ++step) {
+    std::string flag = "yaw" + std::to_string(step);
+    while (!std::filesystem::exists(flag)) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::map<uint32_t, float> now;
+    {
+      std::lock_guard l(g_record_yaw_mutex);
+      now = g_record_yaw;
+    }
+    uint32_t rec = 0;
+    float best = -1, yaw = 0;
+    for (auto& [r, y] : now) {
+      float d = prev.count(r) ? std::fabs(y - prev[r]) : (std::fabs(y) > 0.01f ? 0.001f : 0.0f);
+      if (d > best || !rec) best = d, rec = r, yaw = y;
+    }
+    prev = now;
+    auto value = [](uint32_t a) { return LdF(a); };
+    if (step == 1) {
+      for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+        if (page >= 0x80000000 && page < 0xA0000000) continue;
+        if (!IsCommitted(uint32_t(page))) continue;
+        for (uint32_t i = 0; i < 0x1000; i += 4) {
+          float f = value(uint32_t(page) + i);
+          if (std::fabs(f - yaw) < 0.002f) cand.push_back({uint32_t(page) + i, 1});
+          else if (std::fabs(f + yaw) < 0.002f) cand.push_back({uint32_t(page) + i, -1});
+        }
+      }
+    } else {
+      std::vector<std::pair<uint32_t, int>> keep;
+      for (auto& [a, sign] : cand)
+        if (IsCommitted(a) && std::fabs(value(a) - sign * yaw) < 0.002f) keep.push_back({a, sign});
+      cand.swap(keep);
+    }
+    RT_INFO("bot yaw hunt: snapshot %d, record %08X yaw %.3f (moved %.3f), %zu candidates", step, rec, yaw, best,
+            cand.size());
+  }
+  std::string out;
+  for (size_t i = 0; i < cand.size() && i < 40; ++i) {
+    uint32_t a = cand[i].first, start = 0, vt = 0;
+    for (uint32_t back = 0; back <= 0x600; back += 4) {
+      uint32_t w = Ld32(a - back);
+      if (w >= 0x82000000 && w < 0x82180000 && Ld32(w) >= 0x82180000 && Ld32(w) < 0x82F00000) {
+        start = a - back, vt = w;
+        break;
+      }
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), " %08X%s(obj %08X vt %08X +%X)", a, cand[i].second < 0 ? "(-)" : "", start, vt, a - start);
+    out += buf;
+  }
+  RT_INFO("bot yaw hunt:%s", out.c_str());
+  // Who points into what holds them (the 0x600 bytes below each, aligned):
+  // the objects (by vtable) owning an aim history.
+  for (size_t i = 0; i < cand.size() && i < 12; ++i) {
+    uint32_t a = cand[i].first, lo = a - 0x600, hi = a;
+    std::string refs;
+    int n = 0;
+    for (uint64_t page = 0x40000000; page < 0xC0000000 && n < 8; page += 0x1000) {
+      if (page >= 0x80000000 && page < 0xA0000000) continue;
+      if (!IsCommitted(uint32_t(page))) continue;
+      const uint32_t* q = reinterpret_cast<const uint32_t*>(g_base + page);
+      for (int k = 0; k < 1024 && n < 8; ++k) {
+        uint32_t v = _byteswap_ulong(q[k]);
+        if (v < lo || v > hi || (v & 3)) continue;
+        uint32_t at = uint32_t(page) + 4 * k, start = 0, vt = 0;
+        for (uint32_t back = 0; back <= 0x600; back += 4) {
+          uint32_t w = Ld32(at - back);
+          if (w >= 0x82000000 && w < 0x82180000 && Ld32(w) >= 0x82180000 && Ld32(w) < 0x82F00000) {
+            start = at - back, vt = w;
+            break;
+          }
+        }
+        char buf[96];
+        snprintf(buf, sizeof(buf), " [%08X -> %08X: in vt %08X obj %08X +%X]", at, v, vt, start, at - start);
+        refs += buf;
+        ++n;
+      }
+    }
+    RT_INFO("bot yaw hunt: %08X pointed at by:%s", a, refs.c_str());
+  }
+}
+const bool g_yaw_hunt_started = [] {
+  if (!getenv("BF_BOT_YAW_HUNT")) return false;
+  std::thread(HuntYaw).detach();
+  return true;
+}();
+
 const bool g_input_hunt_started = [] {
   if (!getenv("BF_BOT_INPUT_HUNT")) return false;
   std::thread(HuntInput).detach();
@@ -1168,8 +1266,26 @@ extern "C" PPC_FUNC(__imp__sub_823D1DD0);
 // +4; analog actions: +8 turn, +C look up/down, +14 forward, as a joiner's
 // stick showed), driven every server update: forward and a gentle turn.
 static uint32_t g_fake_soldier = 0, g_fake_input = 0;
+static uint32_t g_fake_record = 0;  // its received input record (vtable 8200DC48)
 static void DriveFake() {
   if (!g_fake_soldier) return;
+  // BF_BOT_YAW_EARLY=1 (test): the record's aim (+90) set at the start of the
+  // server update, before anything reads it: 0, 1.57, 3.14 in turn, 5 s each.
+  static const bool early = getenv("BF_BOT_YAW_EARLY") != nullptr;
+  if (early && g_fake_record && IsCommitted(g_fake_record) && Ld32(g_fake_record) == 0x8200DC48) {
+    static int64_t t0 = int64_t(GetTickCount64());
+    int64_t now = int64_t(GetTickCount64());
+    float test = float(((now - t0) / 5000) % 3) * 1.5708f;
+    uint32_t u;
+    memcpy(&u, &test, 4);
+    St32(g_fake_record + 0x90, u);
+    static int64_t last = 0;
+    if (now - last > 2500) {
+      last = now;
+      RT_INFO("bot yaw early: +90 = %.2f, heading %.2f", test,
+              std::atan2(LdF(g_fake_soldier + 0x320), LdF(g_fake_soldier + 0x328)));
+    }
+  }
   if (!g_fake_input) {
     for (uint32_t o : Scan(0x82010C98))
       if (Ld32(o + 4) == g_fake_soldier) g_fake_input = o;
@@ -1424,6 +1540,17 @@ static std::vector<std::array<float, 3>> RouteMesh(const float a[3], const float
   return out;
 }
 
+extern uint32_t g_bot_aim_obj;
+extern float g_bot_want_heading;
+extern bool g_bot_steer;
+// The aim object's +134 holds minus the heading (atan2 of the forward row).
+static void set_aim(uint32_t aim_obj, float heading) {
+  float v = -heading;
+  uint32_t u;
+  memcpy(&u, &v, 4);
+  St32(aim_obj + 0x134, u);
+}
+
 // A first brain for the fake soldier: to the nearest gold crate (mission
 // objective, position +C0). Heading from the soldier's world matrix (forward
 // row +320/+328 in x/z); turning right lowers atan2(x, z).
@@ -1559,6 +1686,37 @@ static void FakeBrain(uint32_t in) {
   set(0x8, forward);
   set(0xC, strafe);
   set(0x1C, turn);
+  // The soldier's aim (BF_BOT_YAW_HUNT on a turning joiner): an object with
+  // vtable 820264A8 holds minus its yaw at +134. The bot's, found from its
+  // soldier (two levels of pointers), gets the yaw toward its target.
+  static uint32_t aim_obj = 0;
+  static uint32_t aim_for = 0;
+  if (aim_for != so) {
+    aim_for = so, aim_obj = 0;
+    std::function<void(uint32_t, int)> find = [&](uint32_t o, int depth) {
+      for (uint32_t off = 0; off < 0x800 && !aim_obj && IsCommitted(o + off); off += 4) {
+        uint32_t q = Ld32(o + off);
+        if (q < 0x40000000 || q >= 0xC0000000 || (q & 3) || !IsCommitted(q)) continue;
+        if (Ld32(q) == 0x820264A8) aim_obj = q;
+        else if (depth < 2 && IsCommitted(q + 0x7FC)) find(q, depth + 1);
+      }
+    };
+    find(so, 0);
+    RT_INFO("bot brain: aim object of soldier %08X: %08X (yaw %.2f)", so, aim_obj, aim_obj ? -LdF(aim_obj + 0x134) : 0.0f);
+    // BF_BOT_WATCH_AIM=1: who writes it (the call stacks), instead of steering.
+    if (aim_obj && getenv("BF_BOT_WATCH_AIM")) StartWriteWatch(aim_obj + 0x134, 4, 0);
+  }
+  if (aim_obj && !getenv("BF_BOT_WATCH_AIM")) {
+    // Facing the next point: the yaw whose heading points there. Heading
+    // atan2(fx, fz) was minus the aim object's value (-2.57 vs 2.57).
+    float want = std::atan2(tx - x, tz - z);
+    g_bot_aim_obj = aim_obj, g_bot_want_heading = want, g_bot_steer = true;
+    static int64_t aim_log = 0;
+    if (now - aim_log > 3000) {
+      aim_log = now;
+      RT_INFO("bot brain: aim %.2f wanted, heading now %.2f", want, std::atan2(fx, fz));
+    }
+  }
   // BF_BOT_YAW_TEST=1: the absolute aim (+90 yaw, +94 pitch, radians, as a
   // joiner's showed) set to 0, 1.57 and 3.14 in turn, 5 s each, with the
   // soldier's heading logged: how yaw maps to facing.
@@ -1606,18 +1764,72 @@ static void FakeBrain(uint32_t in) {
   }
 }
 
+// The aim's writer (BF_BOT_WATCH_AIM: 824ADEE8 <- 822BDE38 <- 822ACB88 <-
+// 822C6170 <- 82275A38): its arguments, to steer the bot through it.
+// Its r4 record: +0/+8 a direction (minus sin, cos of +34), +34 the value it
+// stores at +134 (minus the soldier's heading atan2(fx, fz)). For the bot's
+// aim object, the heading its brain wants goes in there first.
+uint32_t g_bot_aim_obj = 0;
+float g_bot_want_heading = 0;
+bool g_bot_steer = false;
+extern "C" PPC_FUNC(__imp__sub_824ADEE8);
+PPC_FUNC(sub_824ADEE8) {
+  static const bool trace = getenv("BF_BOT_AIM_TRACE") != nullptr;
+  static int n = 0;
+  uint32_t r3 = ctx.r3.u32;
+  if (g_bot_steer && r3 == g_bot_aim_obj && IsCommitted(ctx.r4.u32 + 0x38)) {
+    auto put = [](uint32_t a, float f) {
+      uint32_t u;
+      memcpy(&u, &f, 4);
+      St32(a, u);
+    };
+    float h = g_bot_want_heading;
+    put(ctx.r4.u32 + 0x34, -h);
+    put(ctx.r4.u32 + 0x0, std::sin(h));
+    put(ctx.r4.u32 + 0x8, std::cos(h));
+  }
+  float before = IsCommitted(r3 + 0x134) ? LdF(r3 + 0x134) : 0;
+  PPCContext in = ctx;
+  __imp__sub_824ADEE8(ctx, base);
+  if (trace && n++ < 6) {
+    RT_INFO("bot aim set: r3=%08X(vt %08X) r4=%08X r5=%08X r6=%08X f1=%.3f f2=%.3f f3=%.3f; +134 %.3f -> %.3f", r3,
+            IsCommitted(r3) ? Ld32(r3) : 0, in.r4.u32, in.r5.u32, in.r6.u32, in.f1.f64, in.f2.f64, in.f3.f64, before,
+            IsCommitted(r3 + 0x134) ? LdF(r3 + 0x134) : 0);
+    std::string w;
+    for (uint32_t k = 0; k < 0x80 && IsCommitted(in.r4.u32 + k); k += 4) {
+      float fv = LdF(in.r4.u32 + k);
+      char buf[32];
+      if (std::isfinite(fv) && std::fabs(fv) > 1e-3f && std::fabs(fv) < 1e4f) snprintf(buf, sizeof(buf), " +%X:%.3f", k, fv);
+      else snprintf(buf, sizeof(buf), " +%X:%08X", k, Ld32(in.r4.u32 + k));
+      w += buf;
+    }
+    RT_INFO("bot aim set: r4 record:%s", w.c_str());
+  }
+}
+
 // The soldier update (822B92C8 <- 822C2C38 <- 822ACCD8 <- 82275A38, BF_BOT_WATCH_INPUT)
 // fills a soldier's input state from its player's received input through
 // 821BF2A8, which writes all its analog fields: for the fake soldier, the
 // bot's values go in right after that, before the soldier uses them.
 extern "C" PPC_FUNC(__imp__sub_821BF2A8);
+namespace rt {
+std::mutex g_record_yaw_mutex;
+std::map<uint32_t, float> g_record_yaw;  // received input record -> its aim yaw (+90)
+}  // namespace rt
 PPC_FUNC(sub_821BF2A8) {
   uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
+  if (IsCommitted(r4) && Ld32(r4) == 0x8200DC48) {
+    std::lock_guard l(g_record_yaw_mutex);
+    g_record_yaw[r4] = LdF(r4 + 0x90);
+  }
   // The source is the player's received input (vtable 8200DC48; a walking
   // joiner's has 0.96 at +8): for the fake soldier, fill it before the copy.
   // Its fields (BF_BOT_INPUT_MAP with a joiner): +8 forward, +C strafe, +1C
   // turn (right +), +20 look (up +), +28 fire; +2C.. how long each is held.
-  if (g_fake_input && r3 == g_fake_input && IsCommitted(r4) && Ld32(r4) == 0x8200DC48) FakeBrain(r4);
+  if (g_fake_input && r3 == g_fake_input && IsCommitted(r4) && Ld32(r4) == 0x8200DC48) {
+    g_fake_record = r4;
+    FakeBrain(r4);
+  }
   __imp__sub_821BF2A8(ctx, base);
   // BF_BOT_INPUT_MAP=1 (testing): a player's received input (r4) whenever its
   // first 0x60 bytes change, the non-zero words shown: which field is which.
