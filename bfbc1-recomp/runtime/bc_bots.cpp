@@ -620,6 +620,37 @@ const bool g_trails_started = [] {
   return true;
 }();
 
+// BF_BOT_NAVMESH_CHECK=1 (testing): 60 s and 120 s after start, how many
+// Kynapse navigation mesh headers ("Kynogon AiMesh Array", "InPlace Mesh") are
+// in memory: whether the game generated its navigation (campaign vs multiplayer).
+const bool g_navmesh_check_started = [] {
+  if (!getenv("BF_BOT_NAVMESH_CHECK")) return false;
+  std::thread([] {
+    for (int t : {60, 60}) {
+      std::this_thread::sleep_for(std::chrono::seconds(t));
+      for (const char* key : {"Kynogon AiMesh Array", "InPlace Mesh"}) {
+        size_t n = strlen(key), hits = 0;
+        std::string where;
+        for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+          if (page >= 0x80000000 && page < 0xA0000000) continue;
+          if (!IsCommitted(uint32_t(page))) continue;
+          const char* q = reinterpret_cast<const char*>(g_base + page);
+          for (int i = 0; i + int(n) < 0x1000; ++i)
+            if (q[i] == key[0] && !memcmp(q + i, key, n)) {
+              if (hits++ < 6) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), " %08X", uint32_t(page) + i);
+                where += buf;
+              }
+            }
+        }
+        RT_INFO("bot navmesh: \"%s\" %zu times in memory:%s", key, hits, where.c_str());
+      }
+    }
+  }).detach();
+  return true;
+}();
+
 const bool g_census_started = [] {
   if (!getenv("BF_BOT_CENSUS") && !getenv("BF_BOT_PLAYER_DUMP") && !getenv("BF_BOT_DUMP_VT")) return false;
   std::thread([] {
@@ -952,6 +983,12 @@ static void DriveFake() {
   (void)set;
 }
 
+// The game's own navigation is Kynapse path data, built offline and loaded
+// from Output/xenon/ai/levels/<level>/{infantry,vehicle}/pathdata.hpd
+// ("AI/%s/%s/PathDataDefinition", "/PathData.hpd" in the image): the disc has
+// it for the 7 campaign levels only. BF_BOT_NAVMESH_CHECK finds its "InPlace
+// Mesh" data in memory in the campaign, none in multiplayer. So multiplayer
+// bots route along what they learn instead.
 // Routes from the learnt trails (nav/<map>.txt, RecordTrails): points linked
 // along each trail and to other trails' points within 2.5 m (height within
 // 1.5 m); A* from the point nearest the bot to the one nearest its goal.
