@@ -54,7 +54,11 @@ add_custom_command(OUTPUT ${STUBS}
           ${ROOT}/generated/ppc/ppc_recomp_shared.h ${ROOT}/runtime ${STUBS}
   DEPENDS ${RUNTIME_SOURCES} ${ROOT}/tools/gen_import_stubs.py ${ROOT}/generated/ppc/ppc_recomp_shared.h)
 
-add_executable(bf1943 ${RUNTIME_SOURCES} ${ROOT}/runtime/bots/brain.cpp ${STUBS})
+# The bots' navigation meshes (runtime/bots/nav.cpp, tools/navgen) are read and routed with Detour.
+file(GLOB DETOUR_SOURCES CONFIGURE_DEPENDS ${ROOT}/thirdparty/recastnavigation/Detour/Source/*.cpp)
+add_executable(bf1943 ${RUNTIME_SOURCES} ${ROOT}/runtime/bots/brain.cpp ${ROOT}/runtime/bots/nav.cpp ${DETOUR_SOURCES}
+               ${STUBS})
+target_include_directories(bf1943 PRIVATE ${ROOT}/thirdparty/recastnavigation/Detour/Include)
 target_include_directories(bf1943 PRIVATE ${ROOT}/runtime)
 # The bot brain alone, for reloading while a match runs (BF_BOT_BRAIN): built
 # only when asked for (cmake --build build/game --target bot_brain).

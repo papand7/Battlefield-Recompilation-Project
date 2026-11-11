@@ -70,7 +70,10 @@ target_compile_definitions(xenia_apu PUBLIC FMT_HEADER_ONLY XXH_INLINE_ALL)
 target_compile_options(xenia_apu PRIVATE -march=x86-64-v3 -w)
 target_link_libraries(xenia_apu PUBLIC bf1943_ffmpeg)
 
-add_executable(bf1943_server ${RUNTIME_SOURCES} ${ROOT}/runtime/bots/brain.cpp ${STUBS})
+file(GLOB DETOUR_SOURCES CONFIGURE_DEPENDS ${ROOT}/thirdparty/recastnavigation/Detour/Source/*.cpp)
+add_executable(bf1943_server ${RUNTIME_SOURCES} ${ROOT}/runtime/bots/brain.cpp ${ROOT}/runtime/bots/nav.cpp
+               ${DETOUR_SOURCES} ${STUBS})
+target_include_directories(bf1943_server PRIVATE ${ROOT}/thirdparty/recastnavigation/Detour/Include)
 target_include_directories(bf1943_server PRIVATE ${ROOT}/runtime ${ROOT}/runtime/xenia_shims)
 target_compile_options(bf1943_server PRIVATE -march=x86-64-v3 -fno-strict-aliasing)
 target_link_libraries(bf1943_server PRIVATE bf1943_ppc bf1943_xexload xenia_apu Threads::Threads ${CMAKE_DL_LIBS})

@@ -1,0 +1,290 @@
+// The bots' navigation mesh (from Bad Company's bots, bfbc1-recomp/runtime/
+// bc_bots.cpp): nav/<map>.nav made by tools/navgen from the level's terrain and
+// collision ("BFNV", version 2: dtNavMeshParams, the tile count, then each
+// tile's x, y, size, Detour data), routed with Detour. Looked for next to the
+// exe, then in the working folder. Polygons a bot couldn't get onto are kept
+// in <user>/nav/<map>.blocked for later matches.
+#include "bots/nav.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "kernel.h"  // (before windows.h, as the rest of the runtime)
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+#include "DetourNavMesh.h"
+#include "DetourCommon.h"
+#include "DetourNavMeshQuery.h"
+
+namespace rt::nav {
+namespace {
+
+std::mutex g_mutex;  // Detour's query isn't thread safe; routes come from the director's thread
+dtNavMesh* g_navmesh = nullptr;
+dtNavMeshQuery* g_navquery = nullptr;
+std::string g_map;  // the mesh loaded (or tried) for
+std::filesystem::path g_blocked_path;
+
+// The mesh's joined pieces (polygons reached through their links). Most of a
+// map is one; the rest are islands Recast leaves on roofs, ledges and the like.
+// Routes run on the main piece.
+std::unordered_map<dtPolyRef, int> g_piece;
+int g_main_piece = -1;
+
+void FindPieces() {
+  g_piece.clear();
+  std::vector<int> sizes;
+  int n = 0;
+  for (int ti = 0; ti < g_navmesh->getMaxTiles(); ++ti) {
+    const dtMeshTile* tile = static_cast<const dtNavMesh*>(g_navmesh)->getTile(ti);
+    if (!tile || !tile->header) continue;
+    dtPolyRef base = g_navmesh->getPolyRefBase(tile);
+    for (int pi = 0; pi < tile->header->polyCount; ++pi) {
+      ++n;
+      dtPolyRef start = base | dtPolyRef(pi);
+      if (g_piece.count(start)) continue;
+      int id = int(sizes.size());
+      sizes.push_back(0);
+      std::vector<dtPolyRef> stack{start};
+      g_piece[start] = id;
+      while (!stack.empty()) {
+        dtPolyRef r = stack.back();
+        stack.pop_back();
+        ++sizes[size_t(id)];
+        const dtMeshTile* t = nullptr;
+        const dtPoly* poly = nullptr;
+        if (dtStatusFailed(g_navmesh->getTileAndPolyByRef(r, &t, &poly))) continue;
+        for (unsigned l = poly->firstLink; l != DT_NULL_LINK; l = t->links[l].next) {
+          dtPolyRef o = t->links[l].ref;
+          if (o && !g_piece.count(o)) g_piece[o] = id, stack.push_back(o);
+        }
+      }
+    }
+  }
+  if (sizes.empty()) return;
+  g_main_piece = int(std::max_element(sizes.begin(), sizes.end()) - sizes.begin());
+  RT_INFO("bot nav: %d polygons in %zu pieces, the main one %d", n, sizes.size(), sizes[size_t(g_main_piece)]);
+}
+bool InMainPiece(dtPolyRef r) {
+  auto it = g_piece.find(r);
+  return it != g_piece.end() && it->second == g_main_piece;
+}
+// The main piece's nearest place to p within the box ext (half sizes).
+bool NearestMain(const float p[3], const float ext[3], const dtQueryFilter& filter, dtPolyRef* ref, float out[3]) {
+  static dtPolyRef polys[2048];
+  int n = 0;
+  g_navquery->queryPolygons(p, ext, &filter, polys, &n, 2048);
+  float best = 1e30f;
+  *ref = 0;
+  for (int i = 0; i < n; ++i) {
+    if (!InMainPiece(polys[i])) continue;
+    float c[3];
+    if (dtStatusFailed(g_navquery->closestPointOnPoly(polys[i], p, c, nullptr))) continue;
+    float d = dtVdistSqr(c, p);
+    if (d < best) best = d, *ref = polys[i], dtVcopy(out, c);
+  }
+  return *ref != 0;
+}
+
+void LoadBlocked() {
+  FILE* f = fopen(g_blocked_path.string().c_str(), "r");
+  if (!f) return;
+  unsigned long long ref;
+  int n = 0;
+  while (fscanf(f, "%llx", &ref) == 1)
+    if (dtStatusSucceed(g_navmesh->setPolyFlags(dtPolyRef(ref), 0))) ++n;
+  fclose(f);
+  RT_INFO("bot nav: %d blocked polygons learnt before", n);
+}
+
+std::filesystem::path ExeDir() {
+#ifdef _WIN32
+  wchar_t buf[MAX_PATH];
+  DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+  return std::filesystem::path(std::wstring(buf, n)).parent_path();
+#else
+  char buf[4096];
+  ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf));
+  return n > 0 ? std::filesystem::path(std::string(buf, size_t(n))).parent_path() : std::filesystem::path(".");
+#endif
+}
+
+void Unload() {
+  if (g_navquery) dtFreeNavMeshQuery(g_navquery);
+  if (g_navmesh) dtFreeNavMesh(g_navmesh);
+  g_navquery = nullptr, g_navmesh = nullptr;
+  g_piece.clear();
+  g_main_piece = -1;
+}
+
+bool Load(const std::string& map) {
+  if (map == g_map) return g_navquery != nullptr;
+  Unload();
+  g_map = map;
+  g_blocked_path = g_user_root / "nav" / (map + ".blocked");
+  std::filesystem::path path;
+  for (const std::filesystem::path& dir : {ExeDir() / "nav", std::filesystem::path("nav")}) {
+    std::error_code ec;
+    if (std::filesystem::exists(dir / (map + ".nav"), ec)) {
+      path = dir / (map + ".nav");
+      break;
+    }
+  }
+  if (path.empty()) {
+    RT_INFO("bot nav: no navigation mesh for %s (nav/%s.nav)", map.c_str(), map.c_str());
+    return false;
+  }
+  FILE* f = fopen(path.string().c_str(), "rb");
+  if (!f) return false;
+  char magic[4];
+  int version = 0, size = 0, tiles = 0;
+  bool ok = fread(magic, 1, 4, f) == 4 && !memcmp(magic, "BFNV", 4) && fread(&version, 4, 1, f) == 1 && version == 2;
+  g_navmesh = dtAllocNavMesh();
+  dtNavMeshParams params;
+  int count = 0;
+  ok = ok && fread(&params, sizeof(params), 1, f) == 1 && fread(&count, 4, 1, f) == 1 &&
+       dtStatusSucceed(g_navmesh->init(&params));
+  for (int i = 0; ok && i < count; ++i) {
+    int tx, ty, ts;
+    ok = fread(&tx, 4, 1, f) == 1 && fread(&ty, 4, 1, f) == 1 && fread(&ts, 4, 1, f) == 1 && ts > 0;
+    unsigned char* data = ok ? static_cast<unsigned char*>(dtAlloc(ts, DT_ALLOC_PERM)) : nullptr;
+    ok = ok && data && fread(data, 1, size_t(ts), f) == size_t(ts) &&
+         dtStatusSucceed(g_navmesh->addTile(data, ts, DT_TILE_FREE_DATA, 0, nullptr));
+    size += ts, ++tiles;
+  }
+  fclose(f);
+  if (!ok) {
+    RT_WARN("bot nav: %s isn't a navigation mesh Detour can read", path.string().c_str());
+    Unload();
+    return false;
+  }
+  g_navquery = dtAllocNavMeshQuery();
+  g_navquery->init(g_navmesh, 4096);
+  RT_INFO("bot nav: navigation mesh %s (%d bytes, %d tiles)", path.string().c_str(), size, tiles);
+  FindPieces();
+  LoadBlocked();
+  return true;
+}
+
+}  // namespace
+
+bool Ready(const std::string& map) {
+  std::lock_guard lock(g_mutex);
+  return Load(map);
+}
+
+void Block(const float at[3]) {
+  std::lock_guard lock(g_mutex);
+  if (!g_navquery) return;
+  dtQueryFilter filter;
+  const float ext[3] = {1.5f, 3, 1.5f};
+  dtPolyRef ref = 0;
+  float p[3];
+  g_navquery->findNearestPoly(at, ext, &filter, &ref, p);
+  if (!ref) return;
+  g_navmesh->setPolyFlags(ref, 0);
+  std::error_code ec;
+  std::filesystem::create_directories(g_blocked_path.parent_path(), ec);
+  if (FILE* f = fopen(g_blocked_path.string().c_str(), "a")) {
+    fprintf(f, "%llx\n", (unsigned long long)ref);
+    fclose(f);
+  }
+  RT_INFO("bot nav: blocked polygon %llx at %.1f %.1f %.1f", (unsigned long long)ref, p[0], p[1], p[2]);
+}
+
+// The corners of a route from a to b (none if there's no mesh or no way).
+int Route(const float a[3], const float b[3], float* corners, int max, Memory* mem) {
+  std::lock_guard lock(g_mutex);
+  if (!g_navquery || max <= 0) return 0;
+  std::vector<std::array<float, 3>> out;
+  dtQueryFilter filter;
+  const float ext[3] = {3, 6, 3};
+  dtPolyRef sa = 0, sb = 0;
+  float pa[3], pb[3];
+  g_navquery->findNearestPoly(a, ext, &filter, &sa, pa);
+  // The goal (a flag, a vehicle) can be up on a structure: the nearest
+  // walkable place within 8 m across and 60 m up or down.
+  const float goal_ext[3] = {8, 60, 8};
+  g_navquery->findNearestPoly(b, goal_ext, &filter, &sb, pb);
+  if (sb && !InMainPiece(sb)) {  // the goal on an island: the main piece's nearest place
+    float q[3];
+    dtPolyRef r = 0;
+    if (NearestMain(b, goal_ext, filter, &r, q)) sb = r, dtVcopy(pb, q);
+  }
+  // An island the main piece touches: on the main piece already. The soldier
+  // on one: first back the way it came, or to the nearest main place.
+  static Memory shared;
+  Memory& memory = mem ? *mem : shared;
+  if (sa && !InMainPiece(sa)) {
+    const float touch_ext[3] = {1.5f, 1, 1.5f};
+    float q[3];
+    dtPolyRef r = 0;
+    if (NearestMain(a, touch_ext, filter, &r, q)) sa = r, dtVcopy(pa, q);
+  }
+  if (sa && InMainPiece(sa)) dtVcopy(memory.last_main, pa), memory.have = true;
+  if (sa && !InMainPiece(sa)) {
+    const float near_ext[3] = {6, 4, 6};
+    const float back_ext[3] = {1, 2, 1};
+    float q[3];
+    dtPolyRef r = 0;
+    bool back = memory.have && dtVdist(memory.last_main, a) < 30.0f &&
+                (g_navquery->findNearestPoly(memory.last_main, back_ext, &filter, &r, q), r && InMainPiece(r));
+    if (back || NearestMain(a, near_ext, filter, &r, q)) {
+      out.push_back({q[0], q[1], q[2]});
+      sa = r, dtVcopy(pa, q);
+    }
+  }
+  if (!sa || !sb) return 0;
+  dtPolyRef polys[512];
+  int npolys = 0;
+  dtStatus s3 = g_navquery->findPath(sa, sb, pa, pb, &filter, polys, &npolys, 512);
+  if (!npolys) return 0;
+  // Partial (up on a ledge it can drop from: the mesh has no links down):
+  // first to the nearest place around, up to 5 m away and 4 m lower, with a
+  // whole way.
+  if (s3 & DT_PARTIAL_RESULT) {
+    const float near_ext[3] = {0.5f, 4, 0.5f};
+    for (float r : {1.5f, 3.0f, 5.0f}) {
+      for (int k = 0; k < 16; ++k) {
+        float q[3] = {a[0] + r * std::sin(k * 0.3927f), a[1] - 2, a[2] + r * std::cos(k * 0.3927f)}, pq[3];
+        dtPolyRef sq = 0;
+        g_navquery->findNearestPoly(q, near_ext, &filter, &sq, pq);
+        if (!sq || sq == sa) continue;
+        int nq = 0;
+        dtStatus s4 = g_navquery->findPath(sq, sb, pq, pb, &filter, polys, &nq, 512);
+        if (!nq || (s4 & DT_PARTIAL_RESULT)) continue;
+        out.push_back({pq[0], pq[1], pq[2]});
+        npolys = nq;
+        memcpy(pa, pq, sizeof(pa));
+        break;
+      }
+      if (out.size() > 0 && npolys) break;
+    }
+  }
+  float c[256 * 3];
+  unsigned char flags[256];
+  dtPolyRef refs[256];
+  int n = 0;
+  g_navquery->findStraightPath(pa, pb, polys, npolys, c, flags, refs, &n, 256);
+  for (int i = 0; i < n; ++i) out.push_back({c[3 * i], c[3 * i + 1], c[3 * i + 2]});
+  int k = std::min(int(out.size()), max);
+  for (int i = 0; i < k; ++i) memcpy(corners + 3 * i, out[size_t(i)].data(), 12);
+  return k;
+}
+
+}  // namespace rt::nav

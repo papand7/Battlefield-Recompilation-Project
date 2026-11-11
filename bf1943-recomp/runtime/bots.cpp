@@ -22,6 +22,7 @@
 // player "Player1", so the director finds which soldier is which bot by
 // probing: it tips one bot's view up and watches whose pitch moves.
 #include "bots/bot_api.h"
+#include "bots/nav.h"
 #include "guest.h"
 #include "kernel.h"
 #include "xenia_bridge.h"
@@ -245,6 +246,20 @@ size_t MoveVectorsNear(Vec pos, Vec to, const char* who) {
 // ---- the brain: built in, or bot_brain.dll reloaded when it changes ----------
 
 void BrainLog(const char* text) { RT_INFO("%s", text); }
+
+// The navigation mesh for the brain (World::route, World::block).
+nav::Memory g_nav_memory[kMaxBots];
+int BrainRoute(int slot, Vec a, Vec b, Vec* corners, int max) {
+  float fa[3] = {a.x, a.y, a.z}, fb[3] = {b.x, b.y, b.z};
+  static float buf[256 * 3];
+  int n = nav::Route(fa, fb, buf, std::min(max, 256), slot >= 0 && slot < kMaxBots ? &g_nav_memory[slot] : nullptr);
+  for (int i = 0; i < n; ++i) corners[i] = Vec{buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]};
+  return n;
+}
+void BrainBlock(Vec at) {
+  float p[3] = {at.x, at.y, at.z};
+  nav::Block(p);
+}
 
 struct BrainModule {
   botapi::ThinkFn think = &BotBrainThink;
@@ -794,6 +809,11 @@ std::string StartBotDirector(int count) {
       w.scenario = scenario;
       w.result = result;
       w.log = BrainLog;
+      static const std::string nav = (g_user_root / ("bot_nav_" + g_host_map + ".txt")).string();
+      w.nav_path = nav.c_str();
+      bool have_mesh = nav::Ready(g_host_map);  // (loads a new map's once)
+      w.route = have_mesh ? BrainRoute : nullptr;
+      w.block = have_mesh ? BrainBlock : nullptr;
       brain.think(&w);
       for (botapi::BotIO& b : d.bots) {
         Pad pad = b.pad;

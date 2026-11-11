@@ -30,6 +30,10 @@ namespace {
 
 // ---- per-bot state (kept in BotIO::mem) ------------------------------------
 
+// A way up from the water onto land (Shore): its last spot in the water, then
+// where it was up on land.
+struct Exit { Vec wet, up; };
+
 enum BoatState { kNoBoat, kWalkToBoat, kBoard, kDrive, kLeave };
 
 struct Bot {
@@ -74,9 +78,20 @@ struct Bot {
   double hold_until = 0;  // standing still for the teleport
   char probe_name[16] = {};  // BF_BOT_INPUT_PROBE
   Vec spawned_at;         // where it last spawned
-  Vec shore_from;         // where it was a few seconds ago (Shore::Saw)
+  Vec shore_from;         // its last spot in the water, since shore_t
   double shore_t = 0;
   int exit_tries = 0;
+  // A route on the navigation mesh (World::route): its corners, the next one,
+  // when it was planned and to where.
+  static constexpr int kCorners = 28;
+  Vec route[kCorners];
+  int route_n = 0, route_i = 0;
+  double route_t = 0;
+  Vec route_goal;
+  Vec nav_stuck_at;  // where it last got stuck on a route
+  int exit_phase = 0;  // 1: to the exit's spot in the water, 2: up it
+  Exit exit_on;
+  double exit_since = 0;
   double scenario_since = -1, judge_from = 0;
   float drive_from = -1;  // distance to the flag when it started driving
   bool released_once = false;  // this ride's landing craft is already in the water
@@ -116,23 +131,41 @@ Scenario ParseScenario(const char* s) {
   return sc;
 }
 
-// Ways up from the water onto land, learnt from the bots themselves: where one
-// that waded ashore got up over the shore (from about sea level to 5 m above).
+// Ways up from the water onto land, learnt from the bots themselves: the last
+// spot in the water of a bot that was up on land soon after. Kept in a file
+// per map (World::nav_path), so the bots know more every match.
 struct Shore {
-  float sea = 1e9f;  // the lowest a soldier has stood (in the water: sea level)
-  std::vector<Vec> exits;
-  void Saw(Vec before, Vec now) {
-    sea = std::min(sea, now.y);
-    if (before.y < sea + 1.5f && now.y > sea + 5.0f && Dist2D(before, now) < 25.0f) {
-      for (const Vec& e : exits)
-        if (Dist2D(e, now) < 10.0f) return;
-      exits.push_back(now);
+  float sea = 1e9f;  // the lowest a soldier on foot has stood (in the water: sea level)
+  std::vector<Exit> exits;
+  std::string path;
+  void Load(const char* p) {
+    if (!p || path == p) return;
+    path = p;
+    exits.clear();
+    if (FILE* f = fopen(p, "r")) {
+      char line[160];
+      while (fgets(line, sizeof(line), f)) {
+        Exit e;
+        if (sscanf(line, "exit %f %f %f %f %f %f", &e.wet.x, &e.wet.y, &e.wet.z, &e.up.x, &e.up.y, &e.up.z) == 6)
+          exits.push_back(e);
+      }
+      fclose(f);
     }
   }
-  const Vec* Nearest(Vec p, float range) const {
-    const Vec* best = nullptr;
-    for (const Vec& e : exits)
-      if (float d = Dist2D(e, p); d < range) range = d, best = &e;
+  bool Add(Exit e) {
+    for (const Exit& x : exits)
+      if (Dist2D(x.wet, e.wet) < 15.0f) return false;
+    exits.push_back(e);
+    if (FILE* f = fopen(path.c_str(), "a")) {
+      fprintf(f, "exit %.1f %.1f %.1f %.1f %.1f %.1f\n", e.wet.x, e.wet.y, e.wet.z, e.up.x, e.up.y, e.up.z);
+      fclose(f);
+    }
+    return true;
+  }
+  const Exit* Nearest(Vec p, float range) const {
+    const Exit* best = nullptr;
+    for (const Exit& e : exits)
+      if (float d = Dist2D(e.wet, p); d < range) range = d, best = &e;
     return best;
   }
 };
@@ -171,6 +204,21 @@ struct Brain {
       if (&o != &me && o.mem_tag == kTag && reinterpret_cast<const Bot*>(o.mem)->boat == obj) return true;
     }
     return false;
+  }
+
+  // The next place on the way to goal: a corner of its route on the
+  // navigation mesh (planned again every 5 s or when the goal moves), or the
+  // goal itself without a mesh or a way.
+  Vec NextOnRoute(BotIO& io, Bot& b, const Soldier& me, Vec goal) {
+    if (!w.route) return goal;
+    if (b.route_t == 0 || w.now - b.route_t > 5.0 || Dist2D(goal, b.route_goal) > 3.0f) {
+      b.route_n = w.route(io.slot, me.pos, goal, b.route, Bot::kCorners);
+      b.route_i = 0;
+      b.route_t = w.now;
+      b.route_goal = goal;
+    }
+    while (b.route_i < b.route_n && Dist2D(me.pos, b.route[b.route_i]) < 1.5f) ++b.route_i;
+    return b.route_i < b.route_n ? b.route[b.route_i] : goal;
   }
 
   // Strategic layer: temperature per point for a team, then the bot takes the
@@ -608,7 +656,7 @@ struct Brain {
       // the spawn choice off the carrier (the spawn screen lists the carrier,
       // then the held flags), then confirm.
       if (b.alive) b.boat = 0, b.boat_state = kNoBoat, b.teleported = false, b.hold_until = 0, b.boat_done = false,
-                   b.stuck_level = 0, b.exit_tries = 0, b.shore_t = 0;
+                   b.stuck_level = 0, b.exit_tries = 0, b.shore_t = 0, b.exit_phase = 0;
       b.alive = false;
       bool held = false;
       for (int i = 0; i < w.point_count; ++i) held |= w.points[i].owner != 0 && w.points[i].owner == b.team;
@@ -654,10 +702,16 @@ struct Brain {
       b.target_offset = {Rand(-6, 6), 0, Rand(-6, 6)};
     }
     // Shore: remember where bots get up out of the water.
-    if (w.now - b.shore_t > 3.0) {
-      if (b.shore_t > 0 && !me->vehicle) g_shore.Saw(b.shore_from, me->pos);
-      b.shore_from = me->pos;
-      b.shore_t = w.now;
+    if (!me->vehicle) {
+      g_shore.sea = std::min(g_shore.sea, me->pos.y);
+      if (me->pos.y < g_shore.sea + 1.5f) {
+        b.shore_from = me->pos;  // last spot in the water
+        b.shore_t = w.now;
+      } else if (b.shore_t > 0 && me->pos.y > g_shore.sea + 4.5f && w.now - b.shore_t < 40.0) {
+        if (g_shore.Add(Exit{b.shore_from, me->pos}))
+          Log("bots: bot%d found a way up from the water at %.0f,%.0f", io.slot + 1, b.shore_from.x, b.shore_from.z);
+        b.shore_t = 0;
+      }
     }
     // Progress / stuck detection.
     if (Dist2D(me->pos, b.last_pos) > 1.5f) b.last_pos = me->pos, b.last_moved = w.now;
@@ -681,8 +735,23 @@ struct Brain {
     if (!at_point && w_engage <= 0 && w.now - b.last_moved > 2.5 && w.now > b.detour_until) {
       if (!b.stuck_level) b.stuck_at = me->pos;
       ++b.stuck_level;
+      // On a route and stuck again where it got stuck before: the navigation
+      // mesh is wrong there (as Bad Company's bots): that polygon, 1.5 m on
+      // towards the next corner, is off for routes, and a new route.
+      if (w.block && b.route_i < b.route_n) {
+        if (Dist2D(me->pos, b.nav_stuck_at) < 3.0f) {
+          Vec c = b.route[b.route_i];
+          float d = std::max(Dist2D(c, me->pos), 0.1f);
+          w.block(Vec{me->pos.x + (c.x - me->pos.x) / d * 1.5f, me->pos.y, me->pos.z + (c.z - me->pos.z) / d * 1.5f});
+          b.route_t = 0;
+        }
+        b.nav_stuck_at = me->pos;
+      }
       b.last_moved = w.now;
-      if (b.stuck_level > 7 && sc.point < 0) {
+      // Close to the flag it keeps trying: another flag is usually back through the water.
+      if (b.stuck_level > 7 && b.target_point >= 0 && Dist2D(me->pos, w.points[b.target_point].pos) < 30)
+        b.stuck_level = 1;
+      else if (b.stuck_level > 7 && sc.point < 0) {
         b.avoid_point = b.target_point;
         b.avoid_until = w.now + 60;
         b.target_point = -1;
@@ -712,15 +781,26 @@ struct Brain {
       cmd.lx = b.strafe;
       cmd.ly = enemy_d > 30 ? 0.6f : 0.0f;
       snprintf(io.state, sizeof(io.state), "engage");
-    } else if (b.target_point >= 0 && me->pos.y < g_shore.sea + 4.0f && b.stuck_level > 0 &&
-               g_shore.Nearest(me->pos, 200.0f) && Dist2D(*g_shore.Nearest(me->pos, 200.0f), me->pos) > 4.0f &&
-               b.exit_tries < 3) {
-      // In the water and stuck: to the nearest way up another bot found.
-      Vec e = *g_shore.Nearest(me->pos, 200.0f);
+    } else if (b.target_point >= 0 && (b.exit_phase ||
+                                        (me->pos.y < g_shore.sea + 1.5f && b.stuck_level > 0 && b.exit_tries < 3 &&
+                                         g_shore.Nearest(me->pos, 200.0f)))) {
+      // In the water and stuck: the way up another bot found, the way it went.
+      if (!b.exit_phase) {
+        b.exit_on = *g_shore.Nearest(me->pos, 200.0f);
+        b.exit_phase = 1;
+        b.exit_since = w.now;
+        ++b.exit_tries;
+      }
+      Vec e = b.exit_phase == 1 ? b.exit_on.wet : b.exit_on.up;
+      if (b.exit_phase == 1 && Dist2D(e, me->pos) < 4.0f) b.exit_phase = 2, b.exit_since = w.now;
+      else if (b.exit_phase == 2 && (Dist2D(e, me->pos) < 5.0f || me->pos.y > g_shore.sea + 4.5f))
+        b.exit_phase = 0, b.stuck_level = 0;
+      if (w.now - b.exit_since > 40.0) b.exit_phase = 0;  // not getting there
+      if (b.exit_phase == 1 && me->pos.y > g_shore.sea + 4.5f) b.exit_phase = 0;  // up on land already
       Steer(cmd, *me, std::atan2(e.x - me->pos.x, e.z - me->pos.z), 0.0f);
       Walk(cmd, *me, e, 1.0f);
-      if (Dist2D(e, me->pos) < 6.0f) ++b.exit_tries, b.stuck_level = 0;
-      snprintf(io.state, sizeof(io.state), "to shore exit");
+      if (std::fmod(w.now, 1.0) < 0.15) cmd.buttons |= kA;
+      snprintf(io.state, sizeof(io.state), b.exit_phase == 2 ? "up shore exit" : "to shore exit");
     } else if (b.target_point >= 0 && w.now < b.detour_until) {
       Vec goal = w.points[b.target_point].pos;
       float head = std::atan2(goal.x - me->pos.x, goal.z - me->pos.z);
@@ -739,8 +819,9 @@ struct Brain {
       Vec goal = w.points[b.target_point].pos;
       goal.x += b.target_offset.x, goal.z += b.target_offset.z;
       float dx = goal.x - me->pos.x, dz = goal.z - me->pos.z;
-      Steer(cmd, *me, std::atan2(dx, dz), 0.0f);
-      Walk(cmd, *me, goal, 1.0f);
+      Vec next = NextOnRoute(io, b, *me, goal);
+      Steer(cmd, *me, std::atan2(next.x - me->pos.x, next.z - me->pos.z), 0.0f);
+      Walk(cmd, *me, next, 1.0f);
       if (!at_point && std::hypot(dx, dz) > 25) cmd.buttons |= kLeftThumb;  // sprint
       snprintf(io.state, sizeof(io.state), at_point ? "at flag %d" : "to flag %d", b.target_point);
     }
@@ -758,6 +839,7 @@ BOT_BRAIN_API void BotBrainThink(World* w) {
   static Scenario sc;
   std::string now_scenario = w->scenario ? w->scenario : "";
   if (now_scenario != last_scenario) sc = ParseScenario(w->scenario), last_scenario = now_scenario;
+  g_shore.Load(w->nav_path);
   Brain brain{*w, rng, sc};
   for (int i = 0; i < w->bot_count; ++i) brain.Think(w->bots[i]);
 }

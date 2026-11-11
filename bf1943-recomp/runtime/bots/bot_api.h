@@ -10,7 +10,7 @@
 
 namespace botapi {
 
-constexpr int kVersion = 1;      // bump when a struct here changes
+constexpr int kVersion = 3;      // bump when a struct here changes
 constexpr int kMaxBots = 16;
 constexpr int kMemSize = 1024;   // per-bot brain state
 constexpr float kPi = 3.14159265f;
@@ -57,6 +57,12 @@ struct World {
   int result;            // out: 1 the scenario passed, -1 failed
   char result_text[160];
   void (*log)(const char* text);
+  const char* nav_path;  // the brain's notes on this map (ways up from the water), kept across matches
+  // The map's navigation mesh (runtime/bots/nav.cpp; null without one): up to
+  // max corners of a route for that bot from a to b (0: no way), and a place a
+  // bot couldn't get onto (off for routes from then on).
+  int (*route)(int slot, Vec a, Vec b, Vec* corners, int max);
+  void (*block)(Vec at);
 };
 
 using ThinkFn = void (*)(World*);
