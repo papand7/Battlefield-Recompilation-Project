@@ -1501,6 +1501,8 @@ struct Bot {
   int64_t since = 0, unstick_until = 0, jump_until = 0;
   int side = 1;
   int stucks = 0;              // stuck events near the same place (last_sx, last_sz)
+  int detours = 0;             // detours from around there so far (each one wider)
+  float detour_from[2] = {1e9f, 1e9f};
   float detour[3] = {0, 0, 0};  // a way out: a reachable place nearby
   int64_t detour_until = 0;
   uint32_t enemy = 0, engaged = 0;
@@ -2354,22 +2356,26 @@ static void BotBrain(Bot& b, uint32_t in) {
       BlockPoly(ahead);
       b.planned = 0;
     }
-    // Stuck three times around here: a detour to a reachable place 4 to 10 m
-    // away on the mesh's main piece (a random one), then the route again.
+    // Stuck three times around here: a detour to a reachable place on the
+    // mesh's main piece (a random one) 4 to 10 m away, then the route again;
+    // from the same place again, wider each time (20, 30, 40 m).
     if (b.stucks >= 3 && g_navquery) {
+      if (std::hypot(x - b.detour_from[0], z - b.detour_from[1]) < 8.0f) ++b.detours;
+      else b.detours = 0, b.detour_from[0] = x, b.detour_from[1] = z;
+      const float radius = 10.0f * float(1 + std::min(b.detours, 3));
       dtQueryFilter filter;
       const float ext[3] = {2, 4, 2};
       float at[3] = {x, y, z}, onmesh[3], pt[3];
       dtPolyRef start = 0, ref = 0;
       g_navquery->findNearestPoly(at, ext, &filter, &start, onmesh);
       for (int tries = 0; start && tries < 12; ++tries) {
-        if (dtStatusFailed(g_navquery->findRandomPointAroundCircle(start, onmesh, 10.0f, &filter,
+        if (dtStatusFailed(g_navquery->findRandomPointAroundCircle(start, onmesh, radius, &filter,
                                                                    [] { return float(rand()) / RAND_MAX; }, &ref, pt)))
           break;
         float d = std::hypot(pt[0] - x, pt[2] - z);
-        if (d < 4.0f || !InMainPiece(ref)) continue;
+        if (d < std::max(4.0f, radius * 0.4f) || !InMainPiece(ref)) continue;
         memcpy(b.detour, pt, sizeof(pt));
-        b.detour_until = now + 6000, b.stucks = 0;
+        b.detour_until = now + int64_t(radius * 600.0f), b.stucks = 0;
         RT_INFO("bot %d: stuck here again; out by %.1f %.1f first", b.index, pt[0], pt[2]);
         break;
       }
@@ -2440,7 +2446,9 @@ static void BotBrain(Bot& b, uint32_t in) {
       // to tell): its shots are rolled here, one every 150 ms, hitting less
       // the further the enemy (90 % at 5 m, 15 % from 40 m), and each hit is
       // damage the server applies (DamageSoldier, from the input copy hook).
-      if (now >= b.next_shot) {
+      // BF_BOT_NO_ROLL=1 (testing): no rolled hits, only what its own bullets do.
+      static const bool no_roll = getenv("BF_BOT_NO_ROLL") != nullptr;
+      if (!no_roll && now >= b.next_shot) {
         b.next_shot = now + 150;
         float chance = std::clamp(1.05f - b.edist / 40.0f, 0.15f, 0.9f);
         if (float(rand()) / RAND_MAX < chance) b.hit = b.enemy;
@@ -3409,4 +3417,22 @@ PPC_FUNC(sub_82303C20) {
     bf_crash_diag::PrintStack(nullptr);
   }
   __imp__sub_82303C20(ctx, base);
+}
+
+// A player's connection dropped (8235FD80 on the player manager, r4 the
+// connection: out of its list at +520, then the peer's disconnect 826FF630).
+// A bot's connection has no traffic, so the network layer drops it after a
+// few minutes, and the disconnect reads what only a real client's peer has
+// (a fault at 00000096 in 82700480): a bot's is kept instead.
+extern "C" PPC_FUNC(__imp__sub_8235FD80);
+PPC_FUNC(sub_8235FD80) {
+  for (const Bot& b : g_bots)
+    if (b.conn && (ctx.r4.u32 == b.conn || ctx.r4.u32 == b.conn + 4 || ctx.r4.u32 == Ld32(b.conn + 0x14))) {
+      static int said = 0;
+      if (said++ < 8) RT_INFO("bot %d: its connection %08X kept (the network would drop it)", b.index, ctx.r4.u32);
+      return;
+    }
+  static int seen = 0;
+  if (seen++ < 8) RT_INFO("net: player connection %08X (vt %08X) dropped", ctx.r4.u32, Ptr(ctx.r4.u32) ? Ld32(ctx.r4.u32) : 0);
+  __imp__sub_8235FD80(ctx, base);
 }
