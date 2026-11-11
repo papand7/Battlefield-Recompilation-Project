@@ -110,5 +110,25 @@ const bool g_find_slot = [] {
   return true;
 }();
 
+
+// BF_DUMP_VT=<vtable hex>,<bytes>: the words of a vtable (its methods).
+const bool g_dump_vt = [] {
+  const char* e = getenv("BF_DUMP_VT");
+  if (!e) return false;
+  uint32_t vt = 0, len = 0x100;
+  sscanf(e, "%x,%x", &vt, &len);
+  std::thread([vt, len] {
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    std::string out;
+    for (uint32_t k = 0; k < len; k += 4) {
+      char buf[24];
+      snprintf(buf, sizeof(buf), " +%X:%08X", k, Ld32(vt + k));
+      out += buf;
+    }
+    RT_INFO("dump vt %08X:%s", vt, out.c_str());
+  }).detach();
+  return true;
+}();
+
 }  // namespace
 }  // namespace rt

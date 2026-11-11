@@ -300,6 +300,13 @@ GAME_PATCH(822ED8D8) {  // a player's received input to its soldier
     uint32_t so = Ld32(ctx.r3.u32 + 4);
     for (BotPlayer& b : g_players)
       if (b.soldier && b.soldier == so && getenv("BF_BOT_DRIVE")) {
+        // The whole record from a moving player's (its frame time +80/+84,
+        // heading +88, +90 ...), keeping its network id; then our input.
+        if (g_have_template && getenv("BF_BOT_FULL_RECORD")) {
+          uint32_t id = Ld32(ctx.r4.u32 + 0x9C);
+          memcpy(G<uint8_t>(ctx.r4.u32 + 4), g_move_template + 0x10 + 4, 0xB0);
+          St32(ctx.r4.u32 + 0x9C, id);
+        }
         float fwd = 0.8f;
         uint32_t u;
         memcpy(&u, &fwd, 4);
@@ -526,6 +533,88 @@ GAME_PATCH(82414430) {
       memcpy(&u, &fwd, 4);
       St32(b.move_msg + 0x10 + 8, u);
       St32(b.move_msg + 0x10 + 0x9C, b.ghost_id);
+      // EXPERIMENT (BF_BOT_CONTROL): the receiver's +118 is the entity it
+      // controls (823B2C80 compares it with the one the move names).
+      static int64_t said = 0;
+      if (now - said > 5000) {
+        said = now;
+        RT_INFO("bot %d: receiver +118 %08X (vt %08X), its soldier %08X", b.index, Ld32(b.mover + 0x118),
+                IsCommitted(Ld32(b.mover + 0x118)) ? Ld32(Ld32(b.mover + 0x118)) : 0, b.soldier);
+      }
+      if (getenv("BF_BOT_CONTROL")) St32(b.mover + 0x118, b.soldier);
+      // EXPERIMENT (BF_BOT_YAW_SPIN): turn the soldier through its aim (the
+      // character entity, soldier +130: heading +134), a little each tick.
+      if (getenv("BF_BOT_YAW_SPIN")) {
+        uint32_t aim = Ld32(b.soldier + 0x130);
+        if (aim && IsCommitted(aim + 0x140)) {
+          float yaw = LdF(aim + 0x134) + 0.02f;
+          uint32_t yu;
+          memcpy(&yu, &yaw, 4);
+          St32(aim + 0x134, yu);
+        }
+      }
+      // BF_BOT_VEC_WATCH: the 16-byte vectors at the bot soldier's position,
+      // read again 4 s later: does anything (its physics) move?
+      static std::vector<uint32_t> vecs;
+      static int64_t vec_t = 0;
+      if (getenv("BF_BOT_VEC_WATCH")) {
+        float px = LdF(b.soldier + 0x180), py = LdF(b.soldier + 0x184), pz = LdF(b.soldier + 0x188);
+        if (vecs.empty() && px != 0) {
+          for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+            if (page >= 0x80000000 && page < 0xA0000000) continue;
+            if (!IsCommitted(uint32_t(page))) continue;
+            for (uint32_t k = 0; k < 0x1000; k += 16) {
+              uint32_t va = uint32_t(page) + k;
+              if (std::fabs(LdF(va) - px) < 0.05f && std::fabs(LdF(va + 4) - py) < 0.5f && std::fabs(LdF(va + 8) - pz) < 0.05f)
+                vecs.push_back(va);
+            }
+          }
+          vec_t = now;
+          RT_INFO("bot %d: %zu vectors at its position %.1f %.1f %.1f", b.index, vecs.size(), px, py, pz);
+        } else if (!vecs.empty() && now - vec_t > 4000 && vec_t) {
+          vec_t = 0;
+          std::string moved;
+          for (uint32_t va : vecs) {
+            float dx = LdF(va) - px, dz = LdF(va + 8) - pz;
+            if (std::fabs(dx) > 0.05f || std::fabs(dz) > 0.05f) {
+              char buf[64];
+              snprintf(buf, sizeof(buf), " %08X(%.1f %.1f)", va, LdF(va), LdF(va + 8));
+              moved += buf;
+            }
+          }
+          RT_INFO("bot %d: 4 s later, moved vectors:%s", b.index, moved.empty() ? " none" : moved.c_str());
+        }
+      }
+      // BF_BOT_CHAR: the character entities (820332B8) that point at a
+      // soldier (within 0x200), the bot's and the real ones, with their words.
+      static int64_t char_said = 0;
+      if (getenv("BF_BOT_CHAR") && now - char_said > 8000) {
+        char_said = now;
+        for (uint32_t ce : Scan(0x820332B8)) {
+          for (uint32_t off = 0; off < 0x200; off += 4) {
+            uint32_t v = Ld32(ce + off);
+            if (v < 0x40000000 || v >= 0xC0000000 || (v & 3) || !IsCommitted(v) || Ld32(v) != kSoldier) continue;
+            RT_INFO("bot players: character %08X%s +%X -> soldier %08X:%s", ce, v == b.soldier ? " (bot)" : "", off, v,
+                    Around(ce, 0, 0x100).c_str());
+            break;
+          }
+        }
+        // what sits at soldier + 1000 (the real one's character points there, +A4)
+        for (uint32_t so : Scan(kSoldier)) {
+          uint32_t o = so + 0x1000;
+          RT_INFO("bot players: soldier %08X%s + 1000 (vt %08X %s):%s", so, so == b.soldier ? " (bot)" : "", Ld32(o),
+                  TypeName(Ld32(o)).c_str(), Around(o, 0, 0x60).c_str());
+        }
+        // and the soldier's pointers to it
+        for (uint32_t off = 0; off < 0x600; off += 4) {
+          uint32_t v = Ld32(b.soldier + off);
+          if (v >= 0x40000000 && v < 0xC0000000 && IsCommitted(v) && Ld32(v) == 0x820332B8)
+            RT_INFO("bot players: bot soldier +%X -> character %08X", off, v);
+        }
+      }
+      // EXPERIMENT (BF_BOT_FLAGS): a walking soldier's +34C ends in 00 (the
+      // bot's 56) and its +21C is 0 (the bot's 1D00).
+      if (getenv("BF_BOT_FLAGS")) St32(b.soldier + 0x34C, Ld32(b.soldier + 0x34C) & 0xFFFFFF00), St32(b.soldier + 0x21C, 0);
       // EXPERIMENT (BF_BOT_STATE6): a walking soldier has 6 at +1BC, +224
       // and +228 where the bot's has 0, 1 and 1.
       if (getenv("BF_BOT_STATE6")) St32(b.soldier + 0x1BC, 6), St32(b.soldier + 0x224, 6), St32(b.soldier + 0x228, 6);
@@ -542,6 +631,11 @@ GAME_PATCH(82414430) {
           for (uint32_t is : Scan(0x82012320))
             RT_INFO("bot players: input state %08X soldier %08X%s:%s", is, Ld32(is + 4),
                     Ld32(is + 4) == b.soldier ? " (bot)" : "", Around(is, 4, 0x40).c_str());
+        if (getenv("BF_BOT_RCV_DUMP")) {
+          RT_INFO("bot %d: its receiver %08X:%s", b.index, b.mover, Around(b.mover, 0xB0, 0x130).c_str());
+          if (g_real_mover) RT_INFO("bot %d: a real receiver %08X:%s", b.index, g_real_mover, Around(g_real_mover, 0xB0, 0x130).c_str());
+        }
+        RT_INFO("bot %d: heading %.2f", b.index, LdF(Ld32(b.soldier + 0x130) + 0x134));
         RT_INFO("bot %d: driven soldier %08X at %.1f %.1f %.1f (move %u)", b.index, b.soldier, LdF(b.soldier + 0x180),
                 LdF(b.soldier + 0x184), LdF(b.soldier + 0x188), b.move_seq);
       }
@@ -650,6 +744,25 @@ GAME_PATCH(827600A8) {
 }
 
 GAME_PATCH(823B2C80) {
+  // BF_BOT_MSG_DUMP: a moving player's whole move message (0x300 bytes) as floats, with
+  // its soldier's position, to see whether the client sends where it is.
+  static int dumps = 0;
+  if (getenv("BF_BOT_MSG_DUMP") && dumps < 2 && Ld32(ctx.r4.u32) == 0x8200E490 && LdF(ctx.r4.u32 + 0x10 + 8) > 0.5f) {
+    ++dumps;
+    std::string f;
+    for (uint32_t off = 0; off < 0x300; off += 4) {
+      float v = LdF(ctx.r4.u32 + off);
+      uint32_t u = Ld32(ctx.r4.u32 + off);
+      if (!u) continue;
+      char buf[40];
+      if (std::isfinite(v) && std::fabs(v) > 1e-3f && std::fabs(v) < 1e5f) snprintf(buf, sizeof(buf), " %X:%.2f", off, v);
+      else snprintf(buf, sizeof(buf), " %X:%08X", off, u);
+      f += buf;
+    }
+    uint32_t so = Ld32(ctx.r3.u32 + 0x118);
+    RT_INFO("bot players: move message of soldier %08X at %.1f %.1f %.1f:%s", so, LdF(so + 0x180), LdF(so + 0x184),
+            LdF(so + 0x188), f.c_str());
+  }
   // (From a player who is moving: the host's own on the spawn screen is mostly zeros.)
   if (!g_have_template && Ld32(ctx.r4.u32) == 0x8200E490 && LdF(ctx.r4.u32 + 0x10 + 8) > 0.5f) {
     memcpy(g_move_template, G<uint8_t>(ctx.r4.u32), sizeof(g_move_template));
@@ -657,7 +770,7 @@ GAME_PATCH(823B2C80) {
   }
   bool bot_mover = false;
   for (BotPlayer& b : g_players) bot_mover |= b.mover == ctx.r3.u32;
-  if (!bot_mover) g_real_mover = ctx.r3.u32;
+  if (!bot_mover && LdF(ctx.r4.u32 + 0x10 + 8) > 0.5f) g_real_mover = ctx.r3.u32;
   static std::atomic<int> n{0};
   if (g_discover && n < 4 && Ld32(ctx.r3.u32 + 0x10)) {
     Note("move message 823B2C80", n, ctx);
@@ -672,7 +785,109 @@ GAME_PATCH(823B2C80) {
   }
   __imp__sub_823B2C80(ctx, base);
 }
+// The input a step uses: 8236F238 on the seat's controller (entry + 284).
+// BF_BOT_STEP_INPUT: for the bot soldier's steps, what that controller and
+// input are.
+uint32_t g_step_soldier = 0;
+GAME_PATCH(8236F238) {
+  uint32_t ctl = ctx.r3.u32;
+  __imp__sub_8236F238(ctx, base);
+  // A bot soldier's step: its input record is the spawn object's (made with
+  // the join, never filled in without a client): our input goes there, over
+  // a moving player's record (frame time +80/+84, heading +88, +90).
+  if (getenv("BF_BOT_DRIVE") && g_step_soldier)
+    for (BotPlayer& b : g_players)
+      if (b.soldier == g_step_soldier && Ld32(ctx.r3.u32) == 0x8200E48C) {
+        // The actions are read from the record it points at, +160
+        // (822BD248: analog action i at +8 + 4 i, buttons as bits at +78).
+        uint32_t rec = ctx.r3.u32;
+        if (getenv("BF_BOT_REC160")) {
+          uint32_t p = Ld32(rec + 0x160);
+          static int said = 0;
+          if (said++ < 3)
+            RT_INFO("bot %d: step input %08X +160 -> %08X (vt %08X)", b.index, rec, p, IsCommitted(p) ? Ld32(p) : 0);
+          if (p >= 0x40000000 && p < 0xC0000000 && IsCommitted(p) && Ld32(p) == 0x8200E48C) rec = p;
+          else if (p != rec) return;  // not a record: leave it
+        }
+        if (g_have_template && !getenv("BF_BOT_REC160")) {
+          uint32_t keep4 = Ld32(rec + 4), id = Ld32(rec + 0x9C);
+          memcpy(G<uint8_t>(rec + 4), g_move_template + 0x10 + 4, 0xB0);
+          St32(rec + 4, keep4), St32(rec + 0x9C, id);
+        }
+        // The sticks (action i at +8 + 4 i: 0 forward, 1 strafe, 4 turn,
+        // 5 look; 822ED8D8 copies them into the input state): ours only.
+        for (uint32_t k = 8; k < 0x30; k += 4) St32(rec + k, 0);
+        float fwd = 0.8f;
+        uint32_t u;
+        memcpy(&u, &fwd, 4);
+        St32(rec + 8, u);
+        // The client's tick counters (+98, +A4: about 60 a second), advanced
+        // by two a step: the step's time comes from them.
+        if (!getenv("BF_BOT_NO_TICKS")) {
+          static std::map<uint32_t, uint32_t> ticks;
+          uint32_t& t = ticks[rec];
+          if (!t) t = Ld32(rec + 0x98) + 1;
+          t += 2;
+          St32(rec + 0x98, t), St32(rec + 0xA4, t);
+        }
+        // The heading the player aims (record +88, radians): testing, a slow turn.
+        if (getenv("BF_BOT_HEADING_SPIN")) {
+          static float h = 0;
+          h += 0.01f;
+          if (h > 6.2832f) h -= 6.2832f;
+          memcpy(&u, &h, 4);
+          St32(rec + 0x88, u);
+        }
+        if (const char* t = getenv("BF_BOT_TURN")) {  // testing: a constant turn (action 4)
+          float turn = float(atof(t));
+          memcpy(&u, &turn, 4);
+          St32(rec + 0x18, u);
+        }
+      }
+  static int64_t next = 0;
+  int64_t t = int64_t(GetTickCount64());
+  if (getenv("BF_BOT_STEP_INPUT") && g_step_soldier && t >= next) {
+    bool bot = false;
+    for (BotPlayer& b : g_players) bot |= b.soldier == g_step_soldier;
+    if (bot) {
+      next = t + 3000;
+      uint32_t in = ctx.r3.u32;
+      RT_INFO("bot players: bot step: controller %08X (vt %08X %s), input %08X (vt %08X %s) +8 %.2f:%s", ctl, Ld32(ctl),
+              TypeName(Ld32(ctl)).c_str(), in, IsCommitted(in) ? Ld32(in) : 0,
+              IsCommitted(in) ? TypeName(Ld32(in)).c_str() : "", IsCommitted(in) ? LdF(in + 8) : 0.f,
+              IsCommitted(in) ? Around(in, 0, 0x40).c_str() : "");
+    }
+  }
+}
+
 GAME_PATCH(822F05C8) {
+  // BF_BOT_STEP_TRACE: steps per soldier, and how far each step moves it.
+  g_step_soldier = ctx.r3.u32;
+  if (getenv("BF_BOT_STEP_TRACE")) {
+    uint32_t so = ctx.r3.u32;
+    float x0 = LdF(so + 0x180), z0 = LdF(so + 0x188);
+    PPCContext c = ctx;
+    __imp__sub_822F05C8(ctx, base);
+    static std::map<uint32_t, std::pair<int, float>> st;
+    auto& e = st[so];
+    e.first++, e.second += std::hypot(LdF(so + 0x180) - x0, LdF(so + 0x188) - z0);
+    static int64_t next = 0;
+    int64_t t = int64_t(GetTickCount64());
+    if (t >= next) {
+      next = t + 5000;
+      std::string out;
+      for (auto& [k, v] : st) {
+        bool bot = false;
+        for (BotPlayer& b : g_players) bot |= b.soldier == k;
+        char buf[80];
+        snprintf(buf, sizeof(buf), " %08X%s: %d steps, moved %.1f m;", k, bot ? "(bot)" : "", v.first, v.second);
+        out += buf;
+      }
+      RT_INFO("bot players: soldier steps:%s r4 %08X r5 %08X", out.c_str(), c.r4.u32, c.r5.u32);
+      st.clear();
+    }
+    return;
+  }
   static std::atomic<int> n{0};
   if (g_discover && n < 4) {
     Note("soldier step 822F05C8", n, ctx);
