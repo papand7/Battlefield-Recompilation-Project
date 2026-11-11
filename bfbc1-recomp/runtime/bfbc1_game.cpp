@@ -49,6 +49,9 @@ bool BotLookAxis(int, float&) { return false; }
 // Sticks held by the test automation (BF_AUTO_MP "walk", "turn" and "look" steps).
 static std::atomic<int16_t> g_auto_ly{0}, g_auto_rx{0}, g_auto_ry{0}, g_auto_lx{0};
 static std::atomic<uint8_t> g_auto_rt{0};
+// The host's autopilot (bc_bots.cpp, BF_BOT_HOST_PILOT): sticks and buttons.
+std::atomic<int16_t> g_pilot_lx{0}, g_pilot_ly{0}, g_pilot_rx{0}, g_pilot_ry{0};
+std::atomic<uint16_t> g_pilot_buttons{0};
 // The pad, every poll: our Multiplayer menu (bc_mp_menu.cpp) takes it while open.
 bool AddBotInput(XINPUT_GAMEPAD& pad) {
   if (int16_t v = g_auto_ly.load()) pad.sThumbLY = v;
@@ -56,6 +59,11 @@ bool AddBotInput(XINPUT_GAMEPAD& pad) {
   if (int16_t v = g_auto_ry.load()) pad.sThumbRY = v;
   if (int16_t v = g_auto_lx.load()) pad.sThumbLX = v;
   if (uint8_t v = g_auto_rt.load()) pad.bRightTrigger = v;
+  if (int16_t v = g_pilot_lx.load()) pad.sThumbLX = v;
+  if (int16_t v = g_pilot_ly.load()) pad.sThumbLY = v;
+  if (int16_t v = g_pilot_rx.load()) pad.sThumbRX = v;
+  if (int16_t v = g_pilot_ry.load()) pad.sThumbRY = v;
+  pad.wButtons |= g_pilot_buttons.load();
   if (bcmp::Update(pad)) pad = {};
   return false;
 }
@@ -207,14 +215,16 @@ static const bool g_auto_mp_started = [] {
                    : name == "a" ? XINPUT_GAMEPAD_A : name == "b" ? XINPUT_GAMEPAD_B
                    : name == "start" ? XINPUT_GAMEPAD_START : 0;
         if (name == "wait") std::this_thread::sleep_for(std::chrono::seconds(3));
-        if (name.rfind("hold:", 0) == 0) {  // hold:<a|b|x|y|lb|rb|ls|rs|back> 1.5 s
+        if (name.rfind("hold:", 0) == 0) {  // hold:<a|b|x|y|lb|rb|ls|rs|back>[:ms] (1.5 s)
           std::string btn = name.substr(5);
+          int ms = 1500;
+          if (size_t c = btn.find(':'); c != std::string::npos) ms = std::atoi(btn.c_str() + c + 1), btn.resize(c);
           uint16_t bits = btn == "a" ? XINPUT_GAMEPAD_A : btn == "b" ? XINPUT_GAMEPAD_B
                         : btn == "x" ? XINPUT_GAMEPAD_X : btn == "y" ? XINPUT_GAMEPAD_Y
                         : btn == "lb" ? XINPUT_GAMEPAD_LEFT_SHOULDER : btn == "rb" ? XINPUT_GAMEPAD_RIGHT_SHOULDER
                         : btn == "ls" ? XINPUT_GAMEPAD_LEFT_THUMB : btn == "rs" ? XINPUT_GAMEPAD_RIGHT_THUMB
                         : btn == "back" ? XINPUT_GAMEPAD_BACK : 0;
-          press(bits, 1500);
+          press(bits, ms);
           RT_INFO("auto mp: %s (step %zu)", name.c_str(), done);
           continue;
         }
