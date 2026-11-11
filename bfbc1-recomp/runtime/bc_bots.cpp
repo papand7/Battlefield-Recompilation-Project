@@ -1044,6 +1044,66 @@ const bool g_dump_collision_started = [] {
   return true;
 }();
 
+// BF_BOT_TYPES=Name,Name (testing): 60 s into the level, the vtables of the
+// classes with those names and their objects (up to 8 each): the words of
+// their first 0x100 bytes, and the mission objectives (crates) they point to
+// within 0x400 bytes.
+const bool g_types_started = [] {
+  const char* names = getenv("BF_BOT_TYPES");
+  if (!names) return false;
+  std::string list = std::string(",") + names + ",";
+  std::thread([list] {
+    std::this_thread::sleep_for(std::chrono::seconds(150));
+    std::map<uint32_t, int> vts;
+    for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+      if (page >= 0x80000000 && page < 0xA0000000) continue;
+      if (!IsCommitted(uint32_t(page))) continue;
+      const uint32_t* q = reinterpret_cast<const uint32_t*>(g_base + page);
+      for (int i = 0; i < 1024; ++i) {
+        uint32_t w = _byteswap_ulong(q[i]);
+        if (w < 0x82000000 || w >= 0x82180000 || (w & 3)) continue;
+        uint32_t e = Ld32(w);
+        if (e >= 0x82180000 && e < 0x82F00000 && !vts.count(w)) vts[w] = int(page + 4 * i);
+      }
+    }
+    for (auto& [vt, example] : vts) {
+      std::string name = TypeName(uint32_t(example));
+      if (name.empty() || list.find("," + name + ",") == std::string::npos) continue;
+      std::vector<uint32_t> objs = Scan(vt);
+      RT_INFO("bot types: %s vtable %08X, %zu objects", name.c_str(), vt, objs.size());
+      for (size_t i = 0; i < objs.size() && i < 24; ++i) {
+        std::string w, crates;
+        for (uint32_t off = 0; off < 0x100; off += 4) {
+          char buf[16];
+          snprintf(buf, sizeof(buf), " %08X", Ld32(objs[i] + off));
+          w += buf;
+        }
+        for (uint32_t off = 0; off < 0x400; off += 4) {
+          uint32_t p = Ld32(objs[i] + off);
+          if (Ptr(p) && Ld32(p) == 0x82013AF0) crates += " +" + std::to_string(off) + "->" + std::to_string(p);
+        }
+        std::string where;  // transforms: three unit rows, then a translation
+        for (uint32_t off = 0; off + 64 <= 0x400; off += 4) {
+          bool ok = true;
+          for (int j = 0; j < 3 && ok; ++j) {
+            float a0 = LdF(objs[i] + off + 16 * j), a1 = LdF(objs[i] + off + 16 * j + 4), a2 = LdF(objs[i] + off + 16 * j + 8);
+            float l = a0 * a0 + a1 * a1 + a2 * a2;
+            ok = std::isfinite(l) && std::fabs(l - 1) < 1e-3f;
+          }
+          if (!ok) continue;
+          char buf[64];
+          snprintf(buf, sizeof(buf), " +%X(%.1f %.1f %.1f)", off + 48, LdF(objs[i] + off + 48), LdF(objs[i] + off + 52),
+                   LdF(objs[i] + off + 56));
+          where += buf;
+        }
+        RT_INFO("bot types: %s %08X data %08X at%s | crates:%s", name.c_str(), objs[i], Ld32(objs[i] + 0x14), where.c_str(),
+                crates.c_str());
+      }
+    }
+  }).detach();
+  return true;
+}();
+
 const bool g_census_started = [] {
   if (!getenv("BF_BOT_CENSUS") && !getenv("BF_BOT_PLAYER_DUMP") && !getenv("BF_BOT_DUMP_VT")) return false;
   std::thread([] {
@@ -1610,8 +1670,10 @@ static void set_aim(uint32_t aim_obj, float heading) {
   St32(aim_obj + 0x134, u);
 }
 
-// A first brain for the fake soldier: to the nearest gold crate (mission
-// objective, position +C0). Heading from the soldier's world matrix (forward
+// A first brain for the fake soldier: to the nearest gold crate. The crates
+// are where their interaction entities are (ServerInteractionEntity, vtable
+// 82011680, two per crate, position +D0/+D4/+D8); a mission objective's +C0
+// is its marker, above the base. Heading from the soldier's world matrix (forward
 // row +320/+328 in x/z); turning right lowers atan2(x, z).
 static void FakeBrain(uint32_t in) {
   auto set = [in](uint32_t off, float f) {
@@ -1623,10 +1685,11 @@ static void FakeBrain(uint32_t in) {
   if (!so || !IsCommitted(so) || Ld32(so) != 0x820118D0) return;
   float x = LdF(so + 0x200), z = LdF(so + 0x208), fx = LdF(so + 0x320), fz = LdF(so + 0x328);
   float best = 1e9f, tx = 0, tz = 0;
-  for (uint32_t crate : Scan(0x82013AF0)) {
-    float cx = LdF(crate + 0xC0), cz = LdF(crate + 0xC8);
+  float ty = 0;
+  for (uint32_t crate : Scan(0x82011680)) {
+    float cx = LdF(crate + 0xD0), cz = LdF(crate + 0xD8);
     float d = std::hypot(cx - x, cz - z);
-    if (d < best) best = d, tx = cx, tz = cz;
+    if (d < best) best = d, tx = cx, tz = cz, ty = LdF(crate + 0xD4);
   }
   if (best > 1e8f) return;
   // BF_BOT_CRATE_PROBE=1 (testing): every 20 s, each mission objective's +C0
@@ -1676,8 +1739,7 @@ static void FakeBrain(uint32_t in) {
     planned = now_ms;
     route.clear(), step = 0;
     float from[3] = {x, LdF(so + 0x204), z}, to[3] = {tx, LdF(so + 0x204), tz};
-    for (uint32_t crate : Scan(0x82013AF0))
-      if (std::fabs(LdF(crate + 0xC0) - tx) < 0.01f && std::fabs(LdF(crate + 0xC8) - tz) < 0.01f) to[1] = LdF(crate + 0xC4);
+    to[1] = ty;
     route = RouteMesh(from, to);
     if (!route.empty()) {
       RT_INFO("bot nav: navigation mesh route of %zu corners to the crate", route.size());
@@ -1829,13 +1891,47 @@ static void FakeBrain(uint32_t in) {
   St32(in + 0x84, (jump ? 0x2000u : 0u) | (arm ? 0x200000u : 0u));
   St32(in + 0x44, jump ? 0x00003C00u : 0u);
   St32(in + 0x54, arm ? 0x00003C00u : 0u);
+  // BF_BOT_ARM_SWEEP=1 (testing): at the crate every button bit but A's, and
+  // every held time at 1.0 (both halves); the interaction entities within 6 m
+  // (a transform at +40..+400 there) logged when their first 0x200 bytes change.
+  if (arm && getenv("BF_BOT_ARM_SWEEP")) {
+    St32(in + 0x84, 0xFFFFFFFFu & ~0x2000u);
+    for (uint32_t off = 0x40; off <= 0x58; off += 4) St32(in + off, 0x3C003C00u);
+    static std::map<uint32_t, std::vector<uint32_t>> seen;
+    static int64_t last_look = 0;
+    if (now - last_look > 1000) {
+      last_look = now;
+      for (uint32_t ie : Scan(0x82011680)) {
+        bool close = false;
+        for (uint32_t off = 0x40; off < 0x400 && !close; off += 4) {
+          float tx2 = LdF(ie + off), ty2 = LdF(ie + off + 4), tz2 = LdF(ie + off + 8);
+          close = std::isfinite(tx2) && std::fabs(ty2) < 300 && ty2 > 50 && std::hypot(tx2 - x, tz2 - z) < 6.0f;
+        }
+        if (!close) continue;
+        std::vector<uint32_t> w(0x80);
+        for (uint32_t k = 0; k < 0x80; ++k) w[k] = Ld32(ie + 4 * k);
+        auto& before = seen[ie];
+        std::string d;
+        for (uint32_t k = 0; k < 0x80 && !before.empty(); ++k)
+          if (w[k] != before[k]) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), " +%X:%08X>%08X", 4 * k, before[k], w[k]);
+            d += buf;
+          }
+        if (before.empty() || !d.empty())
+          RT_INFO("bot brain: interaction entity %08X near (radius %.1f)%s", ie,
+                  Ptr(Ld32(ie + 0x14)) ? LdF(Ld32(ie + 0x14) + 0x84) : -1.0f, d.empty() ? " first seen" : d.c_str());
+        before = w;
+      }
+    }
+  }
   // At the crate: what of its first 0x200 bytes changes while X is held.
   static uint32_t watched = 0;
   static std::vector<uint32_t> before_arm;
   if (arm) {
     uint32_t crate = 0;
-    for (uint32_t c : Scan(0x82013AF0))
-      if (std::hypot(LdF(c + 0xC0) - x, LdF(c + 0xC8) - z) < 3.0f) crate = c;
+    for (uint32_t c : Scan(0x82011680))
+      if (std::hypot(LdF(c + 0xD0) - x, LdF(c + 0xD8) - z) < 3.0f) crate = c;
     if (crate && crate != watched) {
       watched = crate;
       before_arm.assign(0x80, 0);
@@ -1855,6 +1951,23 @@ static void FakeBrain(uint32_t in) {
         }
       }
       RT_INFO("bot brain: crate %08X after %lld ms of X:%s", crate, (long long)(now - held_x_since), d.c_str());
+      // And the mission objectives: did one change (armed)?
+      static std::map<uint32_t, std::vector<uint32_t>> objectives;
+      for (uint32_t o : Scan(0x82013AF0)) {
+        auto& was = objectives[o];
+        std::string od;
+        for (uint32_t k = 0; k < 0x80; ++k) {
+          uint32_t v = Ld32(o + 4 * k);
+          if (!was.empty() && v != was[k]) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), " +%X:%08X>%08X", 4 * k, was[k], v);
+            od += buf;
+          }
+        }
+        if (!od.empty()) RT_INFO("bot brain: objective %08X changed:%s", o, od.c_str());
+        was.resize(0x80);
+        for (uint32_t k = 0; k < 0x80; ++k) was[k] = Ld32(o + 4 * k);
+      }
     }
   }
   set(0x8, forward);
