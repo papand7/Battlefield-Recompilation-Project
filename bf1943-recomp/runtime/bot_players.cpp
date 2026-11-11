@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -128,7 +129,31 @@ struct BotPlayer {
   uint32_t spawner = 0;  // its spawn object
   uint32_t soldier = 0;
   int64_t died_ms = 0;
+  uint32_t move_msg = 0;  // its own move message (a copy of a real one)
+  uint32_t mover = 0;     // its move receiver (823B2C80's r3)
+  uint32_t move_seq = 0;
 };
+// A player's move receiver (823B2C80's r3): +14 1E, +18 3, +30 its spawn
+// object, then a ring of move numbers (-1 when empty).
+uint32_t FindMover(uint32_t spawner) {
+  for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+    if (page >= 0x80000000 && page < 0xA0000000) continue;
+    if (!IsCommitted(uint32_t(page))) continue;
+    for (uint32_t i = 0x30; i < 0x1000; i += 4) {
+      uint32_t a = uint32_t(page) + i;
+      if (Ld32(a) != spawner) continue;
+      uint32_t o = a - 0x30;
+      if (Ld32(o + 0x14) == 0x1E && Ld32(o + 0x18) == 3) return o;
+    }
+  }
+  return 0;
+}
+// A real player's move message (823B2C80's r4: vtable 8200E490, +4 its
+// number, +10 the input record, vtable 8200E48C: +8 forward ...), kept as
+// the template for the bots'.
+uint8_t g_move_template[0x100];
+bool g_have_template = false;
+uint32_t g_real_mover = 0;  // a real player's move receiver (to clone for the bots)
 std::deque<BotPlayer> g_players;
 const int g_fake_count = getenv("BF_BOT_FAKE") ? std::clamp(atoi(getenv("BF_BOT_FAKE")), 1, 16) : 0;
 
@@ -201,6 +226,14 @@ GAME_PATCH(823B59E0) {  // the player manager's join
           if (Has(peers_before, peer)) continue;
           if (!Ld32(o + 0x14)) St32(o + 0x14, peer);
           if (!Ld32(o + 0x28)) St32(o + 0x28, peer);
+        }
+        // EXPERIMENT (BF_BOT_READY): a real player's part after the handshake
+        // also has +10 | 01000000, +38 010B0003 and +3C 1 (its soldier only
+        // gets updated then?).
+        if (getenv("BF_BOT_READY")) {
+          St32(o + 0x10, Ld32(o + 0x10) | 0x01000000);
+          St32(o + 0x38, 0x010B0003);
+          St32(o + 0x3C, 1);
         }
         b.conn = o;
       }
@@ -348,19 +381,62 @@ GAME_PATCH(8237EE38) {  // the spawn object's constructor (Bad Company's 8232ECB
 // object (+1F4, +1F8), then deploy (82382720) with no spawn point (r4 0: the
 // game picks one of the team's).
 extern "C" PPC_FUNC(__imp__sub_82382720);
+extern "C" PPC_FUNC(__imp__sub_823B2C80);
 GAME_PATCH(82414430) {
   __imp__sub_82414430(ctx, base);
   if (g_players.empty()) return;
-  static int64_t last = 0;
   int64_t now = int64_t(GetTickCount64());
-  if (now - last < 1000) return;
-  last = now;
+  static int64_t last = 0;
+  bool second = now - last >= 1000;
+  if (second) last = now;
   uint32_t kit = 0, kit2 = 0;
-  for (uint32_t o : Scan(kSpawnObject)) {
-    bool bots = false;
-    for (BotPlayer& b : g_players) bots |= b.spawner == o;
-    if (!bots && Ld32(o + 0x1F4)) kit = Ld32(o + 0x1F4), kit2 = Ld32(o + 0x1F8);
-  }
+  if (second)
+    for (uint32_t o : Scan(kSpawnObject)) {
+      bool bots = false;
+      for (BotPlayer& b : g_players) bots |= b.spawner == o;
+      if (!bots && Ld32(o + 0x1F4)) kit = Ld32(o + 0x1F4), kit2 = Ld32(o + 0x1F8);
+    }
+  // EXPERIMENT (BF_BOT_DRIVE): a move message for each bot soldier every
+  // tick, as its client would send (the server simulates a soldier per move
+  // message): 823B2C80 on its spawn object + 180.
+  static const bool drive = getenv("BF_BOT_DRIVE") != nullptr;
+  if (drive && g_have_template)
+    for (BotPlayer& b : g_players) {
+      if (!b.soldier || Ld32(b.soldier) != kSoldier) continue;
+      if (!b.mover) {
+        b.mover = FindMover(b.spawner);
+        // None (made in a real client's handshake): a copy of a real one,
+        // pointing at the bot's spawn object, its move ring and numbers clear.
+        if (!b.mover && g_real_mover && getenv("BF_BOT_CLONE_MOVER")) {
+          b.mover = g_system_heap->Alloc(0x200, 16);
+          memcpy(G<uint8_t>(b.mover), G<uint8_t>(g_real_mover), 0x200);
+          St32(b.mover + 0x30, b.spawner);
+          for (uint32_t k = 0x34; k < 0xB4; k += 4) St32(b.mover + k, 0xFFFFFFFF);
+          St32(b.mover + 180, 0), St32(b.mover + 184, 0), St32(b.mover + 192, 0);
+        }
+        RT_INFO("bot %d: move receiver %08X:%s", b.index, b.mover, b.mover ? Around(b.mover, 0, 0x40).c_str() : "");
+        if (!b.mover) continue;
+      }
+      if (!b.move_msg) b.move_msg = g_system_heap->Alloc(0x100, 16);
+      memcpy(G<uint8_t>(b.move_msg), g_move_template, sizeof(g_move_template));
+      St32(b.move_msg + 4, ++b.move_seq);
+      float fwd = 0.8f;
+      uint32_t u;
+      memcpy(&u, &fwd, 4);
+      St32(b.move_msg + 0x10 + 8, u);
+      PPCContext c = ctx;
+      c.r3.u64 = b.mover;
+      c.r4.u64 = b.move_msg;
+      c.r5.u64 = 1;
+      c.r6.u64 = 0;
+      __imp__sub_823B2C80(c, base);
+      static int64_t next_log = 0;
+      if (now >= next_log) {
+        next_log = now + 2000;
+        RT_INFO("bot %d: driven soldier %08X at %.1f %.1f %.1f (move %u)", b.index, b.soldier, LdF(b.soldier + 0x180),
+                LdF(b.soldier + 0x184), LdF(b.soldier + 0x188), b.move_seq);
+      }
+    }
   if (!kit) return;
   for (BotPlayer& b : g_players) {
     if (!b.spawner) continue;
@@ -398,6 +474,87 @@ GAME_PATCH(82414430) {
             b.soldier ? Ld32(b.soldier + 0x48) : 0, b.soldier ? LdF(b.soldier + 0x180) : 0.0f,
             b.soldier ? LdF(b.soldier + 0x184) : 0.0f, b.soldier ? LdF(b.soldier + 0x188) : 0.0f);
   }
+}
+
+// BF_BOT_DISCOVER: the call stacks that make soldiers (the two functions that
+// set ServerSoldierEntity's vtable), the bots' and a real player's.
+GAME_PATCH(8231C770) {
+  static std::atomic<int> n{0};
+  if (g_discover && n++ < 4) {
+    RT_INFO("bot players: soldier made (8231C770):%s", Args(ctx).c_str());
+    bf_crash_diag::PrintStack(nullptr);
+  }
+  __imp__sub_8231C770(ctx, base);
+}
+GAME_PATCH(8231CD38) {
+  static std::atomic<int> n{0};
+  if (g_discover && n++ < 4) {
+    RT_INFO("bot players: soldier made (8231CD38):%s", Args(ctx).c_str());
+    bf_crash_diag::PrintStack(nullptr);
+  }
+  __imp__sub_8231CD38(ctx, base);
+}
+
+// A real player's soldier is simulated per input message from its client:
+// 8274BDA8 (dispatch) -> 827600A8 -> 823B2C80 -> 822F05C8 -> the soldier's
+// update (82308978). BF_BOT_DISCOVER: their arguments.
+GAME_PATCH(823B2C80) {
+  if (!g_have_template && Ld32(ctx.r4.u32) == 0x8200E490) {
+    memcpy(g_move_template, G<uint8_t>(ctx.r4.u32), sizeof(g_move_template));
+    g_have_template = true;
+  }
+  bool bot_mover = false;
+  for (BotPlayer& b : g_players) bot_mover |= b.mover == ctx.r3.u32;
+  if (!bot_mover) g_real_mover = ctx.r3.u32;
+  static std::atomic<int> n{0};
+  if (g_discover && n < 4) {
+    Note("move message 823B2C80", n, ctx);
+    uint32_t pl = ctx.r3.u32;
+    RT_INFO("bot players:   r3 %08X vt %08X %s:%s", pl, Ld32(pl), TypeName(Ld32(pl)).c_str(), Around(pl, 0, 0x80).c_str());
+    RT_INFO("bot players:   r4 %08X:%s", ctx.r4.u32, Around(ctx.r4.u32, 0, 0x40).c_str());
+    RT_INFO("bot players:   r5 %08X:%s", ctx.r5.u32, Around(ctx.r5.u32, 0, 0x40).c_str());
+  }
+  __imp__sub_823B2C80(ctx, base);
+}
+GAME_PATCH(822F05C8) {
+  static std::atomic<int> n{0};
+  if (g_discover && n < 4) {
+    Note("soldier step 822F05C8", n, ctx);
+    RT_INFO("bot players:   r4 %08X:%s", ctx.r4.u32, Around(ctx.r4.u32, 0, 0x40).c_str());
+    RT_INFO("bot players:   r5 %08X:%s", ctx.r5.u32, Around(ctx.r5.u32, 0, 0x40).c_str());
+  }
+  __imp__sub_822F05C8(ctx, base);
+}
+
+// ServerSoldierEntity's update (its vtable's +114; writes its position through
+// 82536548). BF_BOT_DISCOVER: which soldiers it runs for (every 10 s).
+GAME_PATCH(82308978) {
+  if (g_discover) {
+    static std::map<uint32_t, int> calls;
+    static int64_t next = 0;
+    if (++calls[ctx.r3.u32] == 1) {
+      static std::atomic<int> stacks{0};
+      if (stacks++ < 2) {
+        RT_INFO("bot players: first update of soldier %08X:", ctx.r3.u32);
+        bf_crash_diag::PrintStack(nullptr);
+      }
+    }
+    int64_t now = int64_t(GetTickCount64());
+    if (now >= next) {
+      next = now + 10000;
+      std::string out;
+      for (auto& [so, n] : calls) {
+        bool bot = false;
+        for (BotPlayer& b : g_players) bot |= b.soldier == so;
+        char buf[64];
+        snprintf(buf, sizeof(buf), " %08X%s:%d", so, bot ? "(bot)" : "", n);
+        out += buf;
+      }
+      RT_INFO("bot players: soldier updates:%s", out.c_str());
+      calls.clear();
+    }
+  }
+  __imp__sub_82308978(ctx, base);
 }
 
 GAME_PATCH(823194B0) {  // damage a soldier

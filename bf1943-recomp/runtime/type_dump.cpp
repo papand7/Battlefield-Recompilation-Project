@@ -88,5 +88,27 @@ const bool g_find_vtable = [] {
   return true;
 }();
 
+
+// BF_FIND_SLOT=<function>[,...] (hex): the vtable slots holding these
+// functions (virtual calls), to see whose methods they are.
+const bool g_find_slot = [] {
+  const char* list = getenv("BF_FIND_SLOT");
+  if (!list) return false;
+  std::string l = list;
+  std::thread([l] {
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    for (size_t p = 0; p <= l.size();) {
+      size_t c = l.find(',', p);
+      if (c == std::string::npos) c = l.size();
+      uint32_t fn = uint32_t(strtoul(l.substr(p, c - p).c_str(), nullptr, 16));
+      p = c + 1;
+      for (uint32_t a = 0x82000000; a < 0x82180000; a += 4)
+        if (IsCommitted(a) && Ld32(a) == fn) RT_INFO("find slot: %08X at %08X", fn, a);
+    }
+    RT_INFO("find slot: done");
+  }).detach();
+  return true;
+}();
+
 }  // namespace
 }  // namespace rt
