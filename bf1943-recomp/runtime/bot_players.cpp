@@ -94,6 +94,8 @@ constexpr uint32_t kSpawnObject = 0x8201A990;     // the player's soldier spawne
 constexpr uint32_t kConnectionPart = 0x8201C728;  // a joined player's connection part (8201B140)
 constexpr uint32_t kPeer = 0x82056C00;            // a network peer (820550C0): the part's +14 and +28
 constexpr uint32_t kSoldier = 0x82013A40;         // ServerSoldierEntity (820118D0)
+constexpr uint32_t kNetPlayer = 0x8201C6C8;       // a player's network object: +28 its connection part,
+                                                  // +2FC its move receiver (823B5330 -> 823B2C80)
 // The spawn object: +30 its team, +120 its soldier once deployed, +1F4 and
 // +1F8 the kit the spawn screen chose (SoldierEntityData, SoldierWeaponData;
 // Bad Company +1D4, +1D8).
@@ -115,6 +117,11 @@ float LdF(uint32_t a) {
   memcpy(&f, &u, 4);
   return f;
 }
+uint32_t FindNetPlayer(uint32_t conn) {
+  for (uint32_t o : Scan(kNetPlayer))
+    if (Ld32(o + 0x28) == conn) return o;
+  return 0;
+}
 template <class T>
 bool Has(const std::vector<T>& v, T x) {
   return std::find(v.begin(), v.end(), x) != v.end();
@@ -131,6 +138,8 @@ struct BotPlayer {
   int64_t died_ms = 0;
   uint32_t move_msg = 0;  // its own move message (a copy of a real one)
   uint32_t mover = 0;     // its move receiver (823B2C80's r3)
+  uint32_t ghost_id = 0;  // its soldier's network id in the host's table (0: not found yet)
+  uint32_t ghost_for = 0; // the soldier that id is for
   uint32_t move_seq = 0;
 };
 // A player's move receiver (823B2C80's r3): +14 1E, +18 3, +30 its spawn
@@ -249,6 +258,20 @@ GAME_PATCH(827559F0) {  // the peer manager's create
   uint32_t conn = ctx.r6.u32;
   bool show = g_discover && g_peers <= 6;
   __imp__sub_827559F0(ctx, base);
+  // BF_BOT_DISCOVER: a real joiner's network object, its +2FC (the move
+  // receiver) watched: who stores it (the handshake).
+  if (g_discover && Ld32(conn) == kConnectionPart) {
+    bool bot = false;
+    for (BotPlayer& b : g_players) bot |= b.conn == conn;
+    uint32_t np = FindNetPlayer(conn);
+    RT_INFO("bot players: %s connection %08X: network object %08X, +2FC %08X", bot ? "bot" : "real", conn, np,
+            np ? Ld32(np + 0x2FC) : 0);
+    static bool watching = false;
+    if (!bot && np && !watching && g_peers >= 3) {
+      watching = true;
+      StartWriteWatch(np + 0x2FC, 4, 0);
+    }
+  }
   // What it left in the player's connection part (Bad Company: the peer at +14 and +28),
   // and again 20 s later (after the handshake).
   if (show && IsCommitted(conn)) {
@@ -270,6 +293,46 @@ GAME_PATCH(82382720) {  // deploy a soldier
 }
 GAME_PATCH(822ED8D8) {  // a player's received input to its soldier
   Note("input", g_inputs, ctx);
+  // A bot soldier's input: written into the record before it is copied into
+  // the soldier's input state (r3: vtable 82012320, +4 the soldier, +14
+  // forward; r4 the record: +8 forward), as Bad Company's bots.
+  if (Ld32(ctx.r3.u32) == 0x82012320) {
+    uint32_t so = Ld32(ctx.r3.u32 + 4);
+    for (BotPlayer& b : g_players)
+      if (b.soldier && b.soldier == so && getenv("BF_BOT_DRIVE")) {
+        float fwd = 0.8f;
+        uint32_t u;
+        memcpy(&u, &fwd, 4);
+        St32(ctx.r4.u32 + 8, u);
+        static int64_t next = 0;
+        int64_t t = int64_t(GetTickCount64());
+        if (t >= next) {
+          next = t + 3000;
+          uint32_t is = ctx.r3.u32, rec = ctx.r4.u32;
+          __imp__sub_822ED8D8(ctx, base);
+          RT_INFO("bot %d: input copied: state +14 %.2f, record %08X (vt %08X) +8 %.2f", b.index, LdF(is + 0x14), rec,
+                  Ld32(rec), LdF(rec + 8));
+          // The bot's soldier against a real one: words that are small
+          // numbers (flags, states) and differ.
+          for (uint32_t real : Scan(kSoldier)) {
+            if (real == b.soldier) continue;
+            std::string d;
+            for (uint32_t off = 0; off < 0x600; off += 4) {
+              uint32_t x = Ld32(b.soldier + off), y = Ld32(real + off);
+              if (x == y || x > 0xFFFF0000u || y > 0xFFFF0000u) continue;
+              if ((x < 0x10000 && y < 0x10000) || (x >> 24) == 0x01 || (y >> 24) == 0x01) {
+                char buf[40];
+                snprintf(buf, sizeof(buf), " +%X:%X/%X", off, x, y);
+                d += buf;
+              }
+            }
+            RT_INFO("bot %d: its soldier vs %08X (small words differing, bot/real):%s", b.index, real, d.c_str());
+            break;
+          }
+          return;
+        }
+      }
+  }
   // BF_BOT_DISCOVER: every 3 s, a real player's received record (r4) as
   // floats, with its input state's soldier (r3 +4) and where it is, and
   // where the bot players' soldiers are.
@@ -382,6 +445,31 @@ GAME_PATCH(8237EE38) {  // the spawn object's constructor (Bad Company's 8232ECB
 // game picks one of the team's).
 extern "C" PPC_FUNC(__imp__sub_82382720);
 extern "C" PPC_FUNC(__imp__sub_823B2C80);
+PPC_FUNC(sub_8275D2F8);
+// A move record names the entity it moves by its network id (+9C; 823B2C80
+// reads it with 8251A288), looked up per connection: 8275D2F8(*(receiver),
+// id) -> the entity + 80. A bot's own connection never gets its soldier (no
+// client): the host's local client's table has it (the dedicated server's
+// own player sees every soldier).
+uint32_t HostTable() {
+  for (uint32_t o : Scan(kNetPlayer)) {
+    bool bot = false;
+    for (BotPlayer& b : g_players) bot |= Ld32(o + 0x28) == b.conn;
+    uint32_t rcv = bot ? 0 : Ld32(o + 0x2FC);
+    if (rcv && IsCommitted(rcv) && Ld32(rcv)) return Ld32(rcv);
+  }
+  return 0;
+}
+uint32_t GhostId(PPCContext& ctx, uint8_t* base, uint32_t table, uint32_t entity) {
+  for (uint32_t id = 1; id < 0x4000; ++id) {
+    PPCContext c = ctx;
+    c.r3.u64 = table;
+    c.r4.u64 = id;
+    sub_8275D2F8(c, base);
+    if (c.r3.u32 == entity + 80) return id;
+  }
+  return 0;
+}
 GAME_PATCH(82414430) {
   __imp__sub_82414430(ctx, base);
   if (g_players.empty()) return;
@@ -404,7 +492,12 @@ GAME_PATCH(82414430) {
     for (BotPlayer& b : g_players) {
       if (!b.soldier || Ld32(b.soldier) != kSoldier) continue;
       if (!b.mover) {
-        b.mover = FindMover(b.spawner);
+        // Its network object's +2FC (made with the join).
+        if (uint32_t np = FindNetPlayer(b.conn)) b.mover = Ld32(np + 0x2FC);
+        if (b.mover)
+          RT_INFO("bot %d: move receiver %08X from its network object:%s", b.index, b.mover,
+                  Around(b.mover, 0, 0x40).c_str());
+        if (!b.mover) b.mover = FindMover(b.spawner);
         // None (made in a real client's handshake): a copy of a real one,
         // pointing at the bot's spawn object, its move ring and numbers clear.
         if (!b.mover && g_real_mover && getenv("BF_BOT_CLONE_MOVER")) {
@@ -418,12 +511,24 @@ GAME_PATCH(82414430) {
         if (!b.mover) continue;
       }
       if (!b.move_msg) b.move_msg = g_system_heap->Alloc(0x100, 16);
+      if (b.ghost_for != b.soldier) {
+        uint32_t table = HostTable();
+        b.ghost_id = table ? GhostId(ctx, base, table, b.soldier) : 0;
+        b.ghost_for = b.soldier;
+        RT_INFO("bot %d: soldier %08X is network id %X in the host's table %08X", b.index, b.soldier, b.ghost_id, table);
+        if (b.ghost_id) St32(b.mover, table);  // look it up there
+      }
+      if (!b.ghost_id) continue;
       memcpy(G<uint8_t>(b.move_msg), g_move_template, sizeof(g_move_template));
       St32(b.move_msg + 4, ++b.move_seq);
       float fwd = 0.8f;
       uint32_t u;
       memcpy(&u, &fwd, 4);
       St32(b.move_msg + 0x10 + 8, u);
+      St32(b.move_msg + 0x10 + 0x9C, b.ghost_id);
+      // EXPERIMENT (BF_BOT_STATE6): a walking soldier has 6 at +1BC, +224
+      // and +228 where the bot's has 0, 1 and 1.
+      if (getenv("BF_BOT_STATE6")) St32(b.soldier + 0x1BC, 6), St32(b.soldier + 0x224, 6), St32(b.soldier + 0x228, 6);
       PPCContext c = ctx;
       c.r3.u64 = b.mover;
       c.r4.u64 = b.move_msg;
@@ -433,12 +538,31 @@ GAME_PATCH(82414430) {
       static int64_t next_log = 0;
       if (now >= next_log) {
         next_log = now + 2000;
+        if (g_discover)
+          for (uint32_t is : Scan(0x82012320))
+            RT_INFO("bot players: input state %08X soldier %08X%s:%s", is, Ld32(is + 4),
+                    Ld32(is + 4) == b.soldier ? " (bot)" : "", Around(is, 4, 0x40).c_str());
         RT_INFO("bot %d: driven soldier %08X at %.1f %.1f %.1f (move %u)", b.index, b.soldier, LdF(b.soldier + 0x180),
                 LdF(b.soldier + 0x184), LdF(b.soldier + 0x188), b.move_seq);
       }
     }
   if (!kit) return;
   for (BotPlayer& b : g_players) {
+    // Its move receiver (its network object's +2FC, made with the join) and
+    // the spawn object that one drives (+30): deploy on that one, so the
+    // move messages reach the soldier.
+    if (!b.mover)
+      if (uint32_t np = FindNetPlayer(b.conn)) {
+        b.mover = Ld32(np + 0x2FC);
+        uint32_t sp = b.mover ? Ld32(b.mover + 0x30) : 0;
+        RT_INFO("bot %d: network object %08X, receiver %08X, its spawn object %08X (vt %08X), ours %08X", b.index, np,
+                b.mover, sp, sp && IsCommitted(sp) ? Ld32(sp) : 0, b.spawner);
+        if (sp && IsCommitted(sp) && Ld32(sp) == kSpawnObject && sp != b.spawner) {
+          RT_INFO("bot %d: its move receiver %08X drives spawn object %08X (deploying there, not %08X)", b.index,
+                  b.mover, sp, b.spawner);
+          b.spawner = sp;
+        }
+      }
     if (!b.spawner) continue;
     bool alive = b.soldier && IsCommitted(b.soldier + 0x400) && Ld32(b.soldier) == kSoldier;
     if (alive) continue;
@@ -459,6 +583,8 @@ GAME_PATCH(82414430) {
     for (uint32_t o : Scan(kSoldier))
       if (!Has(before, o)) b.soldier = o;
     b.died_ms = b.soldier ? 0 : now;
+    static bool watched = false;  // BF_BOT_WATCH_POS (testing): who writes the bot soldier's position
+    if (b.soldier && !watched && getenv("BF_BOT_WATCH_POS")) watched = true, StartWriteWatch(b.soldier + 0x180, 12, 0);
     if (g_discover && b.soldier) {
       uint32_t sp = Ld32(b.spawner + 0x1F0), so = b.soldier;
       bool ptr = sp >= 0x40000000 && sp < 0xC0000000 && IsCommitted(sp);
@@ -498,8 +624,34 @@ GAME_PATCH(8231CD38) {
 // A real player's soldier is simulated per input message from its client:
 // 8274BDA8 (dispatch) -> 827600A8 -> 823B2C80 -> 822F05C8 -> the soldier's
 // update (82308978). BF_BOT_DISCOVER: their arguments.
+// The stream reader before it (8274BDA8 -> 827600A8): its this, a channel
+// of the connection. BF_BOT_DISCOVER: what it holds.
+GAME_PATCH(827600A8) {
+  static std::atomic<int> n{0};
+  if (g_discover && n == 0) {
+    std::string v;
+    for (uint32_t k = 0; k < 0x40; k += 4) {
+      char buf[24];
+      snprintf(buf, sizeof(buf), " +%X:%08X", k, Ld32(0x8201C6C8 + k));
+      v += buf;
+    }
+    RT_INFO("bot players: vtable 8201C6C8:%s", v.c_str());
+  }
+  if (g_discover && n++ < 3) {
+    uint32_t ch = ctx.r3.u32;
+    RT_INFO("bot players: channel %08X (vt %08X):%s", ch, Ld32(ch), Around(ch, 0, 0x90).c_str());
+    for (uint32_t off : {48u, 52u, 56u, 28u, 36u}) {
+      uint32_t o = Ld32(ch + off);
+      if (o >= 0x40000000 && o < 0xC0000000 && IsCommitted(o))
+        RT_INFO("bot players:   +%u -> %08X (vt %08X %s):%s", off, o, Ld32(o), TypeName(Ld32(o)).c_str(), Around(o, 0, 0x40).c_str());
+    }
+  }
+  __imp__sub_827600A8(ctx, base);
+}
+
 GAME_PATCH(823B2C80) {
-  if (!g_have_template && Ld32(ctx.r4.u32) == 0x8200E490) {
+  // (From a player who is moving: the host's own on the spawn screen is mostly zeros.)
+  if (!g_have_template && Ld32(ctx.r4.u32) == 0x8200E490 && LdF(ctx.r4.u32 + 0x10 + 8) > 0.5f) {
     memcpy(g_move_template, G<uint8_t>(ctx.r4.u32), sizeof(g_move_template));
     g_have_template = true;
   }
@@ -507,9 +659,13 @@ GAME_PATCH(823B2C80) {
   for (BotPlayer& b : g_players) bot_mover |= b.mover == ctx.r3.u32;
   if (!bot_mover) g_real_mover = ctx.r3.u32;
   static std::atomic<int> n{0};
-  if (g_discover && n < 4) {
+  if (g_discover && n < 4 && Ld32(ctx.r3.u32 + 0x10)) {
     Note("move message 823B2C80", n, ctx);
     uint32_t pl = ctx.r3.u32;
+    uint32_t t = Ld32(pl + 0x10);
+    if (t >= 0x40000000 && t < 0xC0000000 && IsCommitted(t))
+      RT_INFO("bot players:   receiver +10 -> %08X (vt %08X %s):%s", t, Ld32(t), TypeName(Ld32(t)).c_str(),
+              Around(t, 0, 0x20).c_str());
     RT_INFO("bot players:   r3 %08X vt %08X %s:%s", pl, Ld32(pl), TypeName(Ld32(pl)).c_str(), Around(pl, 0, 0x80).c_str());
     RT_INFO("bot players:   r4 %08X:%s", ctx.r4.u32, Around(ctx.r4.u32, 0, 0x40).c_str());
     RT_INFO("bot players:   r5 %08X:%s", ctx.r5.u32, Around(ctx.r5.u32, 0, 0x40).c_str());
