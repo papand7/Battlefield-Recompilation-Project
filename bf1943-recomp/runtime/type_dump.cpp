@@ -130,5 +130,24 @@ const bool g_dump_vt = [] {
   return true;
 }();
 
+
+// BF_FIND_STRINGS=<prefix>: every NUL-terminated string in the image starting
+// with it (enum names: their order in memory).
+const bool g_find_strings = [] {
+  const char* pre = getenv("BF_FIND_STRINGS");
+  if (!pre) return false;
+  std::string p = pre;
+  std::thread([p] {
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    for (uint32_t a = 0x82000000; a < 0x82E00000; ++a) {
+      if (!IsCommitted(a) || memcmp(G<char>(a), p.c_str(), p.size()) != 0) continue;
+      if (G<char>(a)[-1] != 0) continue;
+      RT_INFO("find strings: %08X %s", a, std::string(G<char>(a)).substr(0, 60).c_str());
+    }
+    RT_INFO("find strings: done");
+  }).detach();
+  return true;
+}();
+
 }  // namespace
 }  // namespace rt

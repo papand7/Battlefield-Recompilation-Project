@@ -21,6 +21,7 @@
 // A soldier object exists while its player is alive. Local games name every
 // player "Player1", so the director finds which soldier is which bot by
 // probing: it tips one bot's view up and watches whose pitch moves.
+#include "bot_players.h"
 #include "bots/bot_api.h"
 #include "bots/nav.h"
 #include "guest.h"
@@ -319,6 +320,7 @@ struct Director {
   double probe_until = 0;
   float probe_dir = -1.0f;
   std::vector<std::pair<uint32_t, float>> probe_pitch;  // unmapped soldiers before the probe
+  int players_from = kMaxBots;  // bots[] from here are bot players (bot_players.cpp): their soldier known, no probing
   struct Answer { Vec at; float yaw = 0; double since = 0; };
   Answer answer[kMaxBots];  // each bot's soldier: where and which way it was, since when (told to move)
 
@@ -408,12 +410,15 @@ struct Director {
     probe_pitch.clear();
     for (const Soldier& s : soldiers)
       if (!Mapped(s.obj)) probe_pitch.push_back({s.obj, s.pitch});
+    bool any = false;  // a bot copy left to identify
+    for (const botapi::BotIO& b : bots) any |= !b.soldier && b.slot < players_from;
+    if (!any) probe_pitch.clear();
     if (probe_pitch.empty()) return;
     // Next bot without a soldier, round robin.
     static int next = 0;
     for (size_t i = 0; i < bots.size(); ++i) {
       botapi::BotIO& b = bots[(next + i) % bots.size()];
-      if (b.soldier) continue;
+      if (b.soldier || b.slot >= players_from) continue;
       next = int((next + i + 1) % bots.size());
       probe_slot = b.slot;
       probe_until = now + 0.8;
@@ -757,7 +762,10 @@ int LocalVehicle() {
 
 // Host: start the director (once the bots are launched).
 std::string StartBotDirector(int count) {
+  static bool started = false;
   std::string name = SharedName();
+  if (started) return name;
+  started = true;
   g_shared = MapShared(name, true);
   if (!g_shared) {
     RT_WARN("bots: no shared memory for the AI");
@@ -770,6 +778,7 @@ std::string StartBotDirector(int count) {
       io.slot = i;
       d.bots.push_back(io);
     }
+    d.players_from = int(d.bots.size());
     if (getenv("BF_SELF_TEST")) g_my_slot = kMaxBots - 1;  // the host's own player
     BrainModule brain;
     TraceLog trace;
@@ -793,7 +802,16 @@ std::string StartBotDirector(int count) {
       if (g_in_menus) continue;
       bool rescan = d.now - last_scan > 2.0;
       if (rescan) last_scan = d.now;
+      // Bot players (bot_players.cpp): an entry each, their soldier as it is.
+      while (int(d.bots.size()) < std::min(d.players_from + BotPlayerCount(), kMaxBots - 1)) {
+        botapi::BotIO io{};
+        io.slot = int(d.bots.size());
+        d.bots.push_back(io);
+        RT_INFO("bots: bot player %d is bot %d", io.slot - d.players_from, io.slot + 1);
+      }
       bool flags_changed = d.Refresh(rescan);
+      for (botapi::BotIO& b : d.bots)
+        if (b.slot >= d.players_from) b.soldier = BotPlayerSoldier(b.slot - d.players_from);
       if (d.points.empty()) continue;
       if (getenv("BF_SELF_TEST")) d.SelfTest();
       d.Probe();
@@ -822,6 +840,10 @@ std::string StartBotDirector(int count) {
       brain.think(&w);
       for (botapi::BotIO& b : d.bots) {
         Pad pad = b.pad;
+        if (b.slot >= d.players_from) {
+          SetBotPlayerInput(b.slot - d.players_from, pad.lx, pad.ly, pad.rx, pad.ry, pad.buttons, pad.triggers);
+          continue;
+        }
         if (d.probe_slot == b.slot) pad = Pad{0, 0, 0, d.probe_dir, 0, 0};  // being identified: look up or down
         else if (d.probe_slot >= 0) pad.ry = 0;  // the others keep their view level meanwhile
         // A soldier that doesn't answer its bot (told to move for 20 s, and
