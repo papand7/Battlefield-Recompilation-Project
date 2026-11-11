@@ -5,11 +5,17 @@ models, middle growth, forest) and its terrain (terrain-00.fbrb), with
 tools/navgen (built from tools/navgen/CMakeLists.txt).
 
   python tools/make_navmesh.py <game dir> <level folder> <map name> <out.nav> [--work DIR] [--navgen EXE]
+         [--live <collision.obj> --bounds x0 z0 x1 z1]
 
   e.g. python tools/make_navmesh.py original/v106 wake_island_s Wake_island_s build/game/nav/Wake_island_s.nav
 
 The mesh covers the collision's extent and 150 m around it (beaches and the
 sea floor near the shore), with the terrain in 2 m steps.
+
+--live: the collision Bad Company's tool took from the running game
+(BF_BOT_DUMP_COLLISION, runtime/bot_collision.cpp: every rigid body, carriers
+and placed objects too) instead of the level files' groups, over the play area
+it logs ("bot nav: play area x0 z0 x1 z1").
 """
 import glob
 import os
@@ -49,6 +55,17 @@ def main():
     run(os.path.join(TOOLS, 'fbrb.py'), 'extract', os.path.join(src, 'reduced-level-00.fbrb'), work, 'HavokPhysicsData')
     run(os.path.join(TOOLS, 'fbrb.py'), 'extract', os.path.join(src, 'terrain-00.fbrb'), work, 'TerrainHeightfield')
     objs = []
+    live = opt('--live', None)
+    if live:
+        i = sys.argv.index('--bounds')
+        x0, z0, x1, z1 = (float(v) for v in sys.argv[i + 1:i + 5])
+        hf = glob.glob(os.path.join(work, 'Terrains', '*', '*.Heightfield-000.res'))[0]
+        ground = os.path.join(work, 'ground.obj')
+        run(os.path.join(TOOLS, 'terrain.py'), hf, ground, str(x0), str(z0), str(x1), str(z1), '--step', '2')
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        subprocess.run([navgen, out, ground, live, '--bounds', str(x0), str(z0), str(x1), str(z1)], check=True)
+        print(f'{name}: {out} (live collision, {x0:.0f} {z0:.0f} .. {x1:.0f} {z1:.0f})')
+        return
     for res in sorted(glob.glob(os.path.join(work, 'Levels', '*', '*Entity_HavokAsset.res'))):
         o = os.path.join(work, os.path.basename(res).replace('.res', '.obj'))
         run(os.path.join(TOOLS, 'havok.py'), res, '--obj', o)

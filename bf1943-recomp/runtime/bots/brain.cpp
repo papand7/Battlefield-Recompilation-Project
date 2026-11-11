@@ -365,8 +365,9 @@ struct Brain {
           return false;
         }
         float dx = boat->pos.x - me.pos.x, dz = boat->pos.z - me.pos.z;
-        Steer(cmd, me, std::atan2(dx, dz), 0.0f);
-        Walk(cmd, me, boat->pos, 1.0f);
+        Vec next = NextOnRoute(io, b, me, boat->pos);  // on the navigation mesh, when there is one
+        Steer(cmd, me, std::atan2(next.x - me.pos.x, next.z - me.pos.z), 0.0f);
+        Walk(cmd, me, next, 1.0f);
         if (std::hypot(dx, dz) > 25) cmd.buttons |= kLeftThumb;  // sprint
         if (std::hypot(dx, dz) < 4.0f) {
           SetState(io, b, me, kBoard);

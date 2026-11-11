@@ -180,3 +180,32 @@ Scenario `near`: the bot stands still, then the server and the bot's game move e
 16-byte aligned vector equal to its position (its physics and the copies of it, a few
 hundred on the server) to the new place. (Writing only the soldier's +180 or +3D0 is put
 back every frame.)
+
+### Navigation meshes (Bad Company's tools)
+
+Bots walk along routes on a navigation mesh (`runtime/bots/nav.cpp`, Detour, the same
+layer as Bad Company's bots): `nav/<map>.nav` next to the exe. Polygons a bot keeps
+getting stuck on are turned off and kept in `<user>/nav/<map>.blocked`; the mesh's main
+piece is the one the flags are on (on island maps the biggest is the sea floor).
+
+A mesh is made on the player's PC from their own copy (private, never in the repo), with
+Bad Company's collision tool, which reads every Havok rigid body of the running level
+(`runtime/bot_collision.cpp`; BF1943's hkRigidBody vtable 820B07CC, hkWorld 820B0748,
+found through their RTTI with `BF_FIND_VTABLE=hkRigidBody,hkWorld`):
+
+```
+set BF_BOT_DUMP_COLLISION=C:/path/live.obj
+build/game/bf1943.exe --dedicated --host-map Wake_island_s --user userdata_dump
+rem the log ends with "bot nav: play area x0 z0 x1 z1"
+python tools/make_navmesh.py original/v106 wake_island_s Wake_island_s build/game/nav/Wake_island_s.nav ^
+  --live C:/path/live.obj --bounds x0 z0 x1 z1
+```
+
+`make_navmesh.py` adds the terrain (`terrain.py`) and runs `tools/navgen` (build it from
+`tools/navgen/CMakeLists.txt`); without `--live` it uses only the level files' collision
+groups (no carriers or placed objects). `navgen --islands <nav> [x y z]...` shows the
+mesh's pieces.
+
+Bots as players inside the server (Bad Company's way, instead of a game copy per bot) are
+being ported: `runtime/bot_players.cpp` has Bad Company's functions found in BF1943
+(`tools/match_functions.py` matches functions between the games by their shape).

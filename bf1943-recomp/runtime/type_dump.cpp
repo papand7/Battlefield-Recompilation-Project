@@ -52,5 +52,41 @@ const bool g_type_dump = [] {
   return true;
 }();
 
+
+// BF_FIND_VTABLE=<class>[,<class>...] (e.g. hkRigidBody): the vtables of those
+// C++ classes through their MSVC RTTI in the image (".?AV<class>@@" type
+// descriptor <- complete object locator +C <- vtable -4), as Bad Company's
+// Havok classes were found.
+const bool g_find_vtable = [] {
+  const char* names = getenv("BF_FIND_VTABLE");
+  if (!names) return false;
+  std::string list = names;
+  std::thread([list] {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    const uint32_t lo = 0x82000000, hi = 0x82E00000;
+    for (size_t p = 0; p <= list.size();) {
+      size_t c = list.find(',', p);
+      if (c == std::string::npos) c = list.size();
+      std::string want = ".?AV" + list.substr(p, c - p) + "@@";
+      p = c + 1;
+      int found = 0;
+      for (uint32_t a = lo; a + want.size() < hi; ++a) {
+        if (!IsCommitted(a) || memcmp(G<char>(a), want.c_str(), want.size() + 1) != 0) continue;
+        uint32_t td = a - 8;
+        ++found;
+        for (uint32_t col = lo; col < hi; col += 4) {
+          if (!IsCommitted(col) || Ld32(col + 12) != td) continue;
+          for (uint32_t v = lo; v < hi; v += 4)
+            if (IsCommitted(v) && Ld32(v) == col)
+              RT_INFO("find vtable: %s type %08X locator %08X vtable %08X", want.c_str(), td, col, v + 4);
+        }
+      }
+      if (!found) RT_INFO("find vtable: %s not in the image", want.c_str());
+    }
+    RT_INFO("find vtable: done");
+  }).detach();
+  return true;
+}();
+
 }  // namespace
 }  // namespace rt

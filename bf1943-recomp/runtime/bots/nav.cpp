@@ -45,6 +45,7 @@ std::filesystem::path g_blocked_path;
 // Routes run on the main piece.
 std::unordered_map<dtPolyRef, int> g_piece;
 int g_main_piece = -1;
+bool g_main_chosen = false;  // from the flags (ChooseMain)
 
 void FindPieces() {
   g_piece.clear();
@@ -130,6 +131,7 @@ void Unload() {
   g_navquery = nullptr, g_navmesh = nullptr;
   g_piece.clear();
   g_main_piece = -1;
+  g_main_chosen = false;
 }
 
 bool Load(const std::string& map) {
@@ -182,6 +184,29 @@ bool Load(const std::string& map) {
 }
 
 }  // namespace
+
+void ChooseMain(const float* points, int count) {
+  std::lock_guard lock(g_mutex);
+  if (!g_navquery || g_main_chosen || count <= 0) return;
+  g_main_chosen = true;
+  dtQueryFilter filter;
+  const float ext[3] = {8, 60, 8};
+  std::unordered_map<int, int> votes;
+  for (int i = 0; i < count; ++i) {
+    dtPolyRef ref = 0;
+    float p[3];
+    g_navquery->findNearestPoly(points + 3 * i, ext, &filter, &ref, p);
+    auto it = ref ? g_piece.find(ref) : g_piece.end();
+    if (it != g_piece.end()) ++votes[it->second];
+  }
+  int best = -1, n = 0;
+  for (auto& [piece, v] : votes)
+    if (v > n) n = v, best = piece;
+  if (best >= 0 && best != g_main_piece) {
+    RT_INFO("bot nav: main piece %d (%d of %d flags on it) instead of the biggest, %d", best, n, count, g_main_piece);
+    g_main_piece = best;
+  }
+}
 
 bool Ready(const std::string& map) {
   std::lock_guard lock(g_mutex);
@@ -244,7 +269,9 @@ int Route(const float a[3], const float b[3], float* corners, int max, Memory* m
     dtPolyRef r = 0;
     bool back = memory.have && dtVdist(memory.last_main, a) < 30.0f &&
                 (g_navquery->findNearestPoly(memory.last_main, back_ext, &filter, &r, q), r && InMainPiece(r));
-    if (back || NearestMain(a, near_ext, filter, &r, q)) {
+    // (From the water: the nearest land on the main piece, up to 40 m off.)
+    const float far_ext[3] = {40, 10, 40};
+    if (back || NearestMain(a, near_ext, filter, &r, q) || NearestMain(a, far_ext, filter, &r, q)) {
       out.push_back({q[0], q[1], q[2]});
       sa = r, dtVcopy(pa, q);
     }

@@ -812,6 +812,11 @@ std::string StartBotDirector(int count) {
       static const std::string nav = (g_user_root / ("bot_nav_" + g_host_map + ".txt")).string();
       w.nav_path = nav.c_str();
       bool have_mesh = nav::Ready(g_host_map);  // (loads a new map's once)
+      if (have_mesh) {  // its main piece: the one the flags are on
+        std::vector<float> flags;
+        for (const Point& p : d.points) flags.insert(flags.end(), {p.pos.x, p.pos.y, p.pos.z});
+        nav::ChooseMain(flags.data(), int(d.points.size()));
+      }
       w.route = have_mesh ? BrainRoute : nullptr;
       w.block = have_mesh ? BrainBlock : nullptr;
       brain.think(&w);
