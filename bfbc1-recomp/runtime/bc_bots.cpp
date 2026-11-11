@@ -48,6 +48,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace rt {
@@ -1114,6 +1115,16 @@ const bool g_dump_collision_started = [] {
       last = n;
     }
     DumpCollision(p.c_str());
+    // The play area for the navigation mesh: the crates' extent (every
+    // base's interaction entities, +D0/+D8) and 350 m around it (the spawns).
+    float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f};
+    for (uint32_t ie : Scan(0x82011680)) {
+      float x = LdF(ie + 0xD0), z = LdF(ie + 0xD8);
+      if (!std::isfinite(x) || !std::isfinite(z) || std::fabs(x) > 4096 || std::fabs(z) > 4096) continue;
+      lo[0] = std::min(lo[0], x), lo[1] = std::min(lo[1], z), hi[0] = std::max(hi[0], x), hi[1] = std::max(hi[1], z);
+    }
+    if (lo[0] < 1e8f)
+      RT_INFO("bot nav: play area %.0f %.0f %.0f %.0f", lo[0] - 350, lo[1] - 350, hi[0] + 350, hi[1] + 350);
   }).detach();
   return true;
 }();
@@ -1611,37 +1622,45 @@ static dtNavMeshQuery* g_navquery = nullptr;
 // spawn spots (Valley Run: 836 pieces, the main one 15432 of 23392 polygons).
 // Routes run on the main piece: a goal snapped onto an island (base 2's first
 // crate: 2 polygons) has no way to it, nor has a soldier standing on one.
-static std::vector<int> g_piece;
+static std::unordered_map<dtPolyRef, int> g_piece;
 static int g_main_piece = -1;
-static dtPolyRef g_poly_base = 0;
 static void FindPieces() {
-  const dtMeshTile* tile = static_cast<const dtNavMesh*>(g_navmesh)->getTile(0);
-  int n = tile->header->polyCount;
-  g_poly_base = g_navmesh->getPolyRefBase(tile);
-  g_piece.assign(size_t(n), -1);
+  const dtNavMesh* mesh = g_navmesh;
   std::vector<int> sizes;
-  for (int i = 0; i < n; ++i) {
-    if (g_piece[size_t(i)] >= 0) continue;
-    int id = int(sizes.size());
-    sizes.push_back(0);
-    std::vector<int> stack{i};
-    g_piece[size_t(i)] = id;
-    while (!stack.empty()) {
-      int q = stack.back();
-      stack.pop_back();
-      ++sizes[size_t(id)];
-      for (unsigned l = tile->polys[q].firstLink; l != DT_NULL_LINK; l = tile->links[l].next) {
-        int o = int(tile->links[l].ref - g_poly_base);
-        if (o >= 0 && o < n && g_piece[size_t(o)] < 0) g_piece[size_t(o)] = id, stack.push_back(o);
+  int n = 0;
+  for (int ti = 0; ti < mesh->getMaxTiles(); ++ti) {
+    const dtMeshTile* tile = mesh->getTile(ti);
+    if (!tile || !tile->header) continue;
+    dtPolyRef base = mesh->getPolyRefBase(tile);
+    for (int pi = 0; pi < tile->header->polyCount; ++pi) {
+      ++n;
+      dtPolyRef start = base | dtPolyRef(pi);
+      if (g_piece.count(start)) continue;
+      int id = int(sizes.size());
+      sizes.push_back(0);
+      std::vector<dtPolyRef> stack{start};
+      g_piece[start] = id;
+      while (!stack.empty()) {
+        dtPolyRef r = stack.back();
+        stack.pop_back();
+        ++sizes[size_t(id)];
+        const dtMeshTile* t = nullptr;
+        const dtPoly* poly = nullptr;
+        if (dtStatusFailed(mesh->getTileAndPolyByRef(r, &t, &poly))) continue;
+        for (unsigned l = poly->firstLink; l != DT_NULL_LINK; l = t->links[l].next) {
+          dtPolyRef o = t->links[l].ref;
+          if (o && !g_piece.count(o)) g_piece[o] = id, stack.push_back(o);
+        }
       }
     }
   }
+  if (sizes.empty()) return;
   g_main_piece = int(std::max_element(sizes.begin(), sizes.end()) - sizes.begin());
   RT_INFO("bot nav: %d polygons in %zu pieces, the main one %d", n, sizes.size(), sizes[size_t(g_main_piece)]);
 }
 static bool InMainPiece(dtPolyRef r) {
-  size_t i = size_t(r - g_poly_base);
-  return i < g_piece.size() && g_piece[i] == g_main_piece;
+  auto it = g_piece.find(r);
+  return it != g_piece.end() && it->second == g_main_piece;
 }
 // The main piece's nearest place to p within the box ext (half sizes).
 static bool NearestMain(const float p[3], const float ext[3], const dtQueryFilter& filter, dtPolyRef* ref,
@@ -1667,26 +1686,45 @@ static bool LoadNavMesh() {
   std::string path = "nav/" + g_host_map + ".nav";
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return false;
+  // Version 1: one tile (its data's size, the data); version 2 (navgen's
+  // tiles): dtNavMeshParams, the tile count, then each tile's x, y, size, data.
   char magic[4];
-  int version = 0, size = 0;
-  bool ok = fread(magic, 1, 4, f) == 4 && !memcmp(magic, "BFNV", 4) && fread(&version, 4, 1, f) == 1 &&
-            version == 1 && fread(&size, 4, 1, f) == 1 && size > 0;
-  unsigned char* data = ok ? static_cast<unsigned char*>(dtAlloc(size, DT_ALLOC_PERM)) : nullptr;
-  ok = ok && data && fread(data, 1, size_t(size), f) == size_t(size);
+  int version = 0;
+  bool ok = fread(magic, 1, 4, f) == 4 && !memcmp(magic, "BFNV", 4) && fread(&version, 4, 1, f) == 1;
+  g_navmesh = dtAllocNavMesh();
+  int size = 0, tiles = 0;
+  if (ok && version == 1) {
+    ok = fread(&size, 4, 1, f) == 1 && size > 0;
+    unsigned char* data = ok ? static_cast<unsigned char*>(dtAlloc(size, DT_ALLOC_PERM)) : nullptr;
+    ok = ok && data && fread(data, 1, size_t(size), f) == size_t(size) &&
+         dtStatusSucceed(g_navmesh->init(data, size, DT_TILE_FREE_DATA));
+    tiles = 1;
+  } else if (ok && version == 2) {
+    dtNavMeshParams params;
+    int count = 0;
+    ok = fread(&params, sizeof(params), 1, f) == 1 && fread(&count, 4, 1, f) == 1 &&
+         dtStatusSucceed(g_navmesh->init(&params));
+    for (int i = 0; ok && i < count; ++i) {
+      int tx, ty, ts;
+      ok = fread(&tx, 4, 1, f) == 1 && fread(&ty, 4, 1, f) == 1 && fread(&ts, 4, 1, f) == 1 && ts > 0;
+      unsigned char* data = ok ? static_cast<unsigned char*>(dtAlloc(ts, DT_ALLOC_PERM)) : nullptr;
+      ok = ok && data && fread(data, 1, size_t(ts), f) == size_t(ts) &&
+           dtStatusSucceed(g_navmesh->addTile(data, ts, DT_TILE_FREE_DATA, 0, nullptr));
+      size += ts, ++tiles;
+    }
+  } else {
+    ok = false;
+  }
   fclose(f);
   if (!ok) {
-    if (data) dtFree(data);
-    RT_WARN("bot nav: %s isn't a navigation mesh", path.c_str());
-    return false;
-  }
-  g_navmesh = dtAllocNavMesh();
-  if (dtStatusFailed(g_navmesh->init(data, size, DT_TILE_FREE_DATA))) {
-    RT_WARN("bot nav: Detour couldn't read %s", path.c_str());
+    RT_WARN("bot nav: %s isn't a navigation mesh Detour can read", path.c_str());
+    dtFreeNavMesh(g_navmesh);
+    g_navmesh = nullptr;
     return false;
   }
   g_navquery = dtAllocNavMeshQuery();
   g_navquery->init(g_navmesh, 4096);
-  RT_INFO("bot nav: navigation mesh %s (%d bytes)", path.c_str(), size);
+  RT_INFO("bot nav: navigation mesh %s (%d bytes, %d tiles)", path.c_str(), size, tiles);
   FindPieces();
   LoadBlocked();
   return true;
@@ -2430,7 +2468,7 @@ std::map<uint32_t, float> g_record_yaw;  // received input record -> its aim yaw
 }  // namespace rt
 extern "C" PPC_FUNC(__imp__sub_822C4F48);
 extern "C" PPC_FUNC(__imp__sub_822D1AA0);
-static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, float amount);
+static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, float amount, uint32_t attacker);
 PPC_FUNC(sub_821BF2A8) {
   uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32;
   if (IsCommitted(r4) && Ld32(r4) == 0x8200DC48) {
@@ -2447,7 +2485,7 @@ PPC_FUNC(sub_821BF2A8) {
       BotBrain(b, r4);
       if (uint32_t target = b.hit) {
         b.hit = 0;
-        DamageSoldier(ctx, base, target, 9.0f);
+        DamageSoldier(ctx, base, target, 9.0f, b.spawner);
       }
       if (uint32_t ie = b.use_entity) {
         b.use_entity = 0;
@@ -2495,20 +2533,35 @@ PPC_FUNC(sub_821BF2A8) {
 // +34, from 822D1AA0, which also kills through 822CC5D8): 822D1AA0(soldier,
 // damage record, giver). The record: +28 the amount, +2C and +3B read too
 // (zero here); the giver: a pointer to a word pointing at the attacking
-// player + 0xC4, or to 0 for none (no kill credit; 82328920).
-static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, float amount) {
+// player + 0xC4 (82328920), the player being its spawn object (vtable
+// 82019490: BF_BOT_DAMAGE_TRACE on a crate's blast), so the kill is the bot's.
+static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, float amount, uint32_t attacker) {
   if (!IsCommitted(soldier + 0x400) || Ld32(soldier) != 0x820118D0 || LdF(soldier + 0x3C) <= 0) return;
   static uint32_t record = 0, giver = 0;
   if (!record) record = g_system_heap->Alloc(0x100, 16), giver = g_system_heap->Alloc(0x10, 16);
   memset(G<uint8_t>(record), 0, 0x100);
-  St32(giver, 0);
+  St32(giver, attacker ? giver + 4 : 0);
+  St32(giver + 4, attacker ? attacker + 0xC4 : 0);
   uint32_t u;
   memcpy(&u, &amount, 4);
   St32(record + 0x28, u);
   float before = LdF(soldier + 0x3C);
+  std::vector<uint32_t> was;
+  if (attacker && before <= amount)  // a kill: what of the attacker changes (its score)
+    for (uint32_t k = 0; k < 0x200; k += 4) was.push_back(Ld32(attacker + k));
   PPCContext c = ctx;
   c.r3.u64 = soldier, c.r4.u64 = record, c.r5.u64 = giver;
   __imp__sub_822D1AA0(c, base);
+  if (!was.empty()) {
+    std::string d;
+    for (uint32_t k = 0; k < 0x200; k += 4)
+      if (Ld32(attacker + k) != was[k / 4]) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), " +%X:%X>%X", k, was[k / 4], Ld32(attacker + k));
+        d += buf;
+      }
+    RT_INFO("bot fight: kill by spawn object %08X; it changed:%s", attacker, d.empty() ? " nothing" : d.c_str());
+  }
   static int logged = 0;
   if (logged++ < 20 || LdF(soldier + 0x3C) <= 0)
     RT_INFO("bot fight: hit soldier %08X: health %.0f -> %.0f", soldier, before, LdF(soldier + 0x3C));
@@ -2977,5 +3030,25 @@ static std::string DamageWords(uint32_t a) {
   }
 DAMAGE_TRACE(82275C48)
 DAMAGE_TRACE(822B29A8)
-DAMAGE_TRACE(822D1AA0)
 DAMAGE_TRACE(822CC5D8)
+// 822D1AA0 itself: its giver (r5 -> word -> the attacking player + 0xC4,
+// 82328920): what that player is (its vtable and class) and what of it points
+// at the attacker's soldier, for the bots' kill credit.
+extern "C" PPC_FUNC(__imp__sub_822D1AA0);
+PPC_FUNC(sub_822D1AA0) {
+  static int n = 0;
+  if (g_damage_trace && n < 20 && Ptr(ctx.r5.u32)) {
+    uint32_t w = Ld32(ctx.r5.u32), q = Ptr(w) ? Ld32(w) : 0, player = q ? q - 0xC4 : 0;
+    if (Ptr(player)) {
+      ++n;
+      std::string soldiers;
+      for (uint32_t off = 0; off < 0x800 && IsCommitted(player + off + 3); off += 4)
+        if (Ptr(Ld32(player + off)) && Ld32(Ld32(player + off)) == 0x820118D0) soldiers += " +" + std::to_string(off);
+      RT_INFO("bot damage trace: 822D1AA0 victim %08X (%s), amount %.1f, giver %08X -> %08X -> %08X: player %08X (vt %08X %s); "
+              "soldier pointers at (decimal):%s",
+              ctx.r3.u32, TypeName(ctx.r3.u32).c_str(), Ptr(ctx.r4.u32) ? LdF(ctx.r4.u32 + 0x28) : 0.0f, ctx.r5.u32, w, q,
+              player, Ld32(player), TypeName(player).c_str(), soldiers.c_str());
+    }
+  }
+  __imp__sub_822D1AA0(ctx, base);
+}
