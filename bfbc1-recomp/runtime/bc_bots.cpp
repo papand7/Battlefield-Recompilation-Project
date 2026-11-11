@@ -179,6 +179,23 @@ std::string TypeName(uint32_t o) {
   return std::string(G<char>(name)).substr(0, 48);
 }
 
+// The bytes of an object's first 0x800 that changed between two snapshots and
+// stayed small (0-7 both times): flags and states, e.g. a soldier's pose.
+static std::vector<uint8_t> Bytes(uint32_t o) {
+  std::vector<uint8_t> v(0x800);
+  for (uint32_t k = 0; k < 0x800 && IsCommitted(o + k); ++k) v[k] = *G<uint8_t>(o + k);
+  return v;
+}
+static std::string SmallByteChanges(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+  std::string d;
+  for (size_t k = 0; k < a.size() && k < b.size(); ++k)
+    if (a[k] != b[k] && a[k] < 8 && b[k] < 8) {
+      char buf[24];
+      snprintf(buf, sizeof(buf), " +%zX:%u>%u", k, a[k], b[k]);
+      d += buf;
+    }
+  return d.empty() ? " none" : d;
+}
 // BF_BC_TYPES=1 (testing): 30 s after soldiers appear, every vtable in the heaps whose
 // type name has Soldier, Vehicle, Player or Camera in it, with how many
 // objects and a few of them, and for those objects the float triples that
@@ -1495,6 +1512,9 @@ struct Bot {
   int64_t next_shot = 0;
   std::set<uint32_t> used;  // the interactions it used
   float want_heading = 0;   // for the aim setter (824ADEE8)
+  float want_pitch = 0;     // radians, up + (the aim record's +38)
+  bool crouched = false;    // as it made itself (the pose toggles)
+  int64_t pose_at = 0;      // when it last toggled
   const char* kit_class = nullptr;  // its kit, chosen at the first deploy
   int64_t grenade_at = 0;           // when its last throw began
   float grenade_pos[3] = {0, 0, 0};  // where it lands (where the enemy stood)
@@ -1986,7 +2006,8 @@ const bool g_host_pilot_started = [] {
           while (diff > 3.14159265f) diff -= 6.2831853f;
           while (diff < -3.14159265f) diff += 6.2831853f;
           rx = int16_t(std::clamp(-diff * 3.0f, -1.0f, 1.0f) * 20000);
-          g_pilot_buttons = 0;
+          // BF_BOT_PILOT_GRENADE=1: LB (the grenade) for 0.3 s every 8 s too.
+          g_pilot_buttons = getenv("BF_BOT_PILOT_GRENADE") && now % 8000 < 300 ? 0x0100 : 0;
           continue;
         }
       }
@@ -2073,9 +2094,22 @@ const bool g_host_pilot_started = [] {
         continue;
       }
       hold_since = 0, g_pilot_buttons = 0;
+      // BF_BOT_PILOT_CROUCH=1: the crouch button (the right stick's click) for
+      // 0.2 s every 4 s; the soldier's small bytes that changed 1 s later.
+      if (getenv("BF_BOT_PILOT_CROUCH")) {
+        static std::vector<uint8_t> before;
+        static int64_t pressed = 0;
+        if (now - pressed > 4000) pressed = now, before = Bytes(so);
+        if (now - pressed < 200) g_pilot_buttons = 0x0080;
+        static int64_t reported = 0;
+        if (now - pressed > 1000 && reported != pressed) {
+          reported = pressed;
+          RT_INFO("bot pilot: crouch pressed: soldier bytes changed:%s", SmallByteChanges(before, Bytes(so)).substr(0, 500).c_str());
+        }
+      }
       // BF_BOT_PILOT_LOOK=1: looking up 1.5 s, then down 1.5 s, while walking.
       if (getenv("BF_BOT_PILOT_LOOK")) {
-        int64_t ph = (now / 1500) % 2;
+        int64_t ph = (now / 3000) % 2;
         g_pilot_ry = ph ? -20000 : 20000;
         static int64_t said_ph = -1;
         if (ph != said_ph) said_ph = ph, RT_INFO("bot pilot: looking %s", ph ? "down" : "up");
@@ -2367,8 +2401,15 @@ static void BotBrain(Bot& b, uint32_t in) {
     if (kBits[seg] >= 0) extra_bits = 1u << kBits[seg];
     St32(in + 0x58, 0x3C003C00u);
   }
-  // Buttons are bits of +84: 13 jump (A), 21 reload (X), 23 sprint (the
-  // left stick's click: 21 m in 4 s against 15 walking, BF_BOT_SPRINT_TEST).
+  // Crouching (bit 16, a toggle: heights of 1.38 fell to 1.00, BF_BOT_POSE_TEST)
+  // while fighting an enemy over 8 m off; standing again to move on.
+  bool want_crouch = b.enemy && b.edist > 8.0f;
+  bool toggle = want_crouch != b.crouched && now - b.pose_at > 800;
+  if (toggle) b.crouched = want_crouch, b.pose_at = now;
+  if (now - b.pose_at < 200) extra_bits |= 1u << 16;
+  if (b.crouched && !b.enemy) forward = 0;  // until it has stood up
+  // Buttons are bits of +84: 13 jump (A), 16 crouch, 21 reload (X), 23 sprint
+  // (the left stick's click: 21 m in 4 s against 15 walking, BF_BOT_SPRINT_TEST).
   // Sprinting on the way when the goal is over 20 m off.
   bool sprint = forward > 0.9f && !b.enemy && best > 20.0f && now >= b.unstick_until && !sprint_test;
   St32(in + 0x84, (jump ? 0x2000u : 0u) | (reload ? 0x200000u : 0u) | (sprint ? 0x800000u : 0u) | extra_bits);
@@ -2406,49 +2447,47 @@ static void BotBrain(Bot& b, uint32_t in) {
       }
     }
   }
-  // BF_BOT_POSE_TEST=1 (testing): bot 0 stands; every 6 s: a jump (bit 13,
-  // held +44) and its highest rise, then crouch candidates (bits 14-17,
-  // pressed 0.3 s) and what of the soldier changed 2 s later (then pressed
-  // again to stand up).
+  // BF_BOT_POSE_TEST=1 (testing): bot 0 stands; each crouch candidate (bits
+  // 15, 16, 14, 17 of +84) pressed once, then again 4 s later, 4 s each: the
+  // floats of 0.5-2 m in the soldier and what it points at that moved by over
+  // 0.2 (a height that drops when crouched).
   static const bool pose_test = getenv("BF_BOT_POSE_TEST") != nullptr;
   if (pose_test && b.index == 0) {
     forward = 0, strafe = 0;
     static int64_t t0 = 0;
-    static int phase = -1;
-    static float base_y = 0, top_y = 0;
-    static std::vector<uint32_t> was;
-    static const int kCands[] = {13, 14, 15, 16, 17};
-    if (!t0 || now - t0 > 6000) {
-      if (phase >= 0 && kCands[phase] == 13) RT_INFO("bot pose test: jump rose %.2f m", top_y - base_y);
-      t0 = now, phase = (phase + 1) % 5, base_y = top_y = y;
-      was.clear();
-      for (uint32_t k = 0; k < 0x800; k += 4) was.push_back(Ld32(so + k));
-    }
-    int64_t t = now - t0;
-    top_y = std::max(top_y, y);
-    int bit = kCands[phase];
-    if (t < 300 || (bit != 13 && t >= 3000 && t < 3300)) {
-      St32(in + 0x84, Ld32(in + 0x84) | (1u << bit));
-      if (bit == 13) St32(in + 0x44, 0x00003C00u);
-    }
-    static int reported = -1;
-    if (bit != 13 && t >= 2300 && reported != phase * 100 + int(now / 6000 % 1000)) {
-      reported = phase * 100 + int(now / 6000 % 1000);
-      std::string d;
-      for (uint32_t k = 0; k < 0x800; k += 4) {
-        uint32_t v = Ld32(so + k);
-        if (v == was[k / 4] || k == 0x200 || k == 0x208) continue;
-        float a, c;
-        memcpy(&a, &was[k / 4], 4), memcpy(&c, &v, 4);
-        char buf[48];
-        if (v < 0x100 && was[k / 4] < 0x100) snprintf(buf, sizeof(buf), " +%X:%u>%u", k, was[k / 4], v);
-        else if (std::isfinite(a) && std::isfinite(c) && std::fabs(a - c) > 0.05f && std::fabs(c) < 1e4f)
-          snprintf(buf, sizeof(buf), " +%X:%.2f>%.2f", k, a, c);
-        else continue;
-        d += buf;
+    static int step = -1;
+    static std::map<uint32_t, float> before;
+    static const int kCands[] = {15, 15, 16, 16, 14, 14, 17, 17};
+    auto heights = [&](std::map<uint32_t, float>& out) {
+      out.clear();
+      std::vector<uint32_t> objs{so};
+      for (uint32_t k = 0; k < 0x800; k += 4)
+        if (Ptr(Ld32(so + k)) && IsCommitted(Ld32(so + k) + 0x3FC)) objs.push_back(Ld32(so + k));
+      for (size_t n = 0; n < objs.size(); ++n)
+        for (uint32_t k = 0; k < (n ? 0x400u : 0x800u); k += 4) {
+          float f = LdF(objs[n] + k);
+          if (std::isfinite(f) && f > 0.5f && f < 2.0f) out[uint32_t(n) << 16 | k] = f;
+        }
+    };
+    if (!t0 || now - t0 > 4000) {
+      if (step >= 0) {
+        std::map<uint32_t, float> after;
+        heights(after);
+        std::string d;
+        for (auto& [key, f] : before) {
+          auto it = after.find(key);
+          if (it != after.end() && std::fabs(it->second - f) > 0.2f) {
+            char buf[48];
+            snprintf(buf, sizeof(buf), " obj%u+%X:%.2f>%.2f", key >> 16, key & 0xFFFF, f, it->second);
+            d += buf;
+          }
+        }
+        RT_INFO("bot pose test: bit %d (press %d): heights moved:%s", kCands[step], step % 2 + 1, d.empty() ? " none" : d.substr(0, 500).c_str());
       }
-      RT_INFO("bot pose test: bit %d: changed:%s", bit, d.substr(0, 700).c_str());
+      t0 = now, step = (step + 1) % 8;
+      heights(before);
     }
+    if (now - t0 < 300) St32(in + 0x84, Ld32(in + 0x84) | (1u << kCands[step]));
   }
   // BF_BOT_GRENADE_TEST=1 (testing): bot 0 stands; every 8 s one candidate
   // weapon slot button (bits 19, 18, 20, 29, 30, 31 of +84, bits 0-1 of +88)
@@ -2525,6 +2564,8 @@ static void BotBrain(Bot& b, uint32_t in) {
   // from atan2(dx, dz)).
   float want = b.enemy ? std::atan2(b.ex - x, b.ez - z) : std::atan2(px - x, pz - z);
   b.want_heading = want + 3.14159265f, b.steer = b.aim_obj != 0;
+  // Looking up or down: at the enemy's chest from the eye, else level.
+  b.want_pitch = b.enemy ? std::atan2(b.ey + 1.2f - (y + 1.6f), std::max(b.edist, 0.5f)) : 0.0f;
   if (now - b.logged > 3000) {
     b.logged = now;
     RT_INFO("bot %d (team %u): at %.1f %.1f %.1f, health %.0f; %s %.1f m%s", b.index, b.team, x, y, z, LdF(so + 0x3C),
@@ -2593,6 +2634,7 @@ PPC_FUNC(sub_824ADEE8) {
       St32(a, u);
     };
     float h = steered->want_heading;
+    put(ctx.r4.u32 + 0x38, steered->want_pitch);  // pitch, up + (BF_BOT_PITCH_TRACE: -1.4 looking down)
     put(ctx.r4.u32 + 0x34, -h);
     put(ctx.r4.u32 + 0x0, std::sin(h));
     put(ctx.r4.u32 + 0x8, std::cos(h));
@@ -2604,15 +2646,10 @@ PPC_FUNC(sub_824ADEE8) {
   if (pitch_trace && !steered && IsCommitted(ctx.r4.u32 + 0x48)) {
     static int64_t last = 0;
     int64_t t = int64_t(GetTickCount64());
-    if (t - last > 700) {
+    if (t - last > 300) {
       last = t;
-      std::string w;
-      for (uint32_t k = 0; k <= 0x40; k += 4) {
-        char buf[24];
-        snprintf(buf, sizeof(buf), " +%X:%.3f", k, LdF(ctx.r4.u32 + k));
-        w += buf;
-      }
-      RT_INFO("bot pitch trace: aim %08X:%s", r3, w.c_str());
+      RT_INFO("bot pitch trace: aim %08X: +38 %.3f +3C %.3f (yaw +34 %.3f)", r3, LdF(ctx.r4.u32 + 0x38),
+              LdF(ctx.r4.u32 + 0x3C), LdF(ctx.r4.u32 + 0x34));
     }
   }
   float before = IsCommitted(r3 + 0x134) ? LdF(r3 + 0x134) : 0;
@@ -2899,7 +2936,7 @@ PPC_FUNC(sub_823D1DD0) {
     if (alive) continue;
     if (so) {
       RT_INFO("bot %d: its soldier %08X is dead", b.index, so);
-      b.soldier = b.input = b.aim_obj = b.aim_for = 0, b.steer = false, b.enemy = 0;
+      b.soldier = b.input = b.aim_obj = b.aim_for = 0, b.steer = false, b.enemy = 0, b.crouched = false;
       b.route.clear(), b.died_at = now;
     }
     if (b.died_at && now - b.died_at < 8000) continue;
@@ -3348,6 +3385,7 @@ PPC_FUNC(sub_822D1AA0) {
       std::string soldiers;
       for (uint32_t off = 0; off < 0x800 && IsCommitted(player + off + 3); off += 4)
         if (Ptr(Ld32(player + off)) && Ld32(Ld32(player + off)) == 0x820118D0) soldiers += " +" + std::to_string(off);
+      if (!BotWithSpawner(player) && n <= 4) bf_crash_diag::PrintStack(nullptr);  // a player's hit: how it gets here
       RT_INFO("bot damage trace: 822D1AA0 victim %08X (%s), amount %.1f, giver %08X -> %08X -> %08X: player %08X (vt %08X %s); "
               "soldier pointers at (decimal):%s",
               ctx.r3.u32, TypeName(ctx.r3.u32).c_str(), Ptr(ctx.r4.u32) ? LdF(ctx.r4.u32 + 0x28) : 0.0f, ctx.r5.u32, w, q,
@@ -3355,4 +3393,20 @@ PPC_FUNC(sub_822D1AA0) {
     }
   }
   __imp__sub_822D1AA0(ctx, base);
+}
+
+// BF_BOT_GRENADE_TRACE=1 (testing): ServerGrenadeEntity's constructor (it
+// stores its vtable 82017440): its arguments (a pointer's class, and the
+// record r4/r5 point to) and the call stack, the first 4: how a throw makes one.
+extern "C" PPC_FUNC(__imp__sub_82303C20);
+PPC_FUNC(sub_82303C20) {
+  static const bool trace = getenv("BF_BOT_GRENADE_TRACE") != nullptr;
+  static int n = 0;
+  if (trace && n++ < 4) {
+    RT_INFO("bot grenade trace: 82303C20(%s %s %s %s %s) | r4:%s | r5:%s", ArmArg(ctx.r3.u32).c_str(), ArmArg(ctx.r4.u32).c_str(),
+            ArmArg(ctx.r5.u32).c_str(), ArmArg(ctx.r6.u32).c_str(), ArmArg(ctx.r7.u32).c_str(),
+            DamageWords(ctx.r4.u32).c_str(), DamageWords(ctx.r5.u32).c_str());
+    bf_crash_diag::PrintStack(nullptr);
+  }
+  __imp__sub_82303C20(ctx, base);
 }
