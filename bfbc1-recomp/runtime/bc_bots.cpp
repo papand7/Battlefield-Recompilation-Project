@@ -1483,6 +1483,9 @@ struct Bot {
   float sx = 0, sz = 0, last_sx = 1e9f, last_sz = 1e9f;
   int64_t since = 0, unstick_until = 0, jump_until = 0;
   int side = 1;
+  int stucks = 0;              // stuck events near the same place (last_sx, last_sz)
+  float detour[3] = {0, 0, 0};  // a way out: a reachable place nearby
+  int64_t detour_until = 0;
   uint32_t enemy = 0, engaged = 0;
   float ex = 0, ey = 0, ez = 0, edist = 0;
   int64_t looked_at = 0, engaged_at = 0, reload_until = 0;
@@ -1492,6 +1495,10 @@ struct Bot {
   int64_t next_shot = 0;
   std::set<uint32_t> used;  // the interactions it used
   float want_heading = 0;   // for the aim setter (824ADEE8)
+  const char* kit_class = nullptr;  // its kit, chosen at the first deploy
+  int64_t grenade_at = 0;           // when its last throw began
+  float grenade_pos[3] = {0, 0, 0};  // where it lands (where the enemy stood)
+  bool grenade_live = false;         // thrown, not gone off yet
   bool steer = false;
   int64_t logged = 0;
 };
@@ -2066,6 +2073,13 @@ const bool g_host_pilot_started = [] {
         continue;
       }
       hold_since = 0, g_pilot_buttons = 0;
+      // BF_BOT_PILOT_LOOK=1: looking up 1.5 s, then down 1.5 s, while walking.
+      if (getenv("BF_BOT_PILOT_LOOK")) {
+        int64_t ph = (now / 1500) % 2;
+        g_pilot_ry = ph ? -20000 : 20000;
+        static int64_t said_ph = -1;
+        if (ph != said_ph) said_ph = ph, RT_INFO("bot pilot: looking %s", ph ? "down" : "up");
+      }
       if (now - planned > 3000) {
         planned = now;
         float from[3] = {x, y, z}, to[3] = {tx, ty, tz};
@@ -2255,6 +2269,11 @@ static void BotBrain(Bot& b, uint32_t in) {
   float px = tx, pz = tz;
   if (b.step < b.route.size()) px = b.route[b.step][0], pz = b.route[b.step][2];
   bool arrived = !goal || (guard ? best < 6.0f : best < 1.0f && b.step >= b.route.size());
+  // Out of a spot it keeps getting stuck in: to the detour first.
+  if (now < b.detour_until) {
+    if (std::hypot(b.detour[0] - x, b.detour[2] - z) < 1.5f) b.detour_until = 0, b.planned = 0;
+    else px = b.detour[0], pz = b.detour[2], arrived = false;
+  }
   float forward = arrived ? 0.0f : 1.0f, strafe = 0.0f;
 
   // Fighting.
@@ -2293,11 +2312,33 @@ static void BotBrain(Bot& b, uint32_t in) {
     RT_INFO("bot %d: stuck at %.1f %.1f: jump and sidestep %s", b.index, x, z, b.side > 0 ? "right" : "left");
     // Stuck twice near the same spot on a route: the polygon ahead (1.5 m
     // toward the next corner) is somewhere it can't get to.
-    if (std::hypot(x - b.last_sx, z - b.last_sz) < 3.0f && b.step < b.route.size() && g_navquery) {
+    bool same_place = std::hypot(x - b.last_sx, z - b.last_sz) < 5.0f;
+    b.stucks = same_place ? b.stucks + 1 : 1;
+    if (same_place && b.step < b.route.size() && g_navquery) {
       float dx = b.route[b.step][0] - x, dz = b.route[b.step][2] - z, l = std::max(std::hypot(dx, dz), 0.001f);
       float ahead[3] = {x + 1.5f * dx / l, y, z + 1.5f * dz / l};
       BlockPoly(ahead);
       b.planned = 0;
+    }
+    // Stuck three times around here: a detour to a reachable place 4 to 10 m
+    // away on the mesh's main piece (a random one), then the route again.
+    if (b.stucks >= 3 && g_navquery) {
+      dtQueryFilter filter;
+      const float ext[3] = {2, 4, 2};
+      float at[3] = {x, y, z}, onmesh[3], pt[3];
+      dtPolyRef start = 0, ref = 0;
+      g_navquery->findNearestPoly(at, ext, &filter, &start, onmesh);
+      for (int tries = 0; start && tries < 12; ++tries) {
+        if (dtStatusFailed(g_navquery->findRandomPointAroundCircle(start, onmesh, 10.0f, &filter,
+                                                                   [] { return float(rand()) / RAND_MAX; }, &ref, pt)))
+          break;
+        float d = std::hypot(pt[0] - x, pt[2] - z);
+        if (d < 4.0f || !InMainPiece(ref)) continue;
+        memcpy(b.detour, pt, sizeof(pt));
+        b.detour_until = now + 6000, b.stucks = 0;
+        RT_INFO("bot %d: stuck here again; out by %.1f %.1f first", b.index, pt[0], pt[2]);
+        break;
+      }
     }
     b.last_sx = x, b.last_sz = z;
   }
@@ -2308,9 +2349,41 @@ static void BotBrain(Bot& b, uint32_t in) {
 
   // The pad.
   bool jump = now < b.jump_until, reload = now < b.reload_until;
-  St32(in + 0x84, (jump ? 0x2000u : 0u) | (reload ? 0x200000u : 0u));
+  uint32_t extra_bits = 0;
+  // BF_BOT_SPRINT_TEST=1 (testing): while walking, each button bit of +84 in
+  // turn (4 s each; A's and X's known) with the left stick click's held time
+  // (+58) at 1.0, and how far it went: which bit sprints.
+  static const bool sprint_test = getenv("BF_BOT_SPRINT_TEST") != nullptr;
+  if (sprint_test && b.index == 0 && forward > 0.9f && !b.enemy) {
+    static int64_t seg_at = 0;
+    static int seg = -1;
+    static float seg_x = 0, seg_z = 0;
+    if (now - seg_at > 4000) {
+      static const int kNames[4] = {-1, 23, 24, 25};
+      if (seg >= 0) RT_INFO("bot sprint test: bit %d: %.2f m in 4 s", kNames[seg], std::hypot(x - seg_x, z - seg_z));
+      seg = (seg + 1) % 4, seg_at = now, seg_x = x, seg_z = z;
+    }
+    static const int kBits[4] = {-1, 23, 24, 25};  // none, then the candidates around EIASprint (24)
+    if (kBits[seg] >= 0) extra_bits = 1u << kBits[seg];
+    St32(in + 0x58, 0x3C003C00u);
+  }
+  // Buttons are bits of +84: 13 jump (A), 21 reload (X), 23 sprint (the
+  // left stick's click: 21 m in 4 s against 15 walking, BF_BOT_SPRINT_TEST).
+  // Sprinting on the way when the goal is over 20 m off.
+  bool sprint = forward > 0.9f && !b.enemy && best > 20.0f && now >= b.unstick_until && !sprint_test;
+  St32(in + 0x84, (jump ? 0x2000u : 0u) | (reload ? 0x200000u : 0u) | (sprint ? 0x800000u : 0u) | extra_bits);
   St32(in + 0x44, jump ? 0x00003C00u : 0u);
   St32(in + 0x54, reload ? 0x00003C00u : 0u);
+  // A grenade every 15 s at an enemy 12 to 35 m off. A fake player's throw
+  // makes no grenade (no button tried did: BF_BOT_GRENADE_TEST), so it is
+  // the server's: 2.5 s later everyone within 6 m of where the enemy stood
+  // takes up to 60 damage (falling off with distance), credited to the bot.
+  // No explosion is drawn.
+  if (b.enemy && b.edist > 12.0f && b.edist < 35.0f && now - b.grenade_at > 15000 && now - b.engaged_at > 600) {
+    b.grenade_at = now, b.grenade_live = true;
+    b.grenade_pos[0] = b.ex, b.grenade_pos[1] = b.ey, b.grenade_pos[2] = b.ez;
+    RT_INFO("bot %d: grenade at %08X, %.1f m", b.index, b.enemy, b.edist);
+  }
   if (b.enemy) {
     forward = 0, strafe = 0;
     // The shot's direction: the record's aim (+90 yaw: atan2(dx, dz) + pi, as
@@ -2331,6 +2404,103 @@ static void BotBrain(Bot& b, uint32_t in) {
         float chance = std::clamp(1.05f - b.edist / 40.0f, 0.15f, 0.9f);
         if (float(rand()) / RAND_MAX < chance) b.hit = b.enemy;
       }
+    }
+  }
+  // BF_BOT_POSE_TEST=1 (testing): bot 0 stands; every 6 s: a jump (bit 13,
+  // held +44) and its highest rise, then crouch candidates (bits 14-17,
+  // pressed 0.3 s) and what of the soldier changed 2 s later (then pressed
+  // again to stand up).
+  static const bool pose_test = getenv("BF_BOT_POSE_TEST") != nullptr;
+  if (pose_test && b.index == 0) {
+    forward = 0, strafe = 0;
+    static int64_t t0 = 0;
+    static int phase = -1;
+    static float base_y = 0, top_y = 0;
+    static std::vector<uint32_t> was;
+    static const int kCands[] = {13, 14, 15, 16, 17};
+    if (!t0 || now - t0 > 6000) {
+      if (phase >= 0 && kCands[phase] == 13) RT_INFO("bot pose test: jump rose %.2f m", top_y - base_y);
+      t0 = now, phase = (phase + 1) % 5, base_y = top_y = y;
+      was.clear();
+      for (uint32_t k = 0; k < 0x800; k += 4) was.push_back(Ld32(so + k));
+    }
+    int64_t t = now - t0;
+    top_y = std::max(top_y, y);
+    int bit = kCands[phase];
+    if (t < 300 || (bit != 13 && t >= 3000 && t < 3300)) {
+      St32(in + 0x84, Ld32(in + 0x84) | (1u << bit));
+      if (bit == 13) St32(in + 0x44, 0x00003C00u);
+    }
+    static int reported = -1;
+    if (bit != 13 && t >= 2300 && reported != phase * 100 + int(now / 6000 % 1000)) {
+      reported = phase * 100 + int(now / 6000 % 1000);
+      std::string d;
+      for (uint32_t k = 0; k < 0x800; k += 4) {
+        uint32_t v = Ld32(so + k);
+        if (v == was[k / 4] || k == 0x200 || k == 0x208) continue;
+        float a, c;
+        memcpy(&a, &was[k / 4], 4), memcpy(&c, &v, 4);
+        char buf[48];
+        if (v < 0x100 && was[k / 4] < 0x100) snprintf(buf, sizeof(buf), " +%X:%u>%u", k, was[k / 4], v);
+        else if (std::isfinite(a) && std::isfinite(c) && std::fabs(a - c) > 0.05f && std::fabs(c) < 1e4f)
+          snprintf(buf, sizeof(buf), " +%X:%.2f>%.2f", k, a, c);
+        else continue;
+        d += buf;
+      }
+      RT_INFO("bot pose test: bit %d: changed:%s", bit, d.substr(0, 700).c_str());
+    }
+  }
+  // BF_BOT_GRENADE_TEST=1 (testing): bot 0 stands; every 8 s one candidate
+  // weapon slot button (bits 19, 18, 20, 29, 30, 31 of +84, bits 0-1 of +88)
+  // for 0.2 s, fire at 1.2 s for 0.4 s, then at 4 s: how many objects of the
+  // projectile and explosion classes there are, and what of the soldier changed.
+  static const bool grenade_test = getenv("BF_BOT_GRENADE_TEST") != nullptr;
+  if (grenade_test && b.index == 0) {
+    forward = 0, strafe = 0;
+    static int64_t t0 = 0;
+    static int phase = -1;
+    static std::vector<uint32_t> was;
+    static std::vector<uint32_t> vts;  // the projectile/explosion/grenade classes' vtables
+    if (vts.empty()) {
+      std::set<uint32_t> seen;
+      for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+        if (page >= 0x80000000 && page < 0xA0000000) continue;
+        if (!IsCommitted(uint32_t(page))) continue;
+        for (uint32_t i = 0; i < 0x1000; i += 4) {
+          uint32_t v = Ld32(uint32_t(page) + i);
+          if (v < 0x82000000 || v >= 0x82100000 || (v & 3) || !seen.insert(v).second) continue;
+          std::string n = VtName(v);
+          if (n.find("Projectile") != std::string::npos || n.find("Grenade") != std::string::npos ||
+              n.find("Explosion") != std::string::npos)
+            vts.push_back(v), RT_INFO("bot grenade test: class %08X %s", v, n.c_str());
+        }
+      }
+    }
+    static const int kCands[] = {10, 9, 11, 12, 10, 9, 11, 12};  // EIAAltFire (10) and its neighbours
+    if (!t0 || now - t0 > 8000) {
+      t0 = now, phase = (phase + 1) % 8;
+      was.clear();
+      for (uint32_t k = 0; k < 0x800; k += 4) was.push_back(Ld32(so + k));
+      RT_INFO("bot grenade test: trying bit %d", kCands[phase]);
+    }
+    int64_t t = now - t0;
+    int bit = kCands[phase];
+    if (t < 1000) {
+      if (bit < 32) St32(in + 0x84, Ld32(in + 0x84) | (1u << bit));
+      else St32(in + 0x88, Ld32(in + 0x88) | (1u << (bit - 32)));
+    }
+    static int reported = -1;
+    if (t >= 4000 && reported != phase) {
+      reported = phase;
+      std::string counts, d;
+      for (uint32_t v : vts) counts += " " + VtName(v) + "=" + std::to_string(Scan(v).size());
+      for (uint32_t k = 0; k < 0x800; k += 4)
+        if (Ld32(so + k) != was[k / 4] && (Ptr(Ld32(so + k)) || Ptr(was[k / 4]))) {
+          char buf[48];
+          snprintf(buf, sizeof(buf), " +%X:%08X>%08X", k, was[k / 4], Ld32(so + k));
+          d += buf;
+        }
+      RT_INFO("bot grenade test: bit %d: objects%s; soldier pointers changed:%s", bit, counts.c_str(), d.substr(0, 600).c_str());
     }
   }
   set(0x8, forward);
@@ -2428,6 +2598,23 @@ PPC_FUNC(sub_824ADEE8) {
     put(ctx.r4.u32 + 0x8, std::cos(h));
     ++g_bot_setter_calls;
   }
+  // BF_BOT_PITCH_TRACE=1 (testing): a player's (not a bot's) aim record once
+  // a second: the three vectors (+0..+2C) and +30..+40, to find its pitch.
+  static const bool pitch_trace = getenv("BF_BOT_PITCH_TRACE") != nullptr;
+  if (pitch_trace && !steered && IsCommitted(ctx.r4.u32 + 0x48)) {
+    static int64_t last = 0;
+    int64_t t = int64_t(GetTickCount64());
+    if (t - last > 700) {
+      last = t;
+      std::string w;
+      for (uint32_t k = 0; k <= 0x40; k += 4) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), " +%X:%.3f", k, LdF(ctx.r4.u32 + k));
+        w += buf;
+      }
+      RT_INFO("bot pitch trace: aim %08X:%s", r3, w.c_str());
+    }
+  }
   float before = IsCommitted(r3 + 0x134) ? LdF(r3 + 0x134) : 0;
   PPCContext in = ctx;
   __imp__sub_824ADEE8(ctx, base);
@@ -2487,6 +2674,17 @@ PPC_FUNC(sub_821BF2A8) {
         b.hit = 0;
         DamageSoldier(ctx, base, target, 9.0f, b.spawner);
       }
+      if (b.grenade_live && int64_t(GetTickCount64()) - b.grenade_at > 2500) {
+        b.grenade_live = false;
+        for (uint32_t o : Scan(0x820118D0)) {
+          if (!IsCommitted(o + 0x400) || LdF(o + 0x3C) <= 0) continue;
+          uint32_t t = Ld32(o + 0x48);
+          if ((t != 1 && t != 2) || t == b.team) continue;
+          float d = std::hypot(LdF(o + 0x200) - b.grenade_pos[0], LdF(o + 0x208) - b.grenade_pos[2]);
+          if (d < 6.0f && std::fabs(LdF(o + 0x204) - b.grenade_pos[1]) < 3.0f)
+            DamageSoldier(ctx, base, o, 60.0f * (1.0f - d / 6.0f) + 10.0f, b.spawner);
+        }
+      }
       if (uint32_t ie = b.use_entity) {
         b.use_entity = 0;
         b.used.insert(ie);
@@ -2527,6 +2725,59 @@ PPC_FUNC(sub_821BF2A8) {
     if (w != last[r4]) RT_INFO("bot input map %08X:%s", r4, w.c_str());
     last[r4] = w;
   }
+}
+// Kits (SoldierEntityData, vtable 8206E890: KIT_ASSAULT...): one of each
+// class per side, told apart by their SoldierAsset (vtable 8207B2FC, its kit
+// at +3C, its name at +C: Objects/Soldiers/US/Assault, .../RU/Recon). A
+// team's side: its soldiers' kits (a soldier's +14). Each bot gets its team's
+// side and a class in turn (assault, support, demolition, recon, specialist);
+// the weapon choice (+1D8) is left to the kit (0) unless it is the host's kit.
+struct KitInfo { uint32_t kit; std::string side, cls; };
+static std::vector<KitInfo> g_kits;
+static void FindKits() {
+  if (!g_kits.empty()) return;
+  for (uint32_t a : Scan(0x8207B2FC)) {
+    uint32_t k = Ld32(a + 0x3C), name = Ld32(a + 0xC);
+    if (!Ptr(k) || Ld32(k) != 0x8206E890 || !Ptr(name)) continue;
+    std::string n = std::string(G<char>(name)).substr(0, 80);
+    size_t p = n.find("/Soldiers/");
+    if (p == std::string::npos) continue;
+    std::string rest = n.substr(p + 10);
+    size_t slash = rest.find('/');
+    if (slash == std::string::npos) continue;
+    g_kits.push_back({k, rest.substr(0, slash), rest.substr(slash + 1)});
+  }
+  for (auto& k : g_kits) RT_INFO("bot kits: %08X %s %s", k.kit, k.side.c_str(), k.cls.c_str());
+}
+static std::string KitSide(uint32_t kit) {
+  for (auto& k : g_kits)
+    if (k.kit == kit) return k.side;
+  return {};
+}
+static uint32_t BotKit(Bot& b, uint32_t host_kit) {
+  FindKits();
+  // The bot's team's side: from a soldier of that team, else the host's kit's
+  // side for the host's team and the other side for the other.
+  std::string side;
+  for (uint32_t so : Scan(0x820118D0))
+    if (Ld32(so + 0x48) == b.team && Ptr(Ld32(so + 0x14)) && !(side = KitSide(Ld32(so + 0x14))).empty()) break;
+  if (side.empty()) {
+    std::string host_side = KitSide(host_kit);
+    uint32_t host_team = 0;
+    for (uint32_t o : Scan(0x82019490))
+      if (Ld32(o + 0x1D4) == host_kit && !BotWithSpawner(o)) host_team = Ld32(o + 0x30);
+    for (auto& k : g_kits)
+      if ((host_team == b.team) == (k.side == host_side)) side = k.side;
+  }
+  static const char* kClasses[] = {"Assault", "Support", "Demolition", "Recon", "Specialist"};
+  if (!b.kit_class) b.kit_class = kClasses[b.index % 5];
+  for (auto& k : g_kits)
+    if (k.side == side && k.cls == b.kit_class) {
+      static std::map<int, uint32_t> said;
+      if (said[b.index] != k.kit) said[b.index] = k.kit, RT_INFO("bot %d: kit %s/%s", b.index, side.c_str(), b.kit_class);
+      return k.kit;
+    }
+  return host_kit;
 }
 // Damage to a soldier, as the server applies a hit (seen with BF_BOT_WATCH_HEALTH
 // and BF_BOT_DAMAGE_TRACE: its health +3C set by 822B29A8 on its health part
@@ -2589,6 +2840,58 @@ PPC_FUNC(sub_823D1DD0) {
   for (uint32_t o : Scan(0x82019490))
     if (!BotWithSpawner(o) && Ld32(o + 0x1D4)) kit = Ld32(o + 0x1D4), kit2 = Ld32(o + 0x1D8);
   if (!kit) return;
+  // BF_BC_KITS=1 (testing): the kits (SoldierEntityData, vtable 8206E890) once:
+  // each one's words that point at a SoldierWeaponData (82074ACC) or at an
+  // array of them, its text, and the host's choice.
+  static bool kits_logged = false;
+  if (!kits_logged && getenv("BF_BC_KITS")) {
+    kits_logged = true;
+    RT_INFO("bc kits: the host's choice: kit %08X, weapon %08X", kit, kit2);
+    for (uint32_t k : Scan(0x8206E890)) {
+      std::string out;
+      for (uint32_t off = 0; off < 0x200; off += 4) {
+        uint32_t v = Ld32(k + off);
+        if (!Ptr(v)) continue;
+        if (Ld32(v) == 0x82074ACC) out += " +" + std::to_string(off) + "=weapon " + std::to_string(v);
+        else if (IsCommitted(v + 4) && Ptr(Ld32(v)) && Ld32(Ld32(v)) == 0x82074ACC)
+          out += " +" + std::to_string(off) + "=weapons[]@" + std::to_string(v);
+        else {
+          const char* c = G<char>(v);
+          int n = 0;
+          while (n < 40 && c[n] >= 32 && c[n] < 127) ++n;
+          if (n >= 4 && c[n] == 0) out += " +" + std::to_string(off) + "='" + std::string(c, n) + "'";
+        }
+      }
+      RT_INFO("bc kits: kit %08X:%s", k, out.substr(0, 900).c_str());
+      // What points at it (the side's kit list, its asset): the objects with
+      // a vtable, their class and text.
+      uint32_t want = _byteswap_ulong(k);
+      std::string refs;
+      int found = 0;
+      for (uint64_t page = 0x40000000; page < 0xC0000000 && found < 12; page += 0x1000) {
+        if (page >= 0x80000000 && page < 0xA0000000) continue;
+        if (!IsCommitted(uint32_t(page))) continue;
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(g_base + page);
+        for (int i = 0; i < 1024 && found < 12; ++i) {
+          if (w[i] != want) continue;
+          uint32_t at = uint32_t(page) + i * 4;
+          // the object around it: the nearest word before that is a vtable
+          for (uint32_t o = at; o + 0x400 > at && o >= 0x40000000; o -= 4) {
+            uint32_t vt = Ld32(o);
+            if (vt >= 0x82000000 && vt < 0x82180000 && !TypeName(o).empty()) {
+              char buf[160];
+              snprintf(buf, sizeof(buf), " [%08X+%X %s %s]", o, at - o, TypeName(o).c_str(),
+                       Ptr(Ld32(o + 0xC)) ? std::string(G<char>(Ld32(o + 0xC))).substr(0, 40).c_str() : "");
+              refs += buf;
+              break;
+            }
+          }
+          ++found;
+        }
+      }
+      RT_INFO("bc kits:   pointed at by:%s", refs.c_str());
+    }
+  }
   for (Bot& b : g_bots) {
     if (!b.spawner) continue;
     uint32_t so = b.soldier;
@@ -2601,7 +2904,8 @@ PPC_FUNC(sub_823D1DD0) {
     }
     if (b.died_at && now - b.died_at < 8000) continue;
     St32(b.spawner + 0x30, b.team);
-    St32(b.spawner + 0x1D4, kit), St32(b.spawner + 0x1D8, kit2);
+    uint32_t bot_kit = BotKit(b, kit), bot_weapon = bot_kit == kit ? kit2 : 0;
+    St32(b.spawner + 0x1D4, bot_kit), St32(b.spawner + 0x1D8, bot_weapon);
     std::vector<uint32_t> before = Scan(0x820118D0);
     PPCContext c = ctx;
     c.r3.u64 = b.spawner;
@@ -2611,7 +2915,7 @@ PPC_FUNC(sub_823D1DD0) {
     __imp__sub_82332350(c, base);
     for (uint32_t o : Scan(0x820118D0))
       if (std::find(before.begin(), before.end(), o) == before.end()) b.soldier = o;
-    b.died_at = b.soldier ? 0 : now;
+    b.died_at = b.soldier ? 0 : now - 6000;  // refused (the game's respawn wait): again in 2 s
     if (b.soldier) g_bot_soldier_for_trails = b.soldier;
     RT_INFO("bot %d: deployed on team %u: soldier %08X (team %u) at %.1f %.1f", b.index, b.team, b.soldier,
             b.soldier ? Ld32(b.soldier + 0x48) : 0, b.soldier ? LdF(b.soldier + 0x200) : 0.0f,

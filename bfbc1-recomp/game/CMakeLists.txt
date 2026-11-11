@@ -37,7 +37,7 @@ target_include_directories(bfbc1_xexload PUBLIC ${XU} ${XT}/simde
 # Shared runtime minus the BF1943-only parts (its guest patches and bots);
 # BFBC1's own replacements live in runtime/.
 file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS ${ROOT}/runtime/*.cpp)
-list(REMOVE_ITEM RUNTIME_SOURCES ${ROOT}/runtime/game_patches.cpp ${ROOT}/runtime/bots.cpp)
+list(REMOVE_ITEM RUNTIME_SOURCES ${ROOT}/runtime/game_patches.cpp ${ROOT}/runtime/bots.cpp ${ROOT}/runtime/bot_players.cpp)
 file(GLOB BC_RUNTIME_SOURCES CONFIGURE_DEPENDS ${BC}/runtime/*.cpp)
 # The bots' navigation meshes (tools/navgen) are read and routed with Detour.
 file(GLOB DETOUR_SOURCES CONFIGURE_DEPENDS ${ROOT}/thirdparty/recastnavigation/Detour/Source/*.cpp)

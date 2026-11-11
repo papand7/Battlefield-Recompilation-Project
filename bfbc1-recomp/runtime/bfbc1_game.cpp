@@ -57,6 +57,14 @@ std::atomic<uint16_t> g_pilot_buttons{0};
 std::atomic<uint8_t> g_pilot_rt{0};
 // The pad, every poll: our Multiplayer menu (bc_mp_menu.cpp) takes it while open.
 bool AddBotInput(XINPUT_GAMEPAD& pad) {
+  // SKIP INTRO: the startup movies (the EA and Dolby logos, the intro) end on
+  // a press, so until the title screen A is pressed for 0.1 s every 0.4 s.
+  // (Refusing their files instead stops the startup.)
+  if (g_skip_intro && !g_title_passed.load(std::memory_order_relaxed)) {
+    static const auto start = std::chrono::steady_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    if (ms > 1500 && ms % 400 < 100) pad.wButtons |= XINPUT_GAMEPAD_A;
+  }
   if (int16_t v = g_auto_ly.load()) pad.sThumbLY = v;
   if (int16_t v = g_auto_rx.load()) pad.sThumbRX = v;
   if (int16_t v = g_auto_ry.load()) pad.sThumbRY = v;
