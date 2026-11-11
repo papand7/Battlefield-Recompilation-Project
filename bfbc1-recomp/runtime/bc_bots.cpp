@@ -30,6 +30,7 @@
 #include "kernel.h"
 #include "DetourNavMesh.h"
 #include "DetourNavMeshQuery.h"
+#include "DetourCommon.h"
 #include "../../bf1943-recomp/tools/msvc_compat/crash_diag.h"  // PrintStack
 
 #include <algorithm>
@@ -1565,6 +1566,60 @@ static std::vector<int> RouteNav(int from, int to) {
 static dtNavMesh* g_navmesh = nullptr;
 static void LoadBlocked();
 static dtNavMeshQuery* g_navquery = nullptr;
+// The mesh's joined pieces (polygons reached through their links). Most of a
+// map is one; the rest are islands Recast leaves on roofs, crates, ledges and
+// spawn spots (Valley Run: 836 pieces, the main one 15432 of 23392 polygons).
+// Routes run on the main piece: a goal snapped onto an island (base 2's first
+// crate: 2 polygons) has no way to it, nor has a soldier standing on one.
+static std::vector<int> g_piece;
+static int g_main_piece = -1;
+static dtPolyRef g_poly_base = 0;
+static void FindPieces() {
+  const dtMeshTile* tile = static_cast<const dtNavMesh*>(g_navmesh)->getTile(0);
+  int n = tile->header->polyCount;
+  g_poly_base = g_navmesh->getPolyRefBase(tile);
+  g_piece.assign(size_t(n), -1);
+  std::vector<int> sizes;
+  for (int i = 0; i < n; ++i) {
+    if (g_piece[size_t(i)] >= 0) continue;
+    int id = int(sizes.size());
+    sizes.push_back(0);
+    std::vector<int> stack{i};
+    g_piece[size_t(i)] = id;
+    while (!stack.empty()) {
+      int q = stack.back();
+      stack.pop_back();
+      ++sizes[size_t(id)];
+      for (unsigned l = tile->polys[q].firstLink; l != DT_NULL_LINK; l = tile->links[l].next) {
+        int o = int(tile->links[l].ref - g_poly_base);
+        if (o >= 0 && o < n && g_piece[size_t(o)] < 0) g_piece[size_t(o)] = id, stack.push_back(o);
+      }
+    }
+  }
+  g_main_piece = int(std::max_element(sizes.begin(), sizes.end()) - sizes.begin());
+  RT_INFO("bot nav: %d polygons in %zu pieces, the main one %d", n, sizes.size(), sizes[size_t(g_main_piece)]);
+}
+static bool InMainPiece(dtPolyRef r) {
+  size_t i = size_t(r - g_poly_base);
+  return i < g_piece.size() && g_piece[i] == g_main_piece;
+}
+// The main piece's nearest place to p within the box ext (half sizes).
+static bool NearestMain(const float p[3], const float ext[3], const dtQueryFilter& filter, dtPolyRef* ref,
+                        float out[3]) {
+  static dtPolyRef polys[2048];
+  int n = 0;
+  g_navquery->queryPolygons(p, ext, &filter, polys, &n, 2048);
+  float best = 1e30f;
+  *ref = 0;
+  for (int i = 0; i < n; ++i) {
+    if (!InMainPiece(polys[i])) continue;
+    float c[3];
+    if (dtStatusFailed(g_navquery->closestPointOnPoly(polys[i], p, c, nullptr))) continue;
+    float d = dtVdistSqr(c, p);
+    if (d < best) best = d, *ref = polys[i], dtVcopy(out, c);
+  }
+  return *ref != 0;
+}
 static bool LoadNavMesh() {
   static bool tried = false;
   if (tried) return g_navquery != nullptr;
@@ -1592,6 +1647,7 @@ static bool LoadNavMesh() {
   g_navquery = dtAllocNavMeshQuery();
   g_navquery->init(g_navmesh, 4096);
   RT_INFO("bot nav: navigation mesh %s (%d bytes)", path.c_str(), size);
+  FindPieces();
   LoadBlocked();
   return true;
 }
@@ -1643,6 +1699,43 @@ static std::vector<std::array<float, 3>> RouteMesh(const float a[3], const float
   if (log)
     RT_INFO("bot nav: from %.1f %.1f %.1f: poly %llx (%08X); to %.1f %.1f %.1f: poly %llx (%08X) at %.1f %.1f %.1f", a[0], a[1],
             a[2], (unsigned long long)sa, s1, b[0], b[1], b[2], (unsigned long long)sb, s2, pb[0], pb[1], pb[2]);
+  // The goal on an island: the main piece's nearest place instead. The soldier
+  // on one: first to the main piece's nearest place (a drop or a jump away).
+  if (sb && !InMainPiece(sb)) {
+    float q[3];
+    dtPolyRef r = 0;
+    if (NearestMain(b, goal_ext, filter, &r, q)) {
+      if (log) RT_INFO("bot nav: goal on an island; to %.1f %.1f %.1f instead", q[0], q[1], q[2]);
+      sb = r, dtVcopy(pb, q);
+    }
+  }
+  // Where the soldier last was on the main piece: the way off an island is
+  // the way it came on (the nearest main place can be behind a wall).
+  static float last_main[3];
+  static bool have_last = false;
+  // An island the main piece touches (the same floor, only not joined there,
+  // a route along its edge can step onto it): on the main piece already.
+  if (sa && !InMainPiece(sa)) {
+    const float touch_ext[3] = {1.5f, 1, 1.5f};
+    float q[3];
+    dtPolyRef r = 0;
+    if (NearestMain(a, touch_ext, filter, &r, q)) sa = r, dtVcopy(pa, q);
+  }
+  if (sa && InMainPiece(sa)) dtVcopy(last_main, pa), have_last = true;
+  if (sa && !InMainPiece(sa)) {
+    const float near_ext[3] = {6, 4, 6};
+    const float back_ext[3] = {1, 2, 1};
+    float q[3];
+    dtPolyRef r = 0;
+    bool back = have_last && dtVdist(last_main, a) < 30.0f &&
+                (g_navquery->findNearestPoly(last_main, back_ext, &filter, &r, q), r && InMainPiece(r));
+    if (back) RT_INFO("bot nav: back the way it came");
+    if (back || NearestMain(a, near_ext, filter, &r, q)) {
+      RT_INFO("bot nav: on an island at %.1f %.1f %.1f; first to %.1f %.1f %.1f", a[0], a[1], a[2], q[0], q[1], q[2]);
+      out.push_back({q[0], q[1], q[2]});
+      sa = r, dtVcopy(pa, q);
+    }
+  }
   if (!sa || !sb) return out;
   dtPolyRef polys[512];
   int npolys = 0;

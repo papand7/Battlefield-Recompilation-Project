@@ -6,6 +6,8 @@
 //
 //   navgen <out.nav> <in.obj>... [--bounds x0 z0 x1 z1] [--cell 0.3] [--obj walkable.obj]
 //          [--radius 0.7] [--climb 0.4]
+//   navgen --islands <in.nav> [x y z]...   which joined piece of the mesh each
+//          point is on (and the biggest pieces), to see why a route can't be found
 //
 // A soldier: radius 0.7 m (3 cells: more than its body, so routes keep clear of wall
 // corners), height 1.8 m, step 0.4 m, slopes up to 45 degrees.
@@ -23,6 +25,7 @@
 
 #include "DetourNavMesh.h"
 #include "DetourNavMeshBuilder.h"
+#include "DetourNavMeshQuery.h"
 #include "Recast.h"
 
 namespace {
@@ -91,7 +94,79 @@ void WriteWalkableObj(const char* path, const rcPolyMesh& pm) {
 
 }  // namespace
 
+// --islands: the mesh's joined pieces (polygons reached through their links),
+// each point's piece, and the 12 biggest with their extent.
+int Islands(int argc, char** argv) {
+  FILE* f = fopen(argv[2], "rb");
+  if (!f) return fprintf(stderr, "can't open %s\n", argv[2]), 1;
+  char magic[4];
+  int version = 0, size = 0;
+  if (fread(magic, 1, 4, f) != 4 || fread(&version, 4, 1, f) != 1 || fread(&size, 4, 1, f) != 1) return 1;
+  unsigned char* data = static_cast<unsigned char*>(dtAlloc(size_t(size), DT_ALLOC_PERM));
+  if (fread(data, 1, size_t(size), f) != size_t(size)) return 1;
+  fclose(f);
+  dtNavMesh mesh;
+  if (dtStatusFailed(mesh.init(data, size, DT_TILE_FREE_DATA))) return fprintf(stderr, "bad mesh\n"), 1;
+  dtNavMeshQuery q;
+  q.init(&mesh, 2048);
+  const dtMeshTile* tile = static_cast<const dtNavMesh&>(mesh).getTile(0);
+  int n = tile->header->polyCount;
+  dtPolyRef base = mesh.getPolyRefBase(tile);
+  std::vector<int> piece(size_t(n), -1);
+  struct Info { int polys = 0; float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f}; };
+  std::vector<Info> info;
+  for (int i = 0; i < n; ++i) {
+    if (piece[size_t(i)] >= 0) continue;
+    int id = int(info.size());
+    info.push_back({});
+    std::vector<int> stack{i};
+    piece[size_t(i)] = id;
+    while (!stack.empty()) {
+      int p = stack.back();
+      stack.pop_back();
+      const dtPoly& poly = tile->polys[p];
+      Info& in = info[size_t(id)];
+      ++in.polys;
+      for (int v = 0; v < poly.vertCount; ++v)
+        for (int k = 0; k < 3; ++k) {
+          float c = tile->verts[poly.verts[v] * 3 + k];
+          in.lo[k] = std::min(in.lo[k], c), in.hi[k] = std::max(in.hi[k], c);
+        }
+      for (unsigned l = poly.firstLink; l != DT_NULL_LINK; l = tile->links[l].next) {
+        dtPolyRef r = tile->links[l].ref;
+        int o = int(r - base);
+        if (o >= 0 && o < n && piece[size_t(o)] < 0) piece[size_t(o)] = id, stack.push_back(o);
+      }
+    }
+  }
+  std::vector<int> order(info.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = int(i);
+  std::sort(order.begin(), order.end(), [&](int a, int b) { return info[size_t(a)].polys > info[size_t(b)].polys; });
+  printf("%d polygons in %zu pieces; the biggest:\n", n, info.size());
+  for (size_t i = 0; i < order.size() && i < 12; ++i) {
+    const Info& in = info[size_t(order[i])];
+    printf("  piece %d: %d polygons, x %.0f..%.0f y %.0f..%.0f z %.0f..%.0f\n", order[i], in.polys, in.lo[0], in.hi[0],
+           in.lo[1], in.hi[1], in.lo[2], in.hi[2]);
+  }
+  dtQueryFilter filter;
+  for (int i = 3; i + 2 < argc; i += 3) {
+    float p[3] = {float(atof(argv[i])), float(atof(argv[i + 1])), float(atof(argv[i + 2]))}, near[3];
+    const float ext[3] = {3, 6, 3};
+    dtPolyRef r = 0;
+    q.findNearestPoly(p, ext, &filter, &r, near);
+    if (!r) {
+      printf("%.1f %.1f %.1f: no polygon near\n", p[0], p[1], p[2]);
+      continue;
+    }
+    int id = piece[size_t(r - base)];
+    printf("%.1f %.1f %.1f: piece %d (%d polygons), nearest %.1f %.1f %.1f\n", p[0], p[1], p[2], id,
+           info[size_t(id)].polys, near[0], near[1], near[2]);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 3 && !strcmp(argv[1], "--islands")) return Islands(argc, argv);
   if (argc < 3) {
     fprintf(stderr, "navgen <out.nav> <in.obj>... [--bounds x0 z0 x1 z1] [--cell 0.3] [--obj walkable.obj]\n");
     return 2;
