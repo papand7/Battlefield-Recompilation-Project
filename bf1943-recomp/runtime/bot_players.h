@@ -3,6 +3,7 @@
 // pad as it does the bot copies'.
 #pragma once
 #include <cstdint>
+#include <string>
 
 namespace rt {
 
@@ -11,5 +12,11 @@ uint32_t BotPlayerSoldier(int i);  // 0 while dead or not deployed
 // The brain's pad: lx, ly -1..1 (ly forward), rx the turn (+ turns right),
 // ry the look up, XInput buttons, triggers lt | rt << 8.
 void SetBotPlayerInput(int i, float lx, float ly, float rx, float ry, uint32_t buttons, uint32_t triggers);
+
+// Line of sight (bot_collision.cpp: the map's collision and terrain, built in
+// the background for a new map). InSight is true while it isn't built yet.
+void SightForMap(const std::string& map);
+bool InSight(const float a[3], const float b[3]);
+float TerrainHeight(float x, float z);  // -1e9 off the terrain or before it is known
 
 }  // namespace rt

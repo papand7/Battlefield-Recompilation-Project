@@ -257,6 +257,10 @@ int BrainRoute(int slot, Vec a, Vec b, Vec* corners, int max) {
   for (int i = 0; i < n; ++i) corners[i] = Vec{buf[3 * i], buf[3 * i + 1], buf[3 * i + 2]};
   return n;
 }
+bool BrainSight(Vec a, Vec b) {
+  float fa[3] = {a.x, a.y, a.z}, fb[3] = {b.x, b.y, b.z};
+  return InSight(fa, fb);
+}
 void BrainBlock(Vec at) {
   float p[3] = {at.x, at.y, at.z};
   nav::Block(p);
@@ -837,6 +841,8 @@ std::string StartBotDirector(int count) {
       }
       w.route = have_mesh ? BrainRoute : nullptr;
       w.block = have_mesh ? BrainBlock : nullptr;
+      SightForMap(g_host_map);
+      w.sight = BrainSight;
       brain.think(&w);
       for (botapi::BotIO& b : d.bots) {
         Pad pad = b.pad;

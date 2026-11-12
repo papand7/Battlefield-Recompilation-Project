@@ -68,6 +68,8 @@ struct Bot {
   float boat_heading = 0, boat_travel = 0;
   bool ride_land = false;  // a jeep or tank (or a plane) rather than a landing craft
   bool ride_air = false;   // a plane
+  uint32_t seen_enemy = 0;  // the last enemy in sight, and until when it counts
+  double seen_until = 0;
   float fly_last_y = 0;
   double fly_last_t = 0;
   float fly_vy = 0;
@@ -688,13 +690,33 @@ struct Brain {
       return;
     }
     // Behaviour weights (BF1942 style: how much each is needed right now).
+    // The nearest enemy in sight (eye to chest; of the three nearest within
+    // 70 m), or the one last seen for 1.5 s more (behind a tree a moment).
     const Soldier* enemy = nullptr;
     float enemy_d = 1e9f;
-    for (int i = 0; i < w.soldier_count; ++i) {
-      const Soldier& s = w.soldiers[i];
-      if (s.team == me->team) continue;
-      float d = Dist3D(s.pos, me->pos);
-      if (d < enemy_d) enemy_d = d, enemy = &s;
+    {
+      const Soldier* near[3] = {};
+      float near_d[3] = {1e9f, 1e9f, 1e9f};
+      for (int i = 0; i < w.soldier_count; ++i) {
+        const Soldier& s = w.soldiers[i];
+        if (s.team == me->team) continue;
+        float d = Dist3D(s.pos, me->pos);
+        if (d > 70) continue;
+        if (s.obj == b.seen_enemy && w.now < b.seen_until && d < enemy_d) enemy = &s, enemy_d = d;
+        for (int k = 0; k < 3; ++k)
+          if (d < near_d[k]) {
+            for (int m = 2; m > k; --m) near[m] = near[m - 1], near_d[m] = near_d[m - 1];
+            near[k] = &s, near_d[k] = d;
+            break;
+          }
+      }
+      for (int k = 0; k < 3 && near[k]; ++k) {
+        Vec eye{me->pos.x, me->pos.y + 1.6f, me->pos.z}, chest{near[k]->pos.x, near[k]->pos.y + 1.2f, near[k]->pos.z};
+        if (w.sight && !w.sight(eye, chest)) continue;
+        enemy = near[k], enemy_d = near_d[k];
+        b.seen_enemy = enemy->obj, b.seen_until = w.now + 1.5;
+        break;
+      }
     }
     float w_engage = enemy && enemy_d < 70 && (sc.kind == Scenario::kNone || sc.kind == Scenario::kFight) ? 100 - enemy_d : 0;
     if (b.target_point < 0 || b.target_point >= w.point_count ||

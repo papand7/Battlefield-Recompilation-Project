@@ -6,6 +6,7 @@
 //   BF_BOT_DUMP_COLLISION=<file.obj> bf1943 --dedicated --host-map <map> ...
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -356,3 +357,158 @@ const bool g_dump_collision_started = [] {
 }();
 
 }  // namespace
+
+// ---- line of sight (the bots' shots and who they see) ------------------------
+// The physics world's bodies as triangles (as DumpCollision, the vehicles left
+// out: they move), binned once on a 4 m grid by their extent across, a segment
+// tested against those in the cells it crosses (Moller-Trumbore), as Bad
+// Company's bots. And the terrain, which isn't triangles: its heightfield
+// shape (Havok type 0x18, its body at the map's corner, -1024 -1024) points
+// at the terrain (+60), whose +10 are its samples, 2048 a row, 1 m apart,
+// big-endian u16, height = sample / 65535 * 1000 (+54; the flags stand there).
+namespace {
+struct SightGrid {
+  float x0 = 0, z0 = 0, cell = 4.0f;
+  int nx = 0, nz = 0;
+  std::vector<std::array<float, 9>> tris;
+  std::vector<std::vector<uint32_t>> cells;
+  uint32_t hf = 0;  // the terrain's samples
+  float hf_x = 0, hf_z = 0, hf_scale = 0;
+};
+std::atomic<SightGrid*> g_sight{nullptr};  // (an old map's is left, never freed: another thread may be in it)
+std::atomic<bool> g_sight_building{false};
+std::string g_sight_map;
+
+SightGrid* BuildSight() {
+  auto* g = new SightGrid;
+  std::vector<std::array<float, 2>> vehicles;
+  for (uint32_t v : Scan(0x82013068)) {  // ServerVehicleEntity
+    uint32_t body = Ld32(v + 0xF0);
+    if (!Ptr(body)) continue;
+    float x = LdF(body + 0xF0), z = LdF(body + 0xF8);
+    if (std::isfinite(x) && (x != 0 || z != 0)) vehicles.push_back({x, z});
+  }
+  CollisionOut out{nullptr};
+  out.mem = &g->tris;
+  for (uint32_t b : Scan(kRigidBody)) {
+    uint32_t world = Ld32(b + 8), shape = Ld32(b + 0x10);
+    if (!Ptr(world) || Ld32(world) != kWorld || !Ptr(shape)) continue;
+    Mat m;
+    for (int j = 0; j < 3; ++j)
+      for (int i = 0; i < 3; ++i) m.c[j][i] = LdF(b + 0xB0 + 16 * j + 4 * i);
+    for (int i = 0; i < 3; ++i) m.t[i] = LdF(b + 0xE0 + 4 * i);
+    if (Ld32(shape + 0xC) == 0x18) {  // the terrain
+      uint32_t terrain = Ld32(shape + 0x60), samples = Ptr(terrain) ? Ld32(terrain + 0x10) : 0;
+      if (Ptr(samples) && IsCommitted(samples + 2048 * 2048 * 2 - 4))
+        g->hf = samples, g->hf_x = m.t[0], g->hf_z = m.t[2], g->hf_scale = LdF(shape + 0x54) / 65535.0f;
+      continue;
+    }
+    bool vehicle = false;
+    for (auto& v : vehicles) vehicle |= std::hypot(m.t[0] - v[0], m.t[2] - v[1]) < 4.0f;
+    if (!vehicle) ShapeOut(out, m, shape, 0);
+  }
+  // Triangles over 300 m across (the sea's plane, the map's edge walls) left
+  // out: they'd be in every cell. The grid: the terrain's square (the maps'
+  // play areas are within -1100..1100).
+  size_t big = 0;
+  g->tris.erase(std::remove_if(g->tris.begin(), g->tris.end(),
+                               [&](const std::array<float, 9>& t) {
+                                 float w = std::max({t[0], t[3], t[6]}) - std::min({t[0], t[3], t[6]});
+                                 float d = std::max({t[2], t[5], t[8]}) - std::min({t[2], t[5], t[8]});
+                                 return (w > 300 || d > 300) && ++big;
+                               }),
+                g->tris.end());
+  float lo[2] = {-1100, -1100}, hi[2] = {1100, 1100};
+  g->x0 = lo[0], g->z0 = lo[1];
+  g->nx = std::max(1, int((hi[0] - lo[0]) / g->cell) + 1), g->nz = std::max(1, int((hi[1] - lo[1]) / g->cell) + 1);
+  g->cells.resize(size_t(g->nx) * g->nz);
+  for (uint32_t i = 0; i < g->tris.size(); ++i) {
+    auto& t = g->tris[i];
+    float a0 = std::min({t[0], t[3], t[6]}), a1 = std::max({t[0], t[3], t[6]});
+    float b0 = std::min({t[2], t[5], t[8]}), b1 = std::max({t[2], t[5], t[8]});
+    int i0 = std::clamp(int((a0 - g->x0) / g->cell), 0, g->nx - 1), i1 = std::clamp(int((a1 - g->x0) / g->cell), 0, g->nx - 1);
+    int j0 = std::clamp(int((b0 - g->z0) / g->cell), 0, g->nz - 1), j1 = std::clamp(int((b1 - g->z0) / g->cell), 0, g->nz - 1);
+    for (int j = j0; j <= j1; ++j)
+      for (int k = i0; k <= i1; ++k) g->cells[size_t(j) * g->nx + k].push_back(i);
+  }
+  RT_INFO("bot sight: %zu triangles (%zu big ones and %zu vehicles left out), %d x %d cells of %.0f m, terrain %s", g->tris.size(),
+          big, vehicles.size(), g->nx, g->nz, g->cell, g->hf ? "found" : "not found");
+  return g;
+}
+bool SegmentHitsTri(const float o[3], const float d[3], const std::array<float, 9>& t) {
+  float e1[3] = {t[3] - t[0], t[4] - t[1], t[5] - t[2]}, e2[3] = {t[6] - t[0], t[7] - t[1], t[8] - t[2]};
+  float p[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+  float det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+  if (std::fabs(det) < 1e-9f) return false;
+  float inv = 1.0f / det, s[3] = {o[0] - t[0], o[1] - t[1], o[2] - t[2]};
+  float u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * inv;
+  if (u < 0 || u > 1) return false;
+  float q[3] = {s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0]};
+  float v = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) * inv;
+  if (v < 0 || u + v > 1) return false;
+  float tt = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+  return tt > 0.02f && tt < 0.98f;  // not at either end (where the soldiers are)
+}
+}  // namespace
+
+namespace rt {
+// The map's line of sight, built (in the background, once its bodies stopped
+// changing in number) when the map is new.
+void SightForMap(const std::string& map) {
+  if (map.empty() || map == g_sight_map || g_sight_building.exchange(true)) return;
+  std::thread([map] {
+    size_t last = 0;
+    for (;;) {
+      size_t n = Scan(kRigidBody).size();
+      if (n > 10 && n == last) break;
+      last = n;
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+    g_sight = BuildSight();
+    g_sight_map = map;
+    g_sight_building = false;
+  }).detach();
+}
+float TerrainHeight(float x, float z) {
+  SightGrid* g = g_sight;
+  if (!g || !g->hf) return -1e9f;
+  int col = int(x - g->hf_x), row = int(z - g->hf_z);
+  if (col < 0 || row < 0 || col >= 2048 || row >= 2048) return -1e9f;
+  return Ld16(g->hf + 2 * uint32_t(row * 2048 + col)) * g->hf_scale;
+}
+// Clear from a to b (true too before the map's is built).
+bool InSight(const float a[3], const float b[3]) {
+  SightGrid* g = g_sight;
+  if (!g) return true;
+  float d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+  float len = std::hypot(d[0], d[2]);
+  // The ground: every metre along, the segment over the terrain (1 m from
+  // either end: where they stand).
+  if (g->hf)
+    for (float s = 1.0f; s < len - 1.0f; s += 1.0f) {
+      float f = s / len;
+      if (a[1] + d[1] * f < TerrainHeight(a[0] + d[0] * f, a[2] + d[2] * f) - 0.3f) return false;
+    }
+  // (each triangle once: a stamp per thread, the bots' and the server's)
+  thread_local std::vector<uint32_t> stamp;
+  thread_local uint32_t visit = 0;
+  thread_local const SightGrid* stamped = nullptr;
+  if (stamped != g) stamp.assign(g->tris.size(), 0), stamped = g, visit = 0;
+  ++visit;
+  int steps = int(len / (g->cell * 0.25f)) + 1, last = -1;
+  for (int k = 0; k <= steps; ++k) {
+    float f = float(k) / steps;
+    int i = int((a[0] + d[0] * f - g->x0) / g->cell), j = int((a[2] + d[2] * f - g->z0) / g->cell);
+    if (i < 0 || j < 0 || i >= g->nx || j >= g->nz) continue;
+    int c = j * g->nx + i;
+    if (c == last) continue;
+    last = c;
+    for (uint32_t ti : g->cells[size_t(c)]) {
+      if (stamp[ti] == visit) continue;
+      stamp[ti] = visit;
+      if (SegmentHitsTri(a, d, g->tris[ti])) return false;
+    }
+  }
+  return true;
+}
+}  // namespace rt

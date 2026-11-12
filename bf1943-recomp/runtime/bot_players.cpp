@@ -1308,7 +1308,8 @@ std::map<uint32_t, int64_t> g_seen_soldiers;
 // hit, +10 its direction, +20 where from, +38 the damage; the giver: a
 // pointer to a word pointing at the shooter's spawn object + DC, so the kill
 // is the bot's. A shot hits the nearest enemy its aim (yaw, pitch) passes
-// within 0.45 m of the chest of, up to 60 m (no line of sight yet).
+// within 0.45 m of the chest of, up to 60 m, with nothing between
+// (InSight: the map's collision and terrain).
 void BotShoot(PPCContext& ctx, uint8_t* base, BotPlayer& b, int64_t now) {
   uint32_t so = b.soldier, aim = Ld32(so + 0x130);
   if (!IsCommitted(aim) || ((b.triggers >> 8) & 0xFF) < 128 || now < b.next_shot) return;
@@ -1332,6 +1333,14 @@ void BotShoot(PPCContext& ctx, uint8_t* base, BotPlayer& b, int64_t now) {
     if (along <= 0 || along >= best_t) continue;
     float px = c[0] - along * dir[0], py = c[1] - along * dir[1], pz = c[2] - along * dir[2];
     if (px * px + py * py + pz * pz > 0.45f * 0.45f) continue;
+    float at[3] = {o[0] + along * dir[0], o[1] + along * dir[1], o[2] + along * dir[2]};
+    if (!InSight(o, at)) {  // a wall, a hill between
+      static int said = 0;
+      if (getenv("BF_BOT_SHOT_TRACE") && said++ < 40)
+        RT_INFO("bot %d: shot at soldier %08X at %.0f m blocked (ground there %.1f, aim height %.1f)", b.index, t, along,
+                TerrainHeight(at[0], at[2]), at[1]);
+      continue;
+    }
     best = t, best_t = along;
     for (int i = 0; i < 3; ++i) hit[i] = o[i] + along * dir[i];
   }

@@ -10,7 +10,7 @@
 
 namespace botapi {
 
-constexpr int kVersion = 3;      // bump when a struct here changes
+constexpr int kVersion = 4;      // bump when a struct here changes
 constexpr int kMaxBots = 16;
 constexpr int kMemSize = 1024;   // per-bot brain state
 constexpr float kPi = 3.14159265f;
@@ -63,6 +63,9 @@ struct World {
   // bot couldn't get onto (off for routes from then on).
   int (*route)(int slot, Vec a, Vec b, Vec* corners, int max);
   void (*block)(Vec at);
+  // Whether nothing (the map's collision, its terrain) is between a and b:
+  // an eye and a chest. Null without it.
+  bool (*sight)(Vec a, Vec b);
 };
 
 using ThinkFn = void (*)(World*);
