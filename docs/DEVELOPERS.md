@@ -116,6 +116,9 @@ cmake --build build/linux
 build/linux/bf1943_server --game <your dump> --dedicated --name "My Server" --maps Wake_island_s
 ```
 
+Or edit and run `bf1943-recomp/start_server.sh` (name, maps, bots, `PUBLISH=1` to list it on
+the internet too: `--publish`), as `start_server.bat` on Windows.
+
 It also builds on Windows, cross-compiled with LLVM for Windows and a Debian sysroot:
 
 ```
