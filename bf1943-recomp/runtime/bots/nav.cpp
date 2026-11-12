@@ -2,12 +2,16 @@
 // bc_bots.cpp): nav/<map>.nav made by tools/navgen from the level's terrain and
 // collision ("BFNV", version 2: dtNavMeshParams, the tile count, then each
 // tile's x, y, size, Detour data), routed with Detour. Looked for next to the
-// exe, then in the working folder. Polygons a bot couldn't get onto are kept
-// in <user>/nav/<map>.blocked for later matches.
+// exe, then in the working folder. Polygons a bot couldn't get onto are off
+// for a minute (as Bad Company's: a soldier in the way looks the same, and
+// blocks kept for good cut routes off); BF_BOT_NAV_KEEP_BLOCKS=1 keeps them in
+// <user>/nav/<map>.blocked for later matches, as before.
 #include "bots/nav.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -39,6 +43,8 @@ dtNavMesh* g_navmesh = nullptr;
 dtNavMeshQuery* g_navquery = nullptr;
 std::string g_map;  // the mesh loaded (or tried) for
 std::filesystem::path g_blocked_path;
+// Blocks: when they open again, and their flags before.
+std::map<dtPolyRef, std::pair<std::chrono::steady_clock::time_point, unsigned short>> g_blocked_until;
 
 // The mesh's joined pieces (polygons reached through their links). Most of a
 // map is one; the rest are islands Recast leaves on roofs, ledges and the like.
@@ -179,7 +185,7 @@ bool Load(const std::string& map) {
   g_navquery->init(g_navmesh, 4096);
   RT_INFO("bot nav: navigation mesh %s (%d bytes, %d tiles)", path.string().c_str(), size, tiles);
   FindPieces();
-  LoadBlocked();
+  if (getenv("BF_BOT_NAV_KEEP_BLOCKS")) LoadBlocked();
   return true;
 }
 
@@ -222,7 +228,15 @@ void Block(const float at[3]) {
   float p[3];
   g_navquery->findNearestPoly(at, ext, &filter, &ref, p);
   if (!ref) return;
+  unsigned short was = 1;
+  g_navmesh->getPolyFlags(ref, &was);
   g_navmesh->setPolyFlags(ref, 0);
+  static const bool keep = getenv("BF_BOT_NAV_KEEP_BLOCKS") != nullptr;
+  if (!keep) {
+    if (!g_blocked_until.count(ref) && was) g_blocked_until[ref] = {std::chrono::steady_clock::now() + std::chrono::seconds(60), was};
+    RT_INFO("bot nav: blocked polygon %llx at %.1f %.1f %.1f for a minute", (unsigned long long)ref, p[0], p[1], p[2]);
+    return;
+  }
   std::error_code ec;
   std::filesystem::create_directories(g_blocked_path.parent_path(), ec);
   if (FILE* f = fopen(g_blocked_path.string().c_str(), "a")) {
@@ -236,6 +250,11 @@ void Block(const float at[3]) {
 int Route(const float a[3], const float b[3], float* corners, int max, Memory* mem) {
   std::lock_guard lock(g_mutex);
   if (!g_navquery || max <= 0) return 0;
+  // Blocks whose minute is over open again.
+  auto now = std::chrono::steady_clock::now();
+  for (auto it = g_blocked_until.begin(); it != g_blocked_until.end();)
+    if (now > it->second.first) g_navmesh->setPolyFlags(it->first, it->second.second), it = g_blocked_until.erase(it);
+    else ++it;
   std::vector<std::array<float, 3>> out;
   dtQueryFilter filter;
   const float ext[3] = {3, 6, 3};

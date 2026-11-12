@@ -102,6 +102,45 @@ constexpr uint32_t kNetPlayer = 0x8201C6C8;       // a player's network object: 
 // +1F8 the kit the spawn screen chose (SoldierEntityData, SoldierWeaponData;
 // Bad Company +1D4, +1D8).
 
+// The level's soldier kits (SoldierEntityData, 8205AD34: its name at +C,
+// Infantry, Rifleman, Scout) per team, told apart by the weapon assets they
+// lead to (an object they point at names them: Japan's jap_..., k98, nambu).
+struct Kits {
+  std::vector<std::pair<uint32_t, std::string>> team[3];  // [1] US, [2] Japan
+};
+bool LeadsToJapanese(uint32_t kit);
+std::vector<uint32_t> Scan(uint32_t vtable);
+Kits FindKits() {
+  Kits k;
+  for (uint32_t o : Scan(0x8205AD34)) {
+    uint32_t name = Ld32(o + 0xC);
+    if (name < 0x40000000 || name >= 0xC0000000 || !IsCommitted(name)) continue;
+    k.team[LeadsToJapanese(o) ? 2 : 1].push_back({o, std::string(G<char>(name), strnlen(G<char>(name), 24))});
+  }
+  return k;
+}
+bool LeadsToJapanese(uint32_t kit) {
+  // Its soldier model's folder decides (objects/soldiers/us/..., Japan's
+  // .../ru/... or .../jap...); else its first weapon (a Japanese one).
+  int weapon = 0;
+  for (uint32_t off = 4; off < 0x120; off += 4) {
+    uint32_t q = Ld32(kit + off);
+    if (q < 0x40000000 || q >= 0xC0000000 || !IsCommitted(q + 0x80)) continue;
+    for (uint32_t j = 0; j < 0x80; j += 4) {
+      uint32_t z = Ld32(q + j);
+      if (z < 0x40000000 || z >= 0xC0000000 || !IsCommitted(z + 64)) continue;
+      std::string t(G<char>(z), strnlen(G<char>(z), 64));
+      for (char& c : t) c = char(tolower(uint8_t(c)));
+      if (t.rfind("objects/soldiers/", 0) == 0) return t.find("/us/") == std::string::npos;
+      if (!weapon && t.rfind("objects/weapons/", 0) == 0)
+        weapon = t.find("/jap") != std::string::npos || t.find("k98") != std::string::npos ||
+                         t.find("type5") != std::string::npos || t.find("nambu") != std::string::npos
+                     ? 2 : 1;
+    }
+  }
+  return weapon == 2;
+}
+
 // Every live object with this vtable in the heaps.
 std::vector<uint32_t> Scan(uint32_t vtable) {
   std::vector<uint32_t> out;
@@ -170,6 +209,7 @@ struct BotPlayer {
   uint32_t vehicle = 0, vehicle_id = 0, vehicle_id_for = 0;
   uint32_t analog[10] = {};  // the record's analog actions (+8..+2C) of its last input step, for the moves
   int steps = 0;  // (BF_BOT_STEPLOG)
+  int lives = 0;  // deploys so far (its kit turns with them)
   int64_t next_shot = 0;
   // No ChangeVehicle press before this (ms): the brain's repeated B presses
   // would take it back in or out.
@@ -820,6 +860,54 @@ GAME_PATCH(82414430) {
     std::vector<uint32_t> se = Scan(0x8205AD34), sw = Scan(0x8205F284);
     if (!se.empty() && !sw.empty()) kit = se[0], kit2 = sw[0];
   }
+  // BF_BOT_KIT_PROBE (testing): once, every SoldierEntityData and
+  // SoldierWeaponData with the strings its first words point at.
+  if (second && getenv("BF_BOT_KIT_PROBE")) {
+    static bool done = false;
+    static int64_t at = 0;
+    if (!at) at = now + 30000;  // (once the level is up)
+    if (!done && now > at) {
+      done = true;
+      RT_INFO("bot players: kit probe: %zu soldier data, %zu weapon data", Scan(0x8205AD34).size(), Scan(0x8205F284).size());
+      for (uint32_t vt : {0x8205AD34u, 0x8205F284u})
+        for (uint32_t o : Scan(vt)) {
+          std::string w;
+          char buf[96];
+          for (uint32_t k = 4; k < 0x80; k += 4) {
+            uint32_t q = Ld32(o + k);
+            if (q >= 0x40000000 && q < 0xC0000000 && IsCommitted(q) && G<char>(q)[0] >= 'A' && G<char>(q)[0] <= 'z') {
+              const char* c = G<char>(q);
+              size_t n = strnlen(c, 48);
+              bool text = n >= 3;
+              for (size_t i = 0; i < n && text; ++i) text = c[i] >= 32 && c[i] < 127;
+              if (text) snprintf(buf, sizeof(buf), " +%X'%s'", k, std::string(c, n).c_str()), w += buf;
+            } else if (q && q < 0x10000) {
+              snprintf(buf, sizeof(buf), " +%X=%u", k, q), w += buf;
+            }
+          }
+          RT_INFO("bot players: kit %s %08X:%s", vt == 0x8205AD34u ? "soldier" : "weapons", o, w.c_str());
+          if (vt == 0x8205AD34u) {  // one level down: the names it leads to
+            std::string d;
+            for (uint32_t k = 4; k < 0x120; k += 4) {
+              uint32_t q = Ld32(o + k);
+              if (q < 0x40000000 || q >= 0xC0000000 || !IsCommitted(q + 0x80)) continue;
+              for (uint32_t j = 0; j < 0x80; j += 4) {
+                uint32_t z = Ld32(q + j);
+                if (z < 0x40000000 || z >= 0xC0000000 || !IsCommitted(z)) continue;
+                const char* c = G<char>(z);
+                size_t n = strnlen(c, 60);
+                bool text = n >= 4;
+                for (size_t i = 0; i < n && text; ++i) text = c[i] >= 32 && c[i] < 127;
+                if (text) snprintf(buf, sizeof(buf), " +%X+%X'%s'", k, j, std::string(c, n).c_str()), d += buf;
+              }
+            }
+            RT_INFO("bot players: kit soldier %08X leads to:%s", o, d.substr(0, 900).c_str());
+          }
+        }
+      for (uint32_t o : Scan(kSpawnObject))
+        if (Ld32(o + 0x1F4)) RT_INFO("bot players: a spawn object's kit %08X + %08X", Ld32(o + 0x1F4), Ld32(o + 0x1F8));
+    }
+  }
   if (!kit) return;
   for (BotPlayer& b : g_players) {
     // Its move receiver (its network object's +2FC, made with the join) and
@@ -849,7 +937,30 @@ GAME_PATCH(82414430) {
     }
     if (b.died_ms && now - b.died_ms < 8000) continue;
     St32(b.spawner + 0x30, b.team);
-    St32(b.spawner + 0x1F4, kit), St32(b.spawner + 0x1F8, kit2);
+    // Mixed kits (as Bad Company's bots): its team's kits in turn by bot (and
+    // life), unless BF_BOT_SAME_KIT=1 (the borrowed one, as before).
+    uint32_t my_kit = kit;
+    static Kits kits;
+    static int64_t kits_at = 0;
+    if (!getenv("BF_BOT_SAME_KIT") && b.team >= 1 && b.team <= 2) {
+      auto& list = kits.team[b.team];
+      bool stale = list.empty();
+      for (auto& [o, n] : list) stale |= !IsCommitted(o + 0x100) || Ld32(o) != 0x8205AD34;
+      if (stale && now - kits_at > 5000) {
+        kits_at = now, kits = FindKits();
+        std::string us, jp;
+        for (auto& [o, n] : kits.team[1]) us += " " + n;
+        for (auto& [o, n] : kits.team[2]) jp += " " + n;
+        RT_INFO("bot players: kits: US%s; Japan%s", us.c_str(), jp.c_str());
+      }
+      if (!list.empty()) {
+        ++b.lives;
+        auto& pick = list[size_t(b.index + b.lives) % list.size()];
+        my_kit = pick.first;
+        RT_INFO("bot %d: kit %s", b.index, pick.second.c_str());
+      }
+    }
+    St32(b.spawner + 0x1F4, my_kit), St32(b.spawner + 0x1F8, kit2);
     std::vector<uint32_t> before = Scan(kSoldier);
     PPCContext c = ctx;
     c.r3.u64 = b.spawner;
@@ -1429,12 +1540,16 @@ void BotShoot(PPCContext& ctx, uint8_t* base, BotPlayer& b, int64_t now) {
     }
     ++it;
     uint32_t tt = Ld32(t + 0x48);
-    if (t == so || (tt != 1 && tt != 2) || tt == team || LdF(t + 0x3C) <= 0) continue;
+    if (t == so || (tt != 1 && tt != 2) || LdF(t + 0x3C) <= 0) continue;
     float c[3] = {LdF(t + 0x180) - o[0], LdF(t + 0x184) + 1.2f - o[1], LdF(t + 0x188) - o[2]};
     float along = c[0] * dir[0] + c[1] * dir[1] + c[2] * dir[2];
     if (along <= 0 || along >= best_t) continue;
     float px = c[0] - along * dir[0], py = c[1] - along * dir[1], pz = c[2] - along * dir[2];
     if (px * px + py * py + pz * pz > 0.45f * 0.45f) continue;
+    if (tt == team) {  // a teammate in the line of fire first (as Bad Company's): not through it
+      best = 0, best_t = along;
+      continue;
+    }
     float at[3] = {o[0] + along * dir[0], o[1] + along * dir[1], o[2] + along * dir[2]};
     if (!InSight(o, at)) {  // a wall, a hill between
       static int said = 0;
