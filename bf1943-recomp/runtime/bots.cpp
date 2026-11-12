@@ -842,6 +842,9 @@ std::string StartBotDirector(int count) {
         Pad pad = b.pad;
         if (b.slot >= d.players_from) {
           SetBotPlayerInput(b.slot - d.players_from, pad.lx, pad.ly, pad.rx, pad.ry, pad.buttons, pad.triggers);
+          // (its soldier is the server's own: moving it there is all)
+          if (b.teleport && b.soldier)
+            if (const Soldier* s = d.Find(b.soldier)) MoveVectorsNear(s->pos, b.to, "server");
           continue;
         }
         if (d.probe_slot == b.slot) pad = Pad{0, 0, 0, d.probe_dir, 0, 0};  // being identified: look up or down

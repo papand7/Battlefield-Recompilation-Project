@@ -163,6 +163,7 @@ struct BotPlayer {
   bool press13 = false;  // a ChangeVehicle press not yet seen by 822BD2B0
   bool was_seated = false;
   int steps = 0;  // (BF_BOT_STEPLOG)
+  int64_t next_shot = 0;
   // No ChangeVehicle press before this (ms): the brain's repeated B presses
   // would take it back in or out.
   int64_t press_after = 0;
@@ -961,9 +962,9 @@ GAME_PATCH(8236F238) {
       nx = t + 5000;
       for (BotPlayer& b : g_players)
         if (b.soldier) {
-          RT_INFO("bot %d: %d steps, soldier %08X +34C %08X at %.0f %.0f %.0f, ly %.2f lx %.2f buttons %04X", b.index,
+          RT_INFO("bot %d: %d steps, soldier %08X +34C %08X at %.0f %.0f %.0f, ly %.2f lx %.2f buttons %04X triggers %04X yaw %.2f pitch %.2f", b.index,
                   b.steps, b.soldier, Ld32(b.soldier + 0x34C), LdF(b.soldier + 0x180), LdF(b.soldier + 0x184),
-                  LdF(b.soldier + 0x188), b.ly, b.lx, b.buttons);
+                  LdF(b.soldier + 0x188), b.ly, b.lx, b.buttons, b.triggers, b.heading, b.pitch);
           b.steps = 0;
         }
     }
@@ -1253,9 +1254,74 @@ GAME_PATCH(822C1818) {
   }
 }
 
+extern "C" PPC_FUNC(__imp__sub_823194B0);
+// Every soldier stepped lately (on foot: a seated one isn't), with when.
+std::map<uint32_t, int64_t> g_seen_soldiers;
+
+// A bot player's shots. A hit is decided by the shooter's game (its client
+// reports it), and a bot player has none: the server's damage to a soldier,
+// 823194B0(soldier, record, giver), is called for it as a hit would be. The
+// record (seen with BF_BOT_DAMAGE_TRACE on real players' hits): +0 where it
+// hit, +10 its direction, +20 where from, +38 the damage; the giver: a
+// pointer to a word pointing at the shooter's spawn object + DC, so the kill
+// is the bot's. A shot hits the nearest enemy its aim (yaw, pitch) passes
+// within 0.45 m of the chest of, up to 60 m (no line of sight yet).
+void BotShoot(PPCContext& ctx, uint8_t* base, BotPlayer& b, int64_t now) {
+  uint32_t so = b.soldier, aim = Ld32(so + 0x130);
+  if (!IsCommitted(aim) || ((b.triggers >> 8) & 0xFF) < 128 || now < b.next_shot) return;
+  b.next_shot = now + 300;
+  float yaw = LdF(aim + 0x134), pitch = LdF(aim + 0x138);
+  float o[3] = {LdF(so + 0x180), LdF(so + 0x184) + 1.6f, LdF(so + 0x188)};
+  float dir[3] = {std::sin(yaw) * std::cos(pitch), std::sin(pitch), std::cos(yaw) * std::cos(pitch)};
+  uint32_t team = Ld32(so + 0x48), best = 0;
+  float best_t = 60.0f, hit[3] = {};
+  for (auto it = g_seen_soldiers.begin(); it != g_seen_soldiers.end();) {
+    uint32_t t = it->first;
+    if (now - it->second > 2000 || !IsCommitted(t + 0x400) || Ld32(t) != kSoldier) {
+      it = g_seen_soldiers.erase(it);
+      continue;
+    }
+    ++it;
+    uint32_t tt = Ld32(t + 0x48);
+    if (t == so || (tt != 1 && tt != 2) || tt == team || LdF(t + 0x3C) <= 0) continue;
+    float c[3] = {LdF(t + 0x180) - o[0], LdF(t + 0x184) + 1.2f - o[1], LdF(t + 0x188) - o[2]};
+    float along = c[0] * dir[0] + c[1] * dir[1] + c[2] * dir[2];
+    if (along <= 0 || along >= best_t) continue;
+    float px = c[0] - along * dir[0], py = c[1] - along * dir[1], pz = c[2] - along * dir[2];
+    if (px * px + py * py + pz * pz > 0.45f * 0.45f) continue;
+    best = t, best_t = along;
+    for (int i = 0; i < 3; ++i) hit[i] = o[i] + along * dir[i];
+  }
+  if (!best) return;
+  static uint32_t record = 0, giver = 0;
+  if (!record) record = g_system_heap->Alloc(0x100, 16), giver = g_system_heap->Alloc(0x10, 16);
+  memset(G<uint8_t>(record), 0, 0x100);
+  auto put = [](uint32_t a, float v) {
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    St32(a, u);
+  };
+  for (int i = 0; i < 3; ++i) put(record + 4 * i, hit[i]), put(record + 0x10 + 4 * i, dir[i]), put(record + 0x20 + 4 * i, o[i]);
+  put(record + 0x38, 20.0f);  // (a rifle's, as a real player's hits)
+  St32(giver, giver + 4), St32(giver + 4, b.spawner + 0xDC);
+  float before = LdF(best + 0x3C);
+  PPCContext c = ctx;
+  c.r3.u64 = best, c.r4.u64 = record, c.r5.u64 = giver;
+  __imp__sub_823194B0(c, base);
+  static const bool trace = getenv("BF_BOT_SHOT_TRACE") != nullptr;
+  if (trace)
+    RT_INFO("bot %d: hit soldier %08X at %.0f m, health %.0f -> %.0f", b.index, best, best_t, before, LdF(best + 0x3C));
+}
+
 GAME_PATCH(822F05C8) {
   // BF_BOT_STEP_TRACE: steps per soldier, and how far each step moves it.
   g_step_soldier = ctx.r3.u32;
+  if (g_fake_count > 0) {
+    int64_t now = int64_t(GetTickCount64());
+    g_seen_soldiers[ctx.r3.u32] = now;
+    for (BotPlayer& b : g_players)
+      if (b.soldier && b.soldier == ctx.r3.u32 && b.spawner) BotShoot(ctx, base, b, now);
+  }
   if (getenv("BF_BOT_STEP_TRACE")) {
     uint32_t so = ctx.r3.u32;
     float x0 = LdF(so + 0x180), z0 = LdF(so + 0x188);
@@ -1323,5 +1389,34 @@ GAME_PATCH(82308978) {
 
 GAME_PATCH(823194B0) {  // damage a soldier
   Note("damage", g_damages, ctx);
+  // BF_BOT_DAMAGE_TRACE: each call: the soldier (vt), the record's first
+  // words, the giver and what it points at, and the soldier's words that
+  // changed (its health).
+  static const bool trace = getenv("BF_BOT_DAMAGE_TRACE") != nullptr;
+  uint32_t so = ctx.r3.u32, rec = ctx.r4.u32, giver = ctx.r5.u32;
+  std::vector<uint32_t> was;
+  if (trace && IsCommitted(so + 0x400))
+    for (uint32_t k = 0; k < 0x400; k += 4) was.push_back(Ld32(so + k));
   __imp__sub_823194B0(ctx, base);
+  if (trace && !was.empty()) {
+    static int n = 0;
+    if (n++ < 60) {
+      std::string r, ch;
+      char buf[48];
+      for (uint32_t k = 0; k < 0x40 && IsCommitted(rec + k); k += 4) snprintf(buf, sizeof(buf), " %08X", Ld32(rec + k)), r += buf;
+      for (uint32_t k = 0; k < 0x400; k += 4)
+        if (Ld32(so + k) != was[k / 4]) snprintf(buf, sizeof(buf), " +%X %08X->%08X", k, was[k / 4], Ld32(so + k)), ch += buf;
+      uint32_t g1 = IsCommitted(giver) ? Ld32(giver) : 0, g2 = IsCommitted(g1) ? Ld32(g1) : 0;
+      std::string own;
+      for (uint32_t sp : Scan(kSpawnObject))
+        if (g2 >= sp && g2 < sp + 0x800) snprintf(buf, sizeof(buf), " spawn object %08X +%X", sp, g2 - sp), own += buf;
+      for (uint32_t k : {0x2Cu, 0x30u, 0x34u}) {
+        uint32_t q = Ld32(rec + k);
+        if (IsCommitted(q)) snprintf(buf, sizeof(buf), " rec+%X -> vt %08X %s;", k, Ld32(q), TypeName(Ld32(q)).c_str()), own += buf;
+      }
+      RT_INFO("bot players: damage giver is%s", own.c_str());
+      RT_INFO("bot players: damage %08X (vt %08X) rec %08X:%s | giver %08X -> %08X -> %08X (vt %08X) | changed:%s", so,
+              Ld32(so), rec, r.c_str(), giver, g1, g2, IsCommitted(g2) ? Ld32(g2) : 0, ch.c_str());
+    }
+  }
 }

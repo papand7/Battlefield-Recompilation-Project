@@ -111,7 +111,7 @@ Bot& State(BotIO& io) {
 // ---- the scenario ------------------------------------------------------------
 
 struct Scenario {
-  enum Kind { kNone, kWalk, kBoard, kDrive } kind = kNone;
+  enum Kind { kNone, kWalk, kBoard, kDrive, kFight } kind = kNone;
   std::string vehicle;
   int point = -1;
   bool near = false;
@@ -126,6 +126,8 @@ Scenario ParseScenario(const char* s) {
   auto near = [&](const char* x) { return strcmp(x, "near") == 0; };
   if (w == "walk") sc.kind = Scenario::kWalk, sc.point = atoi(a), sc.near = near(b);
   if (w == "board") sc.kind = Scenario::kBoard, sc.vehicle = a, sc.near = near(b);
+  // fight <flag>: all moved near it, fighting as usual (no pass: see who dies)
+  if (w == "fight") sc.kind = Scenario::kFight, sc.point = atoi(a), sc.near = true;
   if (w == "drive") sc.kind = Scenario::kDrive, sc.vehicle = a, sc.point = atoi(b), sc.near = near(c);
   if (const char* t = getenv("BF_BOT_SCENARIO_TIME")) sc.time_limit = atof(t);
   return sc;
@@ -694,7 +696,7 @@ struct Brain {
       float d = Dist3D(s.pos, me->pos);
       if (d < enemy_d) enemy_d = d, enemy = &s;
     }
-    float w_engage = enemy && enemy_d < 70 && sc.kind == Scenario::kNone ? 100 - enemy_d : 0;
+    float w_engage = enemy && enemy_d < 70 && (sc.kind == Scenario::kNone || sc.kind == Scenario::kFight) ? 100 - enemy_d : 0;
     if (b.target_point < 0 || b.target_point >= w.point_count ||
         (sc.point < 0 && w.points[b.target_point].owner == me->team && Rand(0, 1) < 0.01f)) {
       if (sc.point >= 0) b.target_point = std::min(sc.point, w.point_count - 1);
