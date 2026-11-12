@@ -123,6 +123,16 @@ uint32_t FindNetPlayer(uint32_t conn) {
     if (Ld32(o + 0x28) == conn) return o;
   return 0;
 }
+// A float as an IEEE half (for the hold times; small positive values).
+uint16_t HalfFloat(float f) {
+  if (f <= 0) return 0;
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  int e = int((u >> 23) & 0xFF) - 127 + 15;
+  if (e <= 0) return 0;
+  if (e >= 31) return 0x7BFF;
+  return uint16_t((e << 10) | ((u >> 13) & 0x3FF));
+}
 template <class T>
 bool Has(const std::vector<T>& v, T x) {
   return std::find(v.begin(), v.end(), x) != v.end();
@@ -148,6 +158,8 @@ struct BotPlayer {
   float heading = 0, pitch = 0;
   bool aim_set = false;
   uint64_t bits = 0;  // the button bits of its last step (the move messages carry them: entering a vehicle is one)
+  float held[64] = {};  // how long each digital action has been held (s)
+  int64_t e_until = 0;
   uint32_t ghost_for = 0; // the soldier that id is for
   uint32_t move_seq = 0;
 };
@@ -1003,7 +1015,11 @@ GAME_PATCH(8236F238) {
           }
           put(rec + 0x24, rt);                    // RT: fire
           static const int ebit = getenv("BF_BOT_E_BIT") ? atoi(getenv("BF_BOT_E_BIT")) : -1;
-          if (b.buttons & 0x2000) {  // B: in or out of a vehicle, use
+          // EXPERIMENT (BF_BOT_E_LATCH): E kept held 1.5 s after a press.
+          static const bool latch = getenv("BF_BOT_E_LATCH") != nullptr;
+          if (b.buttons & 0x2000) b.e_until = int64_t(GetTickCount64()) + 1500;
+          bool e_on = (b.buttons & 0x2000) || (latch && int64_t(GetTickCount64()) < b.e_until);
+          if (e_on) {  // B: in or out of a vehicle, use
             if (ebit >= 0) bits |= uint64_t(1) << ebit;
             else bit(13), bit(16);
           }
@@ -1013,9 +1029,28 @@ GAME_PATCH(8236F238) {
                                                      : (uint64_t(1) << 40 | uint64_t(1) << 43);
           uint64_t mask = base | bits;
           b.bits = mask;
+          // How long each action has been held, as half floats at +(action
+          // + 20) * 2 (822C1818: entering a vehicle wants Interact, 16, held
+          // long enough; Bad Company's records the same).
+          for (int a = 8; a < 40; ++a) {
+            b.held[a] = (bits >> a & 1) ? b.held[a] + 1.0f / 30.0f : 0.0f;
+            uint16_t h = HalfFloat(b.held[a]);
+            for (uint32_t o : {rec, ctx.r3.u32}) St16(o + uint32_t(a + 20) * 2, h);
+          }
+          if (getenv("BF_BOT_ENTER_TRACE") && (bits >> 16 & 1)) {
+            static int64_t nx = 0;
+            int64_t t2 = int64_t(GetTickCount64());
+            if (t2 >= nx) {
+              nx = t2 + 500;
+              uint32_t in = ctx.r3.u32;
+              RT_INFO("bot %d: E held %.2f s: input %08X +352 %08X +356 %08X | rec %08X +48 %04X mask %08X%08X | target +356 %08X",
+                      b.index, b.held[16], in, Ld32(in + 352), Ld32(in + 356), rec, Ld16(rec + 0x48), Ld32(rec + 0x78),
+                      Ld32(rec + 0x7C), Ld32(b.spawner + 356));
+            }
+          }
           // (the input object too: the move handler enters vehicles from it, 8239D040)
           St32(ctx.r3.u32 + 0x78, uint32_t(mask >> 32)), St32(ctx.r3.u32 + 0x7C, uint32_t(mask));
-          if (ebit == 43 && !(b.buttons & 0x2000)) mask &= ~(uint64_t(1) << 43);  // (43 only while E is held)
+          if (ebit == 43 && !e_on) mask &= ~(uint64_t(1) << 43);  // (43 only while E is held)
           St32(rec + 0x78, uint32_t(mask >> 32)), St32(rec + 0x7C, uint32_t(mask));
           // The heading (the input object's +88; the soldier's aim +134 is
           // minus it): turned by rx, as a pad's right stick turns the view.
@@ -1070,6 +1105,52 @@ GAME_PATCH(8236F238) {
               IsCommitted(in) ? Around(in, 0, 0x40).c_str() : "");
     }
   }
+}
+
+// BF_BOT_ENTER_TRACE: how far down the vehicle entering chain (8239D040 ->
+// 8239CEE8 -> 82398E08 -> 82398B98 -> 82387BB0 -> 822DDE58, seen with
+// BF_BOT_WATCH_SEAT) calls get, and 8239D040's calls per controller.
+std::atomic<int> g_enter_depth[4];
+GAME_PATCH(8239CEE8) {
+  if (getenv("BF_BOT_ENTER_TRACE")) g_enter_depth[0]++;
+  __imp__sub_8239CEE8(ctx, base);
+}
+GAME_PATCH(82398E08) {
+  if (getenv("BF_BOT_ENTER_TRACE")) g_enter_depth[1]++;
+  __imp__sub_82398E08(ctx, base);
+}
+GAME_PATCH(82398B98) {
+  if (getenv("BF_BOT_ENTER_TRACE")) g_enter_depth[2]++;
+  __imp__sub_82398B98(ctx, base);
+}
+GAME_PATCH(82387BB0) {
+  if (getenv("BF_BOT_ENTER_TRACE")) g_enter_depth[3]++;
+  __imp__sub_82387BB0(ctx, base);
+}
+GAME_PATCH(8239D040) {
+  if (getenv("BF_BOT_ENTER_TRACE")) {
+    static std::map<uint32_t, int> calls;
+    calls[ctx.r3.u32]++;
+    static int64_t next = 0;
+    int64_t t = int64_t(GetTickCount64());
+    if (t >= next) {
+      next = t + 5000;
+      std::string out;
+      for (auto& [k, v] : calls) {
+        bool bot = false;
+        for (BotPlayer& b : g_players) bot |= b.spawner == k;
+        char buf[64];
+        uint32_t tgt = Ld32(k + 356), so = Ld32(k + 288);
+        snprintf(buf, sizeof(buf), " %08X%s:%d [+356 %08X(vt %08X) +520 %.2f soldier %08X +46 %04X]", k, bot ? "(bot)" : "", v,
+                 tgt, tgt && IsCommitted(tgt) ? Ld32(tgt) : 0, LdF(k + 520), so, so && IsCommitted(so + 0x40) ? Ld16(so + 46) : 0);
+        out += buf;
+      }
+      RT_INFO("bot players: 8239D040 calls:%s | deeper %d %d %d %d", out.c_str(), g_enter_depth[0].exchange(0),
+              g_enter_depth[1].exchange(0), g_enter_depth[2].exchange(0), g_enter_depth[3].exchange(0));
+      calls.clear();
+    }
+  }
+  __imp__sub_8239D040(ctx, base);
 }
 
 GAME_PATCH(822F05C8) {
