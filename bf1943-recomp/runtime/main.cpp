@@ -124,6 +124,9 @@ void rt::LaunchBots() {
   static bool launched = false;
   if (launched || !g_bot_count) return;
   launched = true;
+  // The bots are players on this server (bot_players.cpp); BF_BOT_COPIES=1:
+  // copies of the game joining it, as before.
+  if (!getenv("BF_BOT_COPIES")) return;
 #ifndef _WIN32
   // Linux: fork + exec of this program; each bot ends with the server
   // (PR_SET_PDEATHSIG), its output in <user>_botN/bot.log.

@@ -10,7 +10,7 @@
 
 namespace botapi {
 
-constexpr int kVersion = 4;      // bump when a struct here changes
+constexpr int kVersion = 5;      // bump when a struct here changes
 constexpr int kMaxBots = 16;
 constexpr int kMemSize = 1024;   // per-bot brain state
 constexpr float kPi = 3.14159265f;
@@ -66,6 +66,8 @@ struct World {
   // Whether nothing (the map's collision, its terrain) is between a and b:
   // an eye and a chest. Null without it.
   bool (*sight)(Vec a, Vec b);
+  // The terrain's height there (-1e9 off it or not known yet). Null without it.
+  float (*ground)(float x, float z);
 };
 
 using ThinkFn = void (*)(World*);

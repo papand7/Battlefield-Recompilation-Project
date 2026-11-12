@@ -200,7 +200,16 @@ uint8_t g_move_template[0x100];
 bool g_have_template = false;
 uint32_t g_real_mover = 0;  // a real player's move receiver (to clone for the bots)
 std::deque<BotPlayer> g_players;
-const int g_fake_count = getenv("BF_BOT_FAKE") ? std::clamp(atoi(getenv("BF_BOT_FAKE")), 1, 16) : 0;
+// How many bot players: --bots N (BF_BOT_COPIES=1: none, the bots are copies
+// of the game joining as clients instead, main.cpp), or BF_BOT_FAKE=N.
+// Read once the arguments are (the first join).
+int FakeCount() {
+  static const int n = getenv("BF_BOT_FAKE")     ? std::clamp(atoi(getenv("BF_BOT_FAKE")), 1, 31)
+                       : getenv("BF_BOT_COPIES") ? 0
+                                                 : std::clamp(g_bot_count, 0, 31);
+  return n;
+}
+#define g_fake_count FakeCount()
 
 }  // namespace
 
@@ -834,6 +843,9 @@ GAME_PATCH(82414430) {
     if (b.soldier) {
       RT_INFO("bot %d: its soldier %08X is gone", b.index, b.soldier);
       b.soldier = 0, b.died_ms = now;
+      // (a new life: no aim, vehicle or pad state of the last one carried over)
+      b.aim_set = false, b.vehicle = 0, b.vehicle_id_for = 0, b.was_seated = false, b.press13 = false, b.e_steps = 0;
+      memset(b.analog, 0, sizeof(b.analog));
     }
     if (b.died_ms && now - b.died_ms < 8000) continue;
     St32(b.spawner + 0x30, b.team);
@@ -1202,7 +1214,11 @@ GAME_PATCH(8236F238) {
           St32(ctx.r3.u32 + 0x78, uint32_t(mask >> 32)), St32(ctx.r3.u32 + 0x7C, uint32_t(mask));
           if (ebit == 43 && !e_on) mask &= ~(uint64_t(1) << 43);  // (43 only while E is held)
           St32(rec + 0x78, uint32_t(mask >> 32)), St32(rec + 0x7C, uint32_t(mask));
-          for (int k = 0; k < 10; ++k) b.analog[k] = Ld32(rec + 8 + 4 * k);
+          for (int k = 0; k < 10; ++k) {
+            float f = LdF(rec + 8 + 4 * k);
+            f = std::isfinite(f) ? std::clamp(f, -1.0f, 1.0f) : 0.0f;
+            memcpy(&b.analog[k], &f, 4);
+          }
           if (getenv("BF_BOT_RECDUMP") && b.ly > 0.5f) {
             static int64_t nx = 0;
             int64_t t = int64_t(GetTickCount64());
@@ -1225,10 +1241,16 @@ GAME_PATCH(8236F238) {
           if (aim && IsCommitted(aim + 0x140) && !getenv("BF_BOT_HEADING_SPIN")) {
             if (!b.aim_set) b.heading = -LdF(aim + 0x134), b.pitch = LdF(aim + 0x138), b.aim_set = true;
             float yaw = LdF(aim + 0x134) - b.rx * 0.12f;
+            // (0..2 pi, as a real player's: the aim's own yaw keeps adding up)
+            float h = std::fmod(-yaw, 6.2831853f);
+            if (h < 0) h += 6.2831853f;
+            if (!std::isfinite(h)) h = 0;
+            yaw = -h;
             put(ctx.r3.u32 + 0x88, -yaw);
             // The pitch beside it (+8C; the aim's +138, up positive), turned by ry.
             static const float psign = getenv("BF_BOT_PITCH_SIGN") ? float(atof(getenv("BF_BOT_PITCH_SIGN"))) : 1.0f;
             float pitch = std::clamp(LdF(aim + 0x138) + b.ry * 0.08f, -1.0f, 1.0f);
+            if (!std::isfinite(pitch)) pitch = 0;
             (void)psign;
             b.heading = -yaw, b.pitch = pitch;
             put(ctx.r3.u32 + 0x8C, pitch);
@@ -1551,4 +1573,18 @@ GAME_PATCH(823194B0) {  // damage a soldier
               Ld32(so), rec, r.c_str(), giver, g1, g2, IsCommitted(g2) ? Ld32(g2) : 0, ch.c_str());
     }
   }
+}
+
+// A peer's entry removed by key (82750608: a map at +28 looked up by a 16-bit
+// key, then 827504B0 takes the entry out and deletes it). With bot players
+// on a server running at full rate, a key not in the map came by now and then
+// and the null entry crashed the server's update (a read at +96): nothing to
+// remove then.
+GAME_PATCH(827504B0) {
+  if (!ctx.r4.u32) {
+    static int said = 0;
+    if (said++ < 5) RT_WARN("bot players: a peer's entry to remove wasn't there (%08X)", ctx.r3.u32);
+    return;
+  }
+  __imp__sub_827504B0(ctx, base);
 }

@@ -93,6 +93,8 @@ struct Bot {
   Vec route_goal;
   Vec nav_stuck_at;  // where it last got stuck on a route
   int exit_phase = 0;  // 1: to the exit's spot in the water, 2: up it
+  Vec land_exit;          // a way up worked out from the terrain (LandExit), and when
+  double land_exit_t = -100, land_try_t = -100;
   Exit exit_on;
   double exit_since = 0;
   double scenario_since = -1, judge_from = 0;
@@ -193,6 +195,41 @@ struct Brain {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     if (w.log) w.log(buf);
+  }
+
+  // A way out of the water from the terrain (World::ground): of points on
+  // rings 10..200 m around, land (2 m over the sea) reached in a straight line
+  // that never climbs more than 0.6 m in a metre (a beach, not a cliff or a
+  // sea wall), with a route on from there; the nearest, counting half the way
+  // on to the goal. False without one.
+  bool LandExit(Vec from, Vec goal, Vec& out) {
+    if (!w.ground || g_shore.sea > 1e8f) return false;
+    float best = 1e9f;
+    for (float r = 10; r <= 200; r += 10)
+      for (int k = 0; k < 36; ++k) {
+        float a = k * 0.1745f;
+        Vec c{from.x + r * std::sin(a), 0, from.z + r * std::cos(a)};
+        float h = w.ground(c.x, c.z);
+        if (h < g_shore.sea + 2.0f) continue;
+        c.y = h;
+        float score = r + 0.5f * Dist2D(c, goal);
+        if (score >= best) continue;
+        bool ok = true;
+        float last = w.ground(from.x, from.z);
+        for (float s = 1; s <= r && ok; s += 1) {
+          float f = s / r, g = w.ground(from.x + (c.x - from.x) * f, from.z + (c.z - from.z) * f);
+          ok = g > -1e8f && (g < g_shore.sea - 0.5f || g - last < 0.6f);
+          last = g;
+        }
+        if (!ok) continue;
+        if (w.route) {
+          Vec corners[4];
+          Vec up{c.x, c.y + 0.5f, c.z};
+          if (w.route(-1, up, goal, corners, 4) <= 0) continue;
+        }
+        best = score, out = c;
+      }
+    return best < 1e9f;
   }
 
   const Soldier* Find(uint32_t obj) const {
@@ -851,6 +888,20 @@ struct Brain {
       cmd.lx = b.strafe;
       cmd.ly = enemy_d > 30 ? 0.6f : 0.0f;
       snprintf(io.state, sizeof(io.state), "engage");
+    } else if (bool wet = b.target_point >= 0 && me->pos.y < g_shore.sea + 1.5f && w.ground &&
+                          me->pos.y - w.ground(me->pos.x, me->pos.z) < 4.0f;  // (near a shore: not a carrier's deck)
+               wet && (w.now - b.land_exit_t < 8.0 ||
+                       (w.now - b.land_try_t > 8.0 &&
+                        (b.land_try_t = w.now, LandExit(me->pos, w.points[b.target_point].pos, b.land_exit)) &&
+                        (b.land_exit_t = w.now, true)))) {
+      // In the water: the way up the terrain shows (LandExit), straight there.
+      Vec e = b.land_exit;
+      Steer(cmd, *me, std::atan2(e.x - me->pos.x, e.z - me->pos.z), 0.0f);
+      Walk(cmd, *me, e, 1.0f);
+      if (std::fmod(w.now, 1.0) < 0.15) cmd.buttons |= kA;  // (jump: over a lip at the edge)
+      if (Dist2D(e, me->pos) < 3.0f) b.land_exit_t = -100;
+      b.stuck_level = 0;
+      snprintf(io.state, sizeof(io.state), "to land exit");
     } else if (b.target_point >= 0 && (b.exit_phase ||
                                         (me->pos.y < g_shore.sea + 1.5f && b.stuck_level > 0 && b.exit_tries < 3 &&
                                          g_shore.Nearest(me->pos, 200.0f)))) {
