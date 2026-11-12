@@ -158,9 +158,14 @@ struct BotPlayer {
   float heading = 0, pitch = 0;
   bool aim_set = false;
   uint64_t bits = 0;  // the button bits of its last step (the move messages carry them: entering a vehicle is one)
-  float held[64] = {};
-  int e_steps = 0;  // steps B has been held
-  bool press13 = false;  // a ChangeVehicle press not yet seen by 822BD2B0  // how long each digital action has been held (s)
+  float held[64] = {};  // how long each digital action has been held (s)
+  int e_steps = 0;       // steps B has been held
+  bool press13 = false;  // a ChangeVehicle press not yet seen by 822BD2B0
+  bool was_seated = false;
+  int steps = 0;  // (BF_BOT_STEPLOG)
+  // No ChangeVehicle press before this (ms): the brain's repeated B presses
+  // would take it back in or out.
+  int64_t press_after = 0;
   int64_t e_until = 0;
   uint32_t ghost_for = 0; // the soldier that id is for
   uint32_t move_seq = 0;
@@ -215,6 +220,17 @@ uint32_t rt::BotPlayerSoldier(int i) {
 void rt::SetBotPlayerInput(int i, float lx, float ly, float rx, float ry, uint32_t buttons, uint32_t triggers) {
   if (i < 0 || i >= int(g_players.size())) return;
   BotPlayer& b = g_players[size_t(i)];
+  // B pressed: a ChangeVehicle press (here, not in the soldier's step: a
+  // seated soldier gets none), unless the seat just changed.
+  int64_t now = int64_t(GetTickCount64());
+  if (b.soldier && IsCommitted(b.soldier)) {
+    bool seated = (Ld32(b.soldier + 0x34C) >> 24) == 0;
+    if (seated != b.was_seated) {
+      b.was_seated = seated, b.press_after = now + 3500;
+      RT_INFO("bot %d: %s", b.index, seated ? "in a vehicle" : "on foot");
+    }
+  }
+  if ((buttons & 0x2000) && !(b.buttons & 0x2000) && now >= b.press_after) b.press13 = true;
   b.lx = lx, b.ly = ly, b.rx = rx, b.ry = ry, b.buttons = buttons, b.triggers = triggers;
 }
 
@@ -934,6 +950,24 @@ uint32_t g_step_soldier = 0;
 GAME_PATCH(8236F238) {
   uint32_t ctl = ctx.r3.u32;
   __imp__sub_8236F238(ctx, base);
+  // BF_BOT_STEPLOG: every 5 s, per fake player, its steps here, sticks,
+  // seat flag and position.
+  if (g_fake_count > 0 && getenv("BF_BOT_STEPLOG")) {
+    for (BotPlayer& b : g_players)
+      if (b.soldier && b.soldier == g_step_soldier) b.steps++;
+    static int64_t nx = 0;
+    int64_t t = int64_t(GetTickCount64());
+    if (t >= nx) {
+      nx = t + 5000;
+      for (BotPlayer& b : g_players)
+        if (b.soldier) {
+          RT_INFO("bot %d: %d steps, soldier %08X +34C %08X at %.0f %.0f %.0f, ly %.2f lx %.2f buttons %04X", b.index,
+                  b.steps, b.soldier, Ld32(b.soldier + 0x34C), LdF(b.soldier + 0x180), LdF(b.soldier + 0x184),
+                  LdF(b.soldier + 0x188), b.ly, b.lx, b.buttons);
+          b.steps = 0;
+        }
+    }
+  }
   // A bot soldier's step: its input record is the spawn object's (made with
   // the join, never filled in without a client): our input goes there, over
   // a moving player's record (frame time +80/+84, heading +88, +90).
@@ -1029,7 +1063,7 @@ GAME_PATCH(8236F238) {
             if (ebit >= 0) bits |= uint64_t(1) << ebit;
             else {
               bit(16);
-              if (b.e_steps % 15 == 1) bit(13), b.press13 = true;
+              if (b.e_steps % 15 == 1) bit(13);
             }
           }
           if (b.buttons & 0x4000) bit(21);        // X: reload
