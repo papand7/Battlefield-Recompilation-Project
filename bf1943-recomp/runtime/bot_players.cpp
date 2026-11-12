@@ -563,7 +563,7 @@ GAME_PATCH(82414430) {
           getenv("BF_BOT_TPL78") ? uint32_t(strtoul(getenv("BF_BOT_TPL78"), nullptr, 16)) : 0x900);
     put32(g_move_template, 0x10 + 0x7C, 0x00400000);
     put32(g_move_template, 0x10 + 0x80, 0x3C23D70A);  // 0.01
-    put32(g_move_template, 0x10 + 0x84, 0x3C23D70A);
+    put32(g_move_template, 0x10 + 0x84, getenv("BF_BOT_OLD_84") ? 0x3C23D70A : 0x3D4CCCCD);  // 0.05, as a real player's
     put32(g_move_template, 0x10 + 0x90, 0x3F800000);  // 1.0
     g_have_template = true;
   }
@@ -719,6 +719,16 @@ GAME_PATCH(82414430) {
       c.r5.u64 = 1;
       c.r6.u64 = 0;
       __imp__sub_823B2C80(c, base);
+      // Three moves a tick: the server moves a soldier on foot a step per
+      // move, and a real player's game sends about that many (one a tick
+      // walked a fifth of the speed; three walk as a real player, about
+      // 3 m/s; vehicles are not affected). BF_BOT_PUMP=n to try others.
+      static const int pump = getenv("BF_BOT_PUMP") ? atoi(getenv("BF_BOT_PUMP")) : 3;
+      for (int k = 1; k < pump; ++k) {
+        St32(b.move_msg + 4, ++b.move_seq);
+        c = ctx, c.r3.u64 = b.mover, c.r4.u64 = b.move_msg, c.r5.u64 = 1, c.r6.u64 = 0;
+        __imp__sub_823B2C80(c, base);
+      }
       static int64_t next_log = 0;
       if (now >= next_log) {
         next_log = now + 2000;
@@ -913,6 +923,23 @@ GAME_PATCH(823B2C80) {
       StartWriteWatch(so + 0x34C, 4, 0);
     }
   }
+  // BF_BOT_RECDUMP: a real player's whole move record (+0..+180) as floats
+  // beside its soldier's position, every 2 s: does it carry where it is?
+  if (getenv("BF_BOT_RECDUMP") && Ld32(ctx.r4.u32) == 0x8200E490) {
+    static int64_t next = 0;
+    int64_t t = int64_t(GetTickCount64());
+    uint32_t so = Ld32(ctx.r3.u32 + 0x118);
+    if (t >= next && so && IsCommitted(so + 0x400) && Ld32(so) == kSoldier) {
+      next = t + 2000;
+      uint32_t rec = ctx.r4.u32 + 0x10;
+      std::string o;
+      char buf[40];
+      for (uint32_t k = 4; k < 0x180; k += 4)
+        if (Ld32(rec + k)) snprintf(buf, sizeof(buf), " +%X %08X", k, Ld32(rec + k)), o += buf;
+      RT_INFO("bot players: soldier at %.1f %.1f %.1f | record:%s", LdF(so + 0x180), LdF(so + 0x184), LdF(so + 0x188),
+              o.c_str());
+    }
+  }
   // BF_BOT_AIMLOG: a real player's record +80..+94 beside its soldier's aim
   // (yaw +134, pitch +138), once a second: which field is the pitch.
   if (getenv("BF_BOT_AIMLOG") && Ld32(ctx.r4.u32) == 0x8200E490) {
@@ -1096,6 +1123,22 @@ GAME_PATCH(8236F238) {
           St32(ctx.r3.u32 + 0x78, uint32_t(mask >> 32)), St32(ctx.r3.u32 + 0x7C, uint32_t(mask));
           if (ebit == 43 && !e_on) mask &= ~(uint64_t(1) << 43);  // (43 only while E is held)
           St32(rec + 0x78, uint32_t(mask >> 32)), St32(rec + 0x7C, uint32_t(mask));
+          if (getenv("BF_BOT_RECDUMP") && b.ly > 0.5f) {
+            static int64_t nx = 0;
+            int64_t t = int64_t(GetTickCount64());
+            if (t >= nx) {
+              nx = t + 2000;
+              std::string o;
+              char buf[40];
+              for (uint32_t k = 4; k < 0x180; k += 4)
+                if (Ld32(rec + k)) snprintf(buf, sizeof(buf), " +%X %08X", k, Ld32(rec + k)), o += buf;
+              RT_INFO("bot %d: fake record (in %08X rec %08X):%s", b.index, ctx.r3.u32, rec, o.c_str());
+            }
+          }
+          // +80 / +84 as in a real player's records (0.01, 0.05: times)
+          // unless BF_BOT_NO_TIMES (testing)
+          if (!getenv("BF_BOT_NO_TIMES"))
+            for (uint32_t o : {rec, ctx.r3.u32}) St32(o + 0x80, 0x3C23D70A), St32(o + 0x84, 0x3D4CCCCD);
           // The heading (the input object's +88; the soldier's aim +134 is
           // minus it): turned by rx, as a pad's right stick turns the view.
           uint32_t aim = Ld32(b.soldier + 0x130);
