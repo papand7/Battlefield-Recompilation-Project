@@ -781,7 +781,7 @@ void OpenMode(Mode mode, Mode back_to) {
     g_host_rows.clear();
     g_host_rows.push_back(Choice(kGraphics, "host_map", L"MAP", L"The battlefield.", kMapNames, kMaps, 0));
     g_host_rows.push_back(Choice(kGraphics, "bots", L"BOTS",
-                                 L"Computer players that join your game (each runs as its own copy).",
+                                 L"Computer players in your game, half on each team.",
                                  {L"NONE", L"2", L"4", L"6", L"8", L"12", L"15"},
                                  {"0", "2", "4", "6", "8", "12", "15"}, 0));
     Setting start;

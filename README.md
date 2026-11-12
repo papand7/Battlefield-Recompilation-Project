@@ -111,12 +111,17 @@ All keys can be changed under **Settings → Keys**.
 
 ### Run your own server
 
-A dedicated server runs in a console window, with no graphics, and shows up in everyone's
-**Join Game** list. Edit and run `start_server.bat` (name, maps to rotate through, bots), or:
+A dedicated server runs in a console window, with no graphics, and shows up in the
+**Join Game** list of everyone on your network. Edit and run `start_server.bat` (name, maps to
+rotate through, bots, and `PUBLISH=1` to list it on the internet too), or:
 
 ```
-bf1943.exe --game <your game files> --dedicated --name "My Server" --maps Wake_island_s,Iwo_Jima_s --bots 4
+bf1943.exe --game <your game files> --dedicated --name "My Server" --maps Wake_island_s,Iwo_Jima_s --bots 4 --publish
 ```
+
+`--publish` lists it on the internet (the master server) as well; the router must pass UDP
+ports 1003 and 19430 to the server. Hosting from the game's menu has the same choice
+(**List on the internet**).
 
 **Linux server (experimental):** a native Linux build of the dedicated server
 (`bf1943_server`) runs on Ubuntu 24.04 (tested in WSL2), and the Windows game can join
