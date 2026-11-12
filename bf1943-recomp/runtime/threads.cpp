@@ -22,6 +22,8 @@
 #include <chrono>
 #include <string>
 #include <condition_variable>
+#include <map>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -287,6 +289,66 @@ void DumpGuestThreads() {
   }
   ::CloseHandle(snap);
 }
+
+// BF_PROFILE=<seconds> (testing): that long after the start, every guest
+// thread's native stack sampled every 5 ms for 15 s; per thread, its samples
+// and the functions in most of them (inclusive), to see where a slow frame goes.
+const bool g_profile_started = [] {
+  const char* e = getenv("BF_PROFILE");
+  if (!e) return false;
+  int after = atoi(e);
+  std::thread([after] {
+    std::this_thread::sleep_for(std::chrono::seconds(after));
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    std::map<uint32_t, std::pair<std::string, std::map<std::string, int>>> per;
+    std::map<uint32_t, int> samples;
+    std::map<uint32_t, std::map<std::string, int>> leaf;
+    auto end = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < end) {
+      std::vector<std::shared_ptr<GuestThread>> threads;
+      {
+        std::lock_guard lock(g_threads_mutex);
+        threads = g_threads;
+      }
+      for (auto& t : threads) {
+        if (!t->host || WaitForSingleObject(t->host, 0) == WAIT_OBJECT_0) continue;
+        std::string st = StackOf(t->host, true);
+        auto& e2 = per[t->id];
+        e2.first = t->name;
+        samples[t->id]++;
+        std::set<std::string> once;
+        leaf[t->id][st.substr(0, st.find(" < "))]++;
+        size_t pos = 0;
+        while (pos < st.size()) {
+          size_t q = st.find(" < ", pos);
+          std::string f = st.substr(pos, q == std::string::npos ? std::string::npos : q - pos);
+          if (once.insert(f).second) e2.second[f]++;
+          if (q == std::string::npos) break;
+          pos = q + 3;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    for (auto& [id, e2] : per) {
+      std::vector<std::pair<int, std::string>> top;
+      for (auto& [f, n] : e2.second) top.push_back({n, f});
+      std::sort(top.rbegin(), top.rend());
+      std::string o;
+      for (size_t i = 0; i < top.size() && i < 40; ++i)
+        o += " " + top[i].second + ":" + std::to_string(top[i].first * 100 / std::max(1, samples[id])) + "%";
+      RT_INFO("profile: thread %u (%s), %d samples:%s", id, e2.first.c_str(), samples[id], o.c_str());
+      std::vector<std::pair<int, std::string>> lt;
+      for (auto& [f, n] : leaf[id]) lt.push_back({n, f});
+      std::sort(lt.rbegin(), lt.rend());
+      o.clear();
+      for (size_t i = 0; i < lt.size() && i < 25; ++i)
+        o += " " + lt[i].second + ":" + std::to_string(lt[i].first * 100 / std::max(1, samples[id])) + "%";
+      RT_INFO("profile: thread %u leaves:%s", id, o.c_str());
+    }
+  }).detach();
+  return true;
+}();
 
 // DEBUG --watch-write addr,size,seconds: logs the recompiled call stack of
 // every write to guest [addr, addr+size) (page made read-only, single step).

@@ -131,6 +131,30 @@ const bool g_dump_vt = [] {
 }();
 
 
+// BF_STRINGS_AT=<hex address>,<hex length>: the strings in that part of the
+// image (a type's field names lie together).
+const bool g_strings_at = [] {
+  const char* at = getenv("BF_STRINGS_AT");
+  if (!at) return false;
+  uint32_t a0 = 0, len = 0;
+  sscanf(at, "%x,%x", &a0, &len);
+  std::thread([a0, len] {
+    std::this_thread::sleep_for(std::chrono::seconds(4));
+    std::string all;
+    for (uint32_t a = a0; a < a0 + len; ++a) {
+      if (!IsCommitted(a)) continue;
+      const char* c = G<char>(a);
+      if (c[-1] != 0 || c[0] < 'A' || c[0] > 'z') continue;
+      size_t n = strnlen(c, 64);
+      if (n < 3) continue;
+      all += " " + std::string(c, n);
+      a += uint32_t(n);
+    }
+    RT_INFO("strings at %08X:%s", a0, all.c_str());
+  }).detach();
+  return true;
+}();
+
 // BF_FIND_STRINGS=<prefix>: every NUL-terminated string in the image starting
 // with it (enum names: their order in memory).
 const bool g_find_strings = [] {

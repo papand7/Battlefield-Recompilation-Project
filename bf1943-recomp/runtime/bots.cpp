@@ -848,6 +848,10 @@ std::string StartBotDirector(int count) {
         Pad pad = b.pad;
         if (b.slot >= d.players_from) {
           SetBotPlayerInput(b.slot - d.players_from, pad.lx, pad.ly, pad.rx, pad.ry, pad.buttons, pad.triggers);
+          {
+            const Soldier* s = b.soldier ? d.Find(b.soldier) : nullptr;
+            SetBotPlayerVehicle(b.slot - d.players_from, s && s->vehicle != kSeated ? s->vehicle : 0);
+          }
           // (its soldier is the server's own: moving it there is all)
           if (b.teleport && b.soldier)
             if (const Soldier* s = d.Find(b.soldier)) MoveVectorsNear(s->pos, b.to, "server");

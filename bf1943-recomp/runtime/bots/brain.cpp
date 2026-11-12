@@ -73,6 +73,7 @@ struct Bot {
   float fly_last_y = 0;
   double fly_last_t = 0;
   float fly_vy = 0;
+  float fly_last_h = 0, fly_rate = 0;  // the heading a moment ago, its rate of turn (rad/s)
   bool released = false;   // the landing craft is down from its crane
   uint32_t bad_boat = 0;   // gave up on it
   // Scenario
@@ -113,7 +114,7 @@ Bot& State(BotIO& io) {
 // ---- the scenario ------------------------------------------------------------
 
 struct Scenario {
-  enum Kind { kNone, kWalk, kBoard, kDrive, kFight } kind = kNone;
+  enum Kind { kNone, kWalk, kBoard, kDrive, kFight, kFly } kind = kNone;
   std::string vehicle;
   int point = -1;
   bool near = false;
@@ -130,6 +131,8 @@ Scenario ParseScenario(const char* s) {
   if (w == "board") sc.kind = Scenario::kBoard, sc.vehicle = a, sc.near = near(b);
   // fight <flag>: all moved near it, fighting as usual (no pass: see who dies)
   if (w == "fight") sc.kind = Scenario::kFight, sc.point = atoi(a), sc.near = true;
+  // fly <plane> <flag> [near]: up in it, 60 m over the sea, and (as drive) on to the flag
+  if (w == "fly") sc.kind = Scenario::kFly, sc.vehicle = a, sc.point = atoi(b), sc.near = near(c);
   if (w == "drive") sc.kind = Scenario::kDrive, sc.vehicle = a, sc.point = atoi(b), sc.near = near(c);
   if (const char* t = getenv("BF_BOT_SCENARIO_TIME")) sc.time_limit = atof(t);
   return sc;
@@ -272,7 +275,7 @@ struct Brain {
     const Vehicle* best = nullptr;
     for (int i = 0; i < w.vehicle_count; ++i) {
       const Vehicle& v = w.vehicles[i];
-      if (kind ? strcmp(v.kind, kind) != 0 : !(land ? IsLand(v.kind) : IsBoat(v.kind))) continue;
+      if (kind ? !strstr(v.kind, kind) : !(land ? IsLand(v.kind) : IsBoat(v.kind))) continue;  // (a part of its name)
       if (!kind && land && std::fabs(v.pos.y - p.y) > 4.0f) continue;
       if (v.obj == b.bad_boat || (free_only && BoatTaken(v.obj, io))) continue;
       float d = Dist3D(v.pos, p);
@@ -289,31 +292,68 @@ struct Brain {
     b.boat_since = w.now;
   }
 
-  // A plane: full throttle (LT) off the deck, then hold about 100 m over the
-  // sea with the pitch (right stick Y, BF_PLANE_PITCH_SIGN if it flies the
-  // wrong way), turn with the rudder (left stick X), and circle the flag
+  // A plane: full throttle (LT) off the deck, then hold about 160 m over the
+  // sea with the pitch (right stick Y: down climbs, as the game's flight
+  // controls; BF_PLANE_PITCH_SIGN=1 the other way), turn by banking (right
+  // stick X: the roll; the rudder hardly turns it) toward a rate of turn
+  // (measured from its heading) for the way to the flag, and circle the flag
   // once there. Never gets out in the air.
   bool Fly(BotIO& io, Bot& b, const Soldier& me, Vec goal, Pad& cmd) {
-    static const float sign = getenv("BF_PLANE_PITCH_SIGN") ? float(atof(getenv("BF_PLANE_PITCH_SIGN"))) : 1.0f;
+    static const float sign = getenv("BF_PLANE_PITCH_SIGN") ? float(atof(getenv("BF_PLANE_PITCH_SIGN"))) : -1.0f;
+    static const bool turn_lx = getenv("BF_PLANE_TURN") && !strcmp(getenv("BF_PLANE_TURN"), "lx");
+    static const float turn_sign = getenv("BF_PLANE_TURN_SIGN") ? float(atof(getenv("BF_PLANE_TURN_SIGN"))) : 1.0f;
     double dt = w.now - b.fly_last_t;
     if (dt > 0.25) {
-      if (b.fly_last_t > 0 && dt < 2.0) b.fly_vy = 0.7f * b.fly_vy + 0.3f * float((me.pos.y - b.fly_last_y) / dt);
+      if (b.fly_last_t > 0 && dt < 2.0) {
+        b.fly_vy = 0.7f * b.fly_vy + 0.3f * float((me.pos.y - b.fly_last_y) / dt);
+        b.fly_rate = 0.6f * b.fly_rate + 0.4f * float(Wrap(b.boat_heading - b.fly_last_h) / dt);
+      }
       b.fly_last_y = me.pos.y;
+      b.fly_last_h = b.boat_heading;
       b.fly_last_t = w.now;
     }
     cmd.triggers = 255u;  // LT: throttle
+    if (getenv("BF_PLANE_BOOST")) cmd.buttons |= kLeftThumb, cmd.ly = 1.0f;  // EXPERIMENT
     double t = w.now - b.drive_since;
     if (t < 5.0) return true;  // rolling along the deck
-    const float cruise = 320.0f;  // the sea is at about 214
+    const float cruise = 380.0f;  // the sea is at about 214
     float want_vy = std::clamp((cruise - me.pos.y) * 0.25f, -8.0f, 12.0f);
-    cmd.ry = sign * std::clamp((want_vy - b.fly_vy) * 0.06f, -0.7f, 0.7f);
-    if (me.pos.y < 240.0f && t > 8.0) cmd.ry = sign * 0.7f;  // too low: climb
+    float gain = getenv("BF_PLANE_VY_GAIN") ? float(atof(getenv("BF_PLANE_VY_GAIN"))) : 0.05f;
+    cmd.ry = sign * std::clamp((want_vy - b.fly_vy) * gain, -0.5f, 0.6f);
+    if (me.pos.y < 240.0f && t > 8.0) cmd.ry = sign * 0.6f;  // too low: climb
     float d = Dist2D(me.pos, goal);
     float want = std::atan2(goal.x - me.pos.x, goal.z - me.pos.z);
     if (d < 150.0f) want += 1.3f;  // there: circle it
     float e = Wrap(want - b.boat_heading);
-    cmd.lx = std::clamp(-e * 1.5f, -1.0f, 1.0f);
+    // (The roll is a rate: a bank stays when let go, and right stick + turns
+    // the heading up, BF_PLANE_ROLL_PROBE.)
+    static const float max_rate = getenv("BF_PLANE_RATE") ? float(atof(getenv("BF_PLANE_RATE"))) : 0.15f;
+    float want_rate = std::clamp(e * 0.4f, -max_rate, max_rate);
+    if (me.pos.y < 320.0f || b.fly_vy < -8.0f) want_rate = 0;  // low or falling: wings level first
+    float turn = t < 9.0 ? 0.0f : std::clamp((want_rate - b.fly_rate) * 1.0f, -0.3f, 0.3f) * turn_sign;
+    // BF_PLANE_ROLL_PROBE=<amount> (testing): from 20 s, that roll 3 s, level
+    // 6 s, the other way 3 s, level; heading and height logged.
+    if (const char* pr = getenv("BF_PLANE_ROLL_PROBE"); pr && t > 20.0) {
+      float amt = float(atof(pr)), k = float(std::fmod(t - 20.0, 24.0));
+      turn = k < 3 ? amt : k < 9 ? 0.0f : k < 12 ? -amt : 0.0f;
+      static double nx = 0;
+      if (w.now >= nx)
+        nx = w.now + 0.5, Log("fly probe: t %.1f roll %.2f heading %.0f rate %.2f height %.0f vy %.1f", t, turn,
+                              b.boat_heading * 57.3f, b.fly_rate, me.pos.y, b.fly_vy);
+    }
+    if (turn_lx) cmd.lx = turn;
+    else cmd.rx = turn;
     snprintf(b.probe_name, sizeof(b.probe_name), "fly %.0f", me.pos.y);
+    if (getenv("BF_PLANE_TRACE")) {
+      static double next = 0;
+      if (w.now >= next) {
+        next = w.now + 2.0;
+        const Vehicle* v = b.boat ? FindVehicle(b.boat) : nullptr;
+        Log("fly: bot%d at %.0f,%.0f,%.0f, its plane %s at %.0f,%.0f,%.0f; pad lx %.2f ly %.2f rx %.2f ry %.2f lt %u",
+            io.slot + 1, me.pos.x, me.pos.y, me.pos.z, v ? v->kind : "?", v ? v->pos.x : 0, v ? v->pos.y : 0,
+            v ? v->pos.z : 0, cmd.lx, cmd.ly, cmd.rx, cmd.ry, cmd.triggers & 0xFF);
+      }
+    }
     return true;
   }
 
@@ -323,7 +363,8 @@ struct Brain {
   // drives and steers) and get out at the flag. True while busy (pad set).
   bool Ride(BotIO& io, Bot& b, const Soldier& me, Pad& cmd) {
     const Vehicle* boat = b.boat ? FindVehicle(b.boat) : nullptr;
-    const char* want_kind = sc.kind == Scenario::kBoard || sc.kind == Scenario::kDrive ? sc.vehicle.c_str() : nullptr;
+    const char* want_kind =
+        sc.kind == Scenario::kBoard || sc.kind == Scenario::kDrive || sc.kind == Scenario::kFly ? sc.vehicle.c_str() : nullptr;
     switch (b.boat_state) {
       case kNoBoat: {
         if (w.now < b.no_boat_until || b.target_point < 0 || b.target_point >= w.point_count) return false;
@@ -629,6 +670,10 @@ struct Brain {
       case Scenario::kBoard:
         done = in && sc.vehicle == in->kind;
         break;
+      case Scenario::kFly:
+        // (seated in the plane it went for: a flying plane's place isn't known)
+        done = me.vehicle && b.ride_air && b.boat_state == kDrive && me.pos.y > 275.0f;
+        break;
       case Scenario::kDrive: {
         // Driven to the flag, or most of the way (a landing craft stops at
         // the beach).
@@ -744,7 +789,7 @@ struct Brain {
     // Landing craft from the carriers; BF_BOT_NO_VEHICLES: none.
     static const bool vehicles_off = getenv("BF_BOT_NO_VEHICLES") != nullptr;
     bool ride = (sc.kind == Scenario::kNone && !vehicles_off) || sc.kind == Scenario::kBoard ||
-                sc.kind == Scenario::kDrive;
+                sc.kind == Scenario::kDrive || sc.kind == Scenario::kFly;
     if (ride && Ride(io, b, *me, cmd)) {
       static const char* kNames[] = {"foot", "to vehicle", "boarding", "driving", "leaving"};
       snprintf(io.state, sizeof(io.state), "%s", kNames[b.boat_state]);

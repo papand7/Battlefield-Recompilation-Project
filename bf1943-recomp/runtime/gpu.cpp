@@ -196,12 +196,15 @@ void ExecuteType3(Reader& r, uint32_t op, uint32_t count, int depth) {
       for (;;) {
         uint32_t v = (info & 0x10) ? ReadMem(poll) : ReadRegister(poll);
         if (Compare(info, v & mask, ref)) break;
-        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(2)) {
+        auto waited = std::chrono::steady_clock::now() - start;
+        if (waited > std::chrono::seconds(2)) {
           RT_WARN("GPU: WAIT_REG_MEM timed out (info %X poll %08X ref %X mask %X value %X)", info,
                   poll, ref, mask, v);
           break;
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        // (a Windows sleep is a millisecond or more: polled at once for 2 ms)
+        if (waited < std::chrono::milliseconds(2)) std::this_thread::yield();
+        else std::this_thread::sleep_for(std::chrono::microseconds(100));
       }
       break;
     }
@@ -292,10 +295,12 @@ void Execute(Reader& r, int depth) {
 void CommandProcessorThread() {
   SetThreadDescription(GetCurrentThread(), L"gpu command processor");
   auto last_report = std::chrono::steady_clock::now();
+  auto last_work = last_report;
   for (;;) {
     if (g_gpu.ring_base && g_gpu.ring_size_dwords) {
       uint32_t wptr = Ld32(kGpuRegs + CP_RB_WPTR * 4) % g_gpu.ring_size_dwords;
       if (wptr != g_gpu.rptr) {
+        last_work = std::chrono::steady_clock::now();
         Reader r(g_gpu.ring_base, g_gpu.ring_size_dwords, g_gpu.rptr, wptr);
         Execute(r, 0);
         g_gpu.rptr = wptr;
@@ -308,7 +313,12 @@ void CommandProcessorThread() {
       RT_INFO("GPU: %llu packets, %llu draws, %llu swaps, %u vblanks", g_gpu.packets, g_gpu.draws,
               g_gpu.swaps, g_gpu.vsync_count);
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    // The game's D3D spins on the ring while it waits for us, many times a
+    // frame: a Windows sleep (a millisecond or more) each time held a server
+    // without a GPU to 18 frames a second (and its simulation, a step a frame,
+    // to a third of real time). Polled at once for 5 ms after work, then slept.
+    if (now - last_work < std::chrono::milliseconds(5)) std::this_thread::yield();
+    else std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 }
 

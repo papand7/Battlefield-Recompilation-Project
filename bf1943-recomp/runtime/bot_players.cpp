@@ -27,6 +27,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -162,6 +163,12 @@ struct BotPlayer {
   int e_steps = 0;       // steps B has been held
   bool press13 = false;  // a ChangeVehicle press not yet seen by 822BD2B0
   bool was_seated = false;
+  // The vehicle it sits in (the director's, kept until it is on foot: a
+  // plane's place it reads goes stale once it moves) and its network id: a
+  // seated player's moves name the vehicle, not the soldier (BF_BOT_ENTRYLOG
+  // on a real player: id of its ServerVehicleEntity, bit 43 without 40).
+  uint32_t vehicle = 0, vehicle_id = 0, vehicle_id_for = 0;
+  uint32_t analog[10] = {};  // the record's analog actions (+8..+2C) of its last input step, for the moves
   int steps = 0;  // (BF_BOT_STEPLOG)
   int64_t next_shot = 0;
   // No ChangeVehicle press before this (ms): the brain's repeated B presses
@@ -217,6 +224,12 @@ uint32_t rt::BotPlayerSoldier(int i) {
   if (i < 0 || i >= int(g_players.size())) return 0;
   uint32_t so = g_players[size_t(i)].soldier;
   return so && IsCommitted(so + 0x400) && Ld32(so) == kSoldier ? so : 0;
+}
+void rt::SetBotPlayerVehicle(int i, uint32_t vehicle) {
+  if (i < 0 || i >= int(g_players.size())) return;
+  BotPlayer& b = g_players[size_t(i)];
+  if (vehicle) b.vehicle = vehicle;
+  else if (b.soldier && IsCommitted(b.soldier + 0x400) && (Ld32(b.soldier + 0x34C) >> 24) != 0) b.vehicle = 0;
 }
 void rt::SetBotPlayerInput(int i, float lx, float ly, float rx, float ry, uint32_t buttons, uint32_t triggers) {
   if (i < 0 || i >= int(g_players.size())) return;
@@ -532,6 +545,15 @@ uint32_t GhostId(PPCContext& ctx, uint8_t* base, uint32_t table, uint32_t entity
 }
 GAME_PATCH(82414430) {
   __imp__sub_82414430(ctx, base);
+  // BF_BOT_TICK_TRACE: server updates a second (every 5 s).
+  if (getenv("BF_BOT_TICK_TRACE")) {
+    static int n = 0;
+    static int64_t t0 = 0;
+    int64_t t = int64_t(GetTickCount64());
+    if (!t0) t0 = t;
+    ++n;
+    if (t - t0 >= 5000) RT_INFO("bot players: %.1f server updates a second", n * 1000.0 / double(t - t0)), n = 0, t0 = t;
+  }
   if (g_players.empty()) return;
   int64_t now = int64_t(GetTickCount64());
   static int64_t last = 0;
@@ -598,13 +620,42 @@ GAME_PATCH(82414430) {
         if (b.ghost_id) St32(b.mover, table);  // look it up there
       }
       if (!b.ghost_id) continue;
+      bool seated = (Ld32(b.soldier + 0x34C) >> 24) == 0;
+      if (seated && b.vehicle && b.vehicle_id_for != b.vehicle) {
+        uint32_t table = HostTable();
+        b.vehicle_id = table && IsCommitted(b.vehicle) && Ld32(b.vehicle) == 0x82013068 ? GhostId(ctx, base, table, b.vehicle) : 0;
+        b.vehicle_id_for = b.vehicle;
+        RT_INFO("bot %d: in vehicle %08X, network id %X", b.index, b.vehicle, b.vehicle_id);
+      }
+      // BF_BOT_VEH_TRACE: every 2 s, the soldier's place and float triples in
+      // its vehicle (and what +78 points at) within 60 m of it: where the
+      // vehicle keeps its own.
+      if (getenv("BF_BOT_VEH_TRACE") && seated && b.vehicle && IsCommitted(b.vehicle + 0x800)) {
+        static int64_t nx = 0;
+        if (now >= nx) {
+          nx = now + 2000;
+          float sx = LdF(b.soldier + 0x180), sy = LdF(b.soldier + 0x184), sz = LdF(b.soldier + 0x188);
+          std::string o;
+          char buf[64];
+          uint32_t phys = Ld32(b.vehicle + 0x78);
+          for (uint32_t obj : {b.vehicle, IsCommitted(phys + 0x400) ? phys : 0u})
+            for (uint32_t k = 0; obj && k < 0x800; k += 4) {
+              float x = LdF(obj + k), y = LdF(obj + k + 4), z = LdF(obj + k + 8);
+              if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::fabs(x - sx) < 60 &&
+                  std::fabs(y - sy) < 60 && std::fabs(z - sz) < 60 && std::fabs(x) > 1 && std::fabs(z) > 1)
+                snprintf(buf, sizeof(buf), " %s+%X(%.0f %.0f %.0f)", obj == b.vehicle ? "v" : "p", k, x, y, z), o += buf;
+            }
+          RT_INFO("bot %d: soldier at %.0f %.0f %.0f; vehicle:%s", b.index, sx, sy, sz, o.substr(0, 600).c_str());
+        }
+      }
+      bool in_vehicle = seated && b.vehicle && b.vehicle_id && !getenv("BF_BOT_SEATED_SOLDIER_ID");
       memcpy(G<uint8_t>(b.move_msg), g_move_template, sizeof(g_move_template));
       St32(b.move_msg + 4, ++b.move_seq);
       float fwd = 0.8f;
       uint32_t u;
       memcpy(&u, &fwd, 4);
       St32(b.move_msg + 0x10 + 8, u);
-      St32(b.move_msg + 0x10 + 0x9C, b.ghost_id);
+      St32(b.move_msg + 0x10 + 0x9C, in_vehicle ? b.vehicle_id : b.ghost_id);
       if (b.aim_set) {
         auto putf = [](uint32_t a, float v) {
           uint32_t w;
@@ -617,7 +668,17 @@ GAME_PATCH(82414430) {
         putf(b.move_msg + 0x10 + 8, b.ly);
         putf(b.move_msg + 0x10 + 0xC, b.lx);
         uint64_t m = b.bits ? b.bits : (uint64_t(1) << 40 | uint64_t(1) << 43);
+        if (in_vehicle) {
+          m &= ~(uint64_t(1) << 40);
+          for (int k = 0; k < 10; ++k) St32(b.move_msg + 0x10 + 8 + 4 * k, b.analog[k]);  // throttle, steering, pitch, roll, fire...
+        }
         St32(b.move_msg + 0x10 + 0x78, uint32_t(m >> 32)), St32(b.move_msg + 0x10 + 0x7C, uint32_t(m));
+        if (const char* t80 = getenv("BF_BOT_T80")) {  // EXPERIMENT: the step's time?
+          float f = float(atof(t80));
+          uint32_t w;
+          memcpy(&w, &f, 4);
+          St32(b.move_msg + 0x10 + 0x80, w);
+        }
       }
       // EXPERIMENT (BF_BOT_CONTROL): the receiver's +118 is the entity it
       // controls (823B2C80 compares it with the one the move names).
@@ -719,11 +780,10 @@ GAME_PATCH(82414430) {
       c.r5.u64 = 1;
       c.r6.u64 = 0;
       __imp__sub_823B2C80(c, base);
-      // Three moves a tick: the server moves a soldier on foot a step per
-      // move, and a real player's game sends about that many (one a tick
-      // walked a fifth of the speed; three walk as a real player, about
-      // 3 m/s; vehicles are not affected). BF_BOT_PUMP=n to try others.
-      static const int pump = getenv("BF_BOT_PUMP") ? atoi(getenv("BF_BOT_PUMP")) : 3;
+      // A move a tick (the server moves a soldier on foot a step per move;
+      // BF_BOT_PUMP=n: n a tick). (Three made up for a server held to 18
+      // frames a second, gpu.cpp's background cap, now off without a window.)
+      static const int pump = getenv("BF_BOT_PUMP") ? atoi(getenv("BF_BOT_PUMP")) : 1;
       for (int k = 1; k < pump; ++k) {
         St32(b.move_msg + 4, ++b.move_seq);
         c = ctx, c.r3.u64 = b.mover, c.r4.u64 = b.move_msg, c.r5.u64 = 1, c.r6.u64 = 0;
@@ -911,6 +971,20 @@ GAME_PATCH(823B2C80) {
               now_w[0], now_w[1], now_w[2], now_w[3], now_w[4], now_w[5], now_w[6], now_w[7], now_w[8], now_w[9],
               now_w[10], now_w[11], so && IsCommitted(so + 0x400) ? Ld32(so + 0x34C) >> 24 : 9);
     }
+    // What the id names (8275D2F8: the entity + 80), and the player's spawn
+    // object's entry target (+356, +360), once per id.
+    static std::set<uint32_t> ids;
+    uint32_t id = now_w[1], table = Ld32(ctx.r3.u32);
+    if (id && IsCommitted(table) && ids.insert(id).second) {
+      PPCContext c = ctx;
+      c.r3.u64 = table, c.r4.u64 = id;
+      sub_8275D2F8(c, base);
+      uint32_t ent = c.r3.u32 ? c.r3.u32 - 80 : 0, sp = Ld32(ctx.r3.u32 + 0x30);
+      RT_INFO("bot players: entry: id %X is %08X (vt %08X %s); spawn object %08X +356 %08X (vt %08X) +360 %08X", id, ent,
+              IsCommitted(ent) ? Ld32(ent) : 0, IsCommitted(ent) ? TypeName(Ld32(ent)).c_str() : "", sp,
+              IsCommitted(sp + 0x400) ? Ld32(sp + 356) : 0, IsCommitted(Ld32(sp + 356)) ? Ld32(Ld32(sp + 356)) : 0,
+              IsCommitted(sp + 0x400) ? Ld32(sp + 360) : 0);
+    }
   }
   // BF_BOT_WATCH_SEAT: a write watch on a real soldier's on-foot byte (+34C):
   // the call stack that puts it in a vehicle seat.
@@ -1001,7 +1075,9 @@ GAME_PATCH(8236F238) {
   // a moving player's record (frame time +80/+84, heading +88, +90).
   if ((g_fake_count > 0) && g_step_soldier)
     for (BotPlayer& b : g_players)
-      if (b.soldier == g_step_soldier && Ld32(ctx.r3.u32) == 0x8200E48C) {
+      // (its soldier's step, or anything asking for its input by its spawn
+      // object: a vehicle it sits in, whose step isn't the soldier's)
+      if ((b.soldier == g_step_soldier || (b.spawner && ctl == b.spawner)) && Ld32(ctx.r3.u32) == 0x8200E48C) {
         // The actions are read from the record it points at, +160
         // (822BD248: analog action i at +8 + 4 i, buttons as bits at +78).
         uint32_t rec = ctx.r3.u32;
@@ -1064,17 +1140,20 @@ GAME_PATCH(8236F238) {
           // move of a live soldier, and the heading only counts with 40.)
           auto bit = [&](int a) { bits |= uint64_t(1) << a; };
           if (seated) {
-            put(rec + 8, std::max(lt, b.ly));      // throttle (LT, as the PC keys)
+            static const float thr_scale = getenv("BF_BOT_THR_SCALE") ? float(atof(getenv("BF_BOT_THR_SCALE"))) : 1.0f;  // EXPERIMENT
+            put(rec + 8, std::max(lt, b.ly) * thr_scale);  // throttle (LT, as the PC keys)
             put(rec + 0xC, b.lx);                 // steer
             if (b.buttons & 0x0100) put(rec + 0x10, 1.0f);  // LB: brake / reverse
             put(rec + 0x18, -b.rx);               // yaw
+            put(rec + 0x20, -b.rx);               // roll (a plane turns by it)
             put(rec + 0x1C, b.ry);                // pitch
             if (b.buttons & 0x1000) bit(14);      // A: the next seat
+            if ((b.buttons & 0x0040) && getenv("BF_BOT_SEATED_SPRINT")) bit(22);  // EXPERIMENT: a plane's boost?
           } else {
             put(rec + 8, b.ly);                   // forward
             put(rec + 0xC, b.lx);                 // strafe
             if (b.buttons & 0x1000) bit(12);      // A: jump
-            if (b.buttons & 0x0040) bit(22);      // left stick click: sprint (22, as a real player's)
+            if ((b.buttons & 0x0040) && !getenv("BF_BOT_NO_SPRINT")) bit(22);  // left stick click: sprint (22, as a real player's)
             if (lt > 0.5f) bit(11);               // LT: zoom
           }
           put(rec + 0x24, rt);                    // RT: fire
@@ -1123,6 +1202,7 @@ GAME_PATCH(8236F238) {
           St32(ctx.r3.u32 + 0x78, uint32_t(mask >> 32)), St32(ctx.r3.u32 + 0x7C, uint32_t(mask));
           if (ebit == 43 && !e_on) mask &= ~(uint64_t(1) << 43);  // (43 only while E is held)
           St32(rec + 0x78, uint32_t(mask >> 32)), St32(rec + 0x7C, uint32_t(mask));
+          for (int k = 0; k < 10; ++k) b.analog[k] = Ld32(rec + 8 + 4 * k);
           if (getenv("BF_BOT_RECDUMP") && b.ly > 0.5f) {
             static int64_t nx = 0;
             int64_t t = int64_t(GetTickCount64());
