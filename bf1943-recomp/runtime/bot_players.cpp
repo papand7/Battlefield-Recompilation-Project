@@ -105,6 +105,18 @@ constexpr uint32_t kNetPlayer = 0x8201C6C8;       // a player's network object: 
 // The level's soldier kits (SoldierEntityData, 8205AD34: its name at +C,
 // Infantry, Rifleman, Scout) per team, told apart by the weapon assets they
 // lead to (an object they point at names them: Japan's jap_..., k98, nambu).
+// A guest string, up to max characters, not read past a page that isn't there.
+std::string GuestStr(uint32_t a, size_t max) {
+  std::string out;
+  for (size_t i = 0; i < max; ++i) {
+    if (((a + i) & 0xFFF) == 0 || i == 0)
+      if (!IsCommitted(uint32_t(a + i))) break;
+    char c = G<char>(uint32_t(a + i))[0];
+    if (!c) break;
+    out += c;
+  }
+  return out;
+}
 struct Kit {
   uint32_t soldier = 0, weapon = 0;  // SoldierEntityData (+1F4) and its first weapon's data (+1F8)
   std::string name;
@@ -126,14 +138,14 @@ Kits FindKits() {
   for (uint32_t o : Scan(0x8205F284)) {
     uint32_t name = Ld32(o + 0xC);
     if (name >= 0x40000000 && name < 0xC0000000 && IsCommitted(name))
-      weapons[std::string(G<char>(name), strnlen(G<char>(name), 32))] = o;
+      weapons[GuestStr(name, 32)] = o;
   }
   Kits k;
   for (uint32_t o : Scan(0x8205AD34)) {
     uint32_t name = Ld32(o + 0xC);
     if (name < 0x40000000 || name >= 0xC0000000 || !IsCommitted(name)) continue;
     Kit kit;
-    kit.soldier = o, kit.name = std::string(G<char>(name), strnlen(G<char>(name), 24));
+    kit.soldier = o, kit.name = GuestStr(name, 24);
     int team = LeadsToJapanese(o) ? 2 : 1;
     for (auto& f : kFirst)
       if (f.team == team && kit.name == f.kit && weapons.count(f.weapon)) kit.weapon = weapons[f.weapon];
@@ -151,7 +163,7 @@ bool LeadsToJapanese(uint32_t kit) {
     for (uint32_t j = 0; j < 0x80; j += 4) {
       uint32_t z = Ld32(q + j);
       if (z < 0x40000000 || z >= 0xC0000000 || !IsCommitted(z + 64)) continue;
-      std::string t(G<char>(z), strnlen(G<char>(z), 64));
+      std::string t = GuestStr(z, 64);
       for (char& c : t) c = char(tolower(uint8_t(c)));
       if (t.rfind("objects/soldiers/", 0) == 0) return t.find("/us/") == std::string::npos;
       if (!weapon && t.rfind("objects/weapons/", 0) == 0)
@@ -592,12 +604,32 @@ extern "C" PPC_FUNC(__imp__sub_823B2C80);
 // A bot player's move being handled (its own id, and the soldier or vehicle
 // it names): 8275D2F8(table, id) -> that entity + 80 for it.
 thread_local uint32_t t_move_id = 0, t_move_entity = 0;
+uint32_t g_move_record = 0;  // a ghost record for it (the tables' entries: +4 the id, +8 the entity + 80)
+// While it is handled no table is looked in at all (the bot's own receiver
+// table isn't a sound one: a lookup in it crashed): other ids aren't known
+// (0), and the reverse, 8275D370(table, entity) -> its ghost record, knows
+// only its entity (a record made up for it).
 GAME_PATCH(8275D2F8) {
-  if (t_move_id && (ctx.r4.u32 & 0xFFFF) == t_move_id) {
-    ctx.r3.u64 = t_move_entity + 80;
+  if (t_move_id) {
+    ctx.r3.u64 = (ctx.r4.u32 & 0xFFFF) == t_move_id ? t_move_entity + 80 : 0;
     return;
   }
   __imp__sub_8275D2F8(ctx, base);
+}
+GAME_PATCH(8275D370) {
+  if (t_move_id) {
+    uint32_t e = ctx.r4.u32;
+    if (e != t_move_entity && e != t_move_entity + 80) {
+      ctx.r3.u64 = 0;
+      return;
+    }
+    if (!g_move_record) g_move_record = g_system_heap->Alloc(0x80, 16);
+    memset(G<uint8_t>(g_move_record), 0, 0x80);
+    St32(g_move_record + 4, t_move_id), St32(g_move_record + 8, t_move_entity + 80);
+    ctx.r3.u64 = g_move_record;
+    return;
+  }
+  __imp__sub_8275D370(ctx, base);
 }
 // A move record names the entity it moves by its network id (+9C; 823B2C80
 // reads it with 8251A288), looked up per connection: 8275D2F8(*(receiver),
@@ -624,8 +656,58 @@ uint32_t GhostId(PPCContext& ctx, uint8_t* base, uint32_t table, uint32_t entity
   return 0;
 }
 void ApplyHits(PPCContext& ctx, uint8_t* base);  // (below: the bot players' hits)
+namespace rt {
+uint32_t TlsFromAnotherThread(uint32_t slot);
+uint32_t SetCurrentTls(uint32_t slot, uint32_t value);
+}  // namespace rt
+// The game's per-thread allocator (Havok's thread memory, vtable 820AA914, the
+// game's own kind 82033F7C:
+// +14 its references, +10 the memory it takes from; its TLS slot is the word
+// at 82D0ED14, read by 8285DF70 with KeTlsGetValue): the worker that runs the
+// server's update has none, and making a bot's soldier there crashed
+// (8285BC80 on a null pool). Lending it the main thread's raced with the main
+// thread. So it gets one of its own, made as the game makes them (8285B7D0:
+// constructor, 816 bytes; 82865028: this thread's), once per thread.
+PPC_FUNC(sub_8285B7D0);
+PPC_FUNC(sub_82865028);
+void EnsureThreadAllocator(PPCContext& ctx, uint8_t* base) {
+  thread_local bool done = false;
+  if (done) return;
+  uint32_t slot = Ld32(0x82D0ED14);
+  if (slot >= 64) return;
+  uint32_t mine = rt::SetCurrentTls(slot, 0);
+  rt::SetCurrentTls(slot, mine);
+  if (mine) {
+    done = true;
+    RT_INFO("bot players: the server's thread has an allocator (%08X)", mine);
+    return;
+  }
+  uint32_t other = rt::TlsFromAnotherThread(slot);
+  // (the game's own kind, vtable 82033F7C, is one: the same fields)
+  if (!other || !IsCommitted(other + 0x40) || !IsCommitted(Ld32(other + 0x10))) {  // (not yet: tried again)
+    static int said = 0;
+    if (said++ < 3) RT_INFO("bot players: no allocator to copy yet (slot %u, %08X vt %08X)", slot, other, other && IsCommitted(other) ? Ld32(other) : 0);
+    return;
+  }
+  uint32_t memory = Ld32(other + 0x10);
+  uint32_t obj = g_system_heap->Alloc(816, 16);
+  if (!obj) return;
+  memset(G<uint8_t>(obj), 0, 816);
+  PPCContext c = ctx;
+  c.r3.u64 = obj, c.r4.u64 = memory, c.r5.u64 = 16;
+  sub_8285B7D0(c, base);
+  c = ctx;
+  c.r3.u64 = obj;
+  sub_82865028(c, base);
+  done = true;
+  uint32_t now_tls = rt::SetCurrentTls(slot, 0);
+  rt::SetCurrentTls(slot, now_tls);
+  RT_INFO("bot players: the server's thread got an allocator of its own (%08X, from memory %08X; TLS now %08X)", obj,
+          memory, now_tls);
+}
 GAME_PATCH(82414430) {
   __imp__sub_82414430(ctx, base);
+  EnsureThreadAllocator(ctx, base);
   ApplyHits(ctx, base);
   // BF_BOT_TICK_TRACE: server updates a second (every 5 s).
   if (getenv("BF_BOT_TICK_TRACE")) {
@@ -670,6 +752,23 @@ GAME_PATCH(82414430) {
     put32(g_move_template, 0x10 + 0x84, getenv("BF_BOT_OLD_84") ? 0x3C23D70A : 0x3D4CCCCD);  // 0.05, as a real player's
     put32(g_move_template, 0x10 + 0x90, 0x3F800000);  // 1.0
     g_have_template = true;
+  }
+  // Its move receiver now (once a second: its network object's +2FC; one scan
+  // for all): the game can make a player new ones (as its spawn object after
+  // a death in a vehicle), and a move handed to one gone crashed the server.
+  if (second && drive) {
+    std::vector<uint32_t> nps = Scan(kNetPlayer);
+    for (BotPlayer& b : g_players) {
+      if (!b.mover) continue;
+      uint32_t now_np = 0;
+      for (uint32_t o : nps)
+        if (Ld32(o + 0x28) == b.conn) now_np = o;
+      uint32_t rcv = now_np ? Ld32(now_np + 0x2FC) : 0;
+      if (rcv != b.mover) {
+        RT_INFO("bot %d: its move receiver is now %08X (was %08X)", b.index, rcv, b.mover);
+        b.mover = rcv;  // (0: found again below, or no moves)
+      }
+    }
   }
   if (drive && g_have_template)
     for (BotPlayer& b : g_players) {
@@ -948,13 +1047,28 @@ GAME_PATCH(82414430) {
     bool alive = b.soldier && IsCommitted(b.soldier + 0x400) && Ld32(b.soldier) == kSoldier;
     if (alive) continue;
     if (b.soldier) {
-      RT_INFO("bot %d: its soldier %08X is gone", b.index, b.soldier);
+      RT_INFO("bot %d: its soldier %08X is gone%s", b.index, b.soldier, b.was_seated ? " (in a vehicle)" : "");
       b.soldier = 0, b.died_ms = now;
       // (a new life: no aim, vehicle or pad state of the last one carried over)
       b.aim_set = false, b.vehicle = 0, b.vehicle_id_for = 0, b.was_seated = false, b.press13 = false, b.e_steps = 0;
       memset(b.analog, 0, sizeof(b.analog));
     }
     if (b.died_ms && now - b.died_ms < 8000) continue;
+    // Its spawn object now: the one its move receiver drives (+30). After a
+    // death in a vehicle the game made it a new one, and deploying on the old
+    // one (freed, its memory another object's) crashed the server.
+    if (b.mover && IsCommitted(b.mover + 0x40)) {
+      uint32_t sp = Ld32(b.mover + 0x30);
+      if (sp != b.spawner && sp && IsCommitted(sp + 0x400) && Ld32(sp) == kSpawnObject) {
+        RT_INFO("bot %d: its spawn object is now %08X (was %08X)", b.index, sp, b.spawner);
+        b.spawner = sp;
+      }
+    }
+    if (!IsCommitted(b.spawner + 0x400) || Ld32(b.spawner) != kSpawnObject) {
+      static int said = 0;
+      if (said++ < 10) RT_WARN("bot %d: its spawn object %08X is gone: no deploy", b.index, b.spawner);
+      continue;
+    }
     St32(b.spawner + 0x30, b.team);
     // Mixed kits (as Bad Company's bots): its team's kits in turn by bot (and
     // life), unless BF_BOT_SAME_KIT=1 (the borrowed one, as before).
@@ -980,23 +1094,11 @@ GAME_PATCH(82414430) {
       }
     }
     St32(b.spawner + 0x1F4, my_kit), St32(b.spawner + 0x1F8, my_weapon);
-    // Its spawn object's list at +218..+21C (begin, end): deploying goes
-    // through it (82348640 reads each entry's object). After a bot died in a
-    // vehicle an entry pointed into freed memory and the deploy crashed: such
-    // entries are taken out first.
-    {
-      uint32_t lo = Ld32(b.spawner + 0x218), hi = Ld32(b.spawner + 0x21C), out = lo;
-      if (lo && hi > lo && hi - lo < 0x400 && IsCommitted(lo) && IsCommitted(hi - 4)) {
-        for (uint32_t e = lo; e < hi; e += 4) {
-          uint32_t q = Ld32(e);
-          bool live = q >= 0x40000000 && q < 0xC0000000 && IsCommitted(q) && IsCommitted(q + 0x10) &&
-                      Ld32(q) >= 0x82000000 && Ld32(q) < 0x82E00000;
-          if (live) St32(out, q), out += 4;
-          else RT_WARN("bot %d: its spawn object's list had a dead entry %08X: taken out", b.index, q);
-        }
-        if (out != hi) St32(b.spawner + 0x21C, out);
-      }
-    }
+    // BF_BOT_SPAWN_TRACE: its spawn object's words +1F0..+240 and +340..+370
+    // at each deploy (a deploy after dying in a vehicle crashed: what is left).
+    if (getenv("BF_BOT_SPAWN_TRACE"))
+      RT_INFO("bot %d: deploying, spawn object %08X:%s |%s", b.index, b.spawner, Around(b.spawner, 0x1F0, 0x240).c_str(),
+              Around(b.spawner, 0x340, 0x370).c_str());
     std::vector<uint32_t> before = Scan(kSoldier);
     PPCContext c = ctx;
     c.r3.u64 = b.spawner;
@@ -1763,4 +1865,35 @@ GAME_PATCH(827504B0) {
     return;
   }
   __imp__sub_827504B0(ctx, base);
+}
+
+// A dedicated server draws nothing anyone sees: its world render (825EEED0,
+// most of its render job's time, from 825F6AF8) is skipped, unless
+// BF_SERVER_RENDER=1. It cost CPU and, with bot players, crashed now and then
+// (8259D538 on an entity in a state it didn't expect).
+GAME_PATCH(825EEED0) {
+  static const bool render = !g_dedicated || getenv("BF_SERVER_RENDER") != nullptr;
+  if (!render) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_825EEED0(ctx, base);
+}
+
+// A player's connection dropped (823AFC20, Bad Company's 8235FD80: r4 the
+// connection). A bot player's has no traffic, so the network drops it after
+// a few minutes; its network object and move receiver went with it, and what
+// the bot did next crashed (a dead receiver, the null peer entry above). A
+// bot's connection is kept, as Bad Company's bots' are.
+GAME_PATCH(823AFC20) {
+  uint32_t c = ctx.r4.u32;
+  for (const BotPlayer& b : g_players)
+    if (b.conn && (c == b.conn || c == b.conn + 4 || c == Ld32(b.conn + 0x14))) {
+      static int said = 0;
+      if (said++ < 8) RT_INFO("bot %d: its connection %08X kept (the network would drop it)", b.index, c);
+      return;
+    }
+  static int seen = 0;
+  if (seen++ < 8) RT_INFO("bot players: player connection %08X dropped (r3 %08X)", c, ctx.r3.u32);
+  __imp__sub_823AFC20(ctx, base);
 }

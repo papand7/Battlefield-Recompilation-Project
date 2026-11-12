@@ -551,4 +551,30 @@ GUEST_IMPORT(KeTlsSetValue) {
   RETURN(1);
 }
 
+// A guest TLS slot of another thread (the main one, 1, else the first that
+// has it set), and the current thread's set (returning what it was): for
+// runtime code calling game code on a thread the game didn't set up for it
+// (bot_players.cpp: a per-thread allocator).
+namespace rt {
+uint32_t TlsFromAnotherThread(uint32_t slot);
+uint32_t SetCurrentTls(uint32_t slot, uint32_t value);
+}  // namespace rt
+uint32_t rt::TlsFromAnotherThread(uint32_t slot) {
+  std::lock_guard lock(g_threads_mutex);
+  uint32_t any = 0;
+  for (auto& t : g_threads) {
+    if (slot >= t->tls_slots.size() || !t->tls_slots[slot]) continue;
+    if (t->id == 1) return t->tls_slots[slot];
+    if (!any) any = t->tls_slots[slot];
+  }
+  return any;
+}
+uint32_t rt::SetCurrentTls(uint32_t slot, uint32_t value) {
+  auto* t = CurrentThread();
+  if (!t || slot >= t->tls_slots.size()) return 0;
+  uint32_t old = t->tls_slots[slot];
+  t->tls_slots[slot] = value;
+  return old;
+}
+
 GUEST_IMPORT(KeGetCurrentProcessType) { RETURN(1); }  // title process
