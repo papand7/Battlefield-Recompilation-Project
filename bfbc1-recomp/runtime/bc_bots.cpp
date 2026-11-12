@@ -1515,6 +1515,8 @@ struct Bot {
   std::set<uint32_t> used;  // the interactions it used
   float want_heading = 0;   // for the aim setter (824ADEE8)
   float want_pitch = 0;     // radians, up + (the aim record's +38)
+  float face = 0;           // where its body should face: atan2(dx, dz)
+  bool facing = false;
   bool crouched = false;    // as it made itself (the pose toggles)
   int64_t pose_at = 0;      // when it last toggled
   const char* kit_class = nullptr;  // its kit, chosen at the first deploy
@@ -1755,7 +1757,6 @@ static bool LoadNavMesh() {
   g_navquery->init(g_navmesh, 4096);
   RT_INFO("bot nav: navigation mesh %s (%d bytes, %d tiles)", path.c_str(), size, tiles);
   FindPieces();
-  LoadBlocked();
   return true;
 }
 // Learnt blockers: polygons a bot couldn't get onto (the navigation mesh can
@@ -1772,6 +1773,7 @@ static void LoadBlocked() {
   fclose(f);
   RT_INFO("bot nav: %d blocked polygons learnt before", n);
 }
+static std::map<dtPolyRef, int64_t> g_blocked_until;
 static void BlockPoly(const float at[3]) {
   if (!g_navquery) return;
   dtQueryFilter filter;
@@ -1780,12 +1782,22 @@ static void BlockPoly(const float at[3]) {
   float p[3];
   g_navquery->findNearestPoly(at, ext, &filter, &ref, p);
   if (!ref) return;
+  // For a minute only, and not kept: a soldier in the way (bots on one route
+  // bump into each other) looks the same, and blocks kept for good cut the
+  // routes to the crates off.
   g_navmesh->setPolyFlags(ref, 0);
-  if (FILE* f = fopen(("nav/" + g_host_map + ".blocked").c_str(), "a")) {
-    fprintf(f, "%llx\n", (unsigned long long)ref);
-    fclose(f);
-  }
-  RT_INFO("bot nav: blocked polygon %llx at %.1f %.1f %.1f", (unsigned long long)ref, p[0], p[1], p[2]);
+  g_blocked_until[ref] = int64_t(GetTickCount64()) + 60000;
+  RT_INFO("bot nav: blocked polygon %llx at %.1f %.1f %.1f for a minute", (unsigned long long)ref, p[0], p[1], p[2]);
+}
+// Blocks whose minute is over open again (from the brain, once a second).
+static void UnblockExpired() {
+  static int64_t last = 0;
+  int64_t now = int64_t(GetTickCount64());
+  if (now - last < 1000 || !g_navmesh) return;
+  last = now;
+  for (auto it = g_blocked_until.begin(); it != g_blocked_until.end();)
+    if (now > it->second) g_navmesh->setPolyFlags(it->first, 1), it = g_blocked_until.erase(it);
+    else ++it;
 }
 
 // The corners of a route from a to b on the navigation mesh (empty if none).
@@ -1900,13 +1912,14 @@ static void set_aim(uint32_t aim_obj, float heading) {
 // put on team 1, the attackers, until they deploy (+104 the soldier).
 const bool g_host_team_started = [] {
   if (!getenv("BF_BOT_HOST_TEAM")) return false;
+  static const int team = atoi(getenv("BF_BOT_HOST_TEAM")) == 2 ? 2 : 1;  // BF_BOT_HOST_TEAM=1 or 2
   std::thread([] {
     for (;;) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       for (uint32_t o : Scan(0x82019490))
-        if (!Ld32(o + 0x104) && Ld32(o + 0x30) != 1 && !BotWithSpawner(o)) {  // the host's, not a bot's
-          St32(o + 0x30, 1);
-          RT_INFO("bot pilot: spawn object %08X put on team 1", o);
+        if (!Ld32(o + 0x104) && Ld32(o + 0x30) != uint32_t(team) && !BotWithSpawner(o)) {  // the host's, not a bot's
+          St32(o + 0x30, uint32_t(team));
+          RT_INFO("bot pilot: spawn object %08X put on team %d", o, team);
         }
     }
   }).detach();
@@ -1982,7 +1995,7 @@ const bool g_host_pilot_started = [] {
       static const bool pilot_shoot = getenv("BF_BOT_PILOT_SHOOT") != nullptr;
       if (pilot_shoot) {
         uint32_t target = 0;
-        float td = 25.0f;
+        float td = 45.0f;
         for (Bot& b : g_bots) {
           uint32_t t = b.soldier;
           if (!t || !IsCommitted(t + 0x400) || Ld32(t) != 0x820118D0 || Ld32(t + 0x48) == Ld32(so + 0x48) ||
@@ -2012,6 +2025,11 @@ const bool g_host_pilot_started = [] {
           g_pilot_buttons = getenv("BF_BOT_PILOT_GRENADE") && now % 8000 < 300 ? 0x0100 : 0;
           continue;
         }
+      }
+      // BF_BOT_PILOT_STAY=1: it stays where it spawned (only turns and fires).
+      if (getenv("BF_BOT_PILOT_STAY")) {
+        g_pilot_buttons = 0;
+        continue;
       }
       if (best < (pilot_vehicle ? 3.0f : 1.0f)) {  // at the crate: each button in turn, 6 s held then 2 s up
         if (pilot_vehicle) {
@@ -2281,6 +2299,7 @@ static void BotBrain(Bot& b, uint32_t in) {
   int64_t now = int64_t(GetTickCount64());
   float x = LdF(so + 0x200), y = LdF(so + 0x204), z = LdF(so + 0x208);
   NoteInteractions();
+  UnblockExpired();
   uint32_t goal = 0;
   float best = 1e9f;
   bool guard = false;
@@ -2435,20 +2454,31 @@ static void BotBrain(Bot& b, uint32_t in) {
     forward = 0, strafe = 0;
     // The shot's direction: the record's aim (+90 yaw: atan2(dx, dz) + pi, as
     // the aim object's +134 negated; +94 pitch, up +), eye to chest.
-    float yaw = std::atan2(b.ex - x, b.ez - z) + 3.14159265f;
+    // BF_BOT_YAW_FLIP=1 (testing): the old half-turn (bullets went behind?).
+    static const bool flip = getenv("BF_BOT_YAW_FLIP") != nullptr;
+    float yaw = std::atan2(b.ex - x, b.ez - z) + (flip ? 3.14159265f : 0.0f);
     if (yaw > 3.14159265f) yaw -= 6.2831853f;
     set(0x90, yaw);
     set(0x94, std::atan2(b.ey + 1.2f - (y + 1.6f), std::max(b.edist, 0.5f)));
-    if (now - b.engaged_at > 400) {
+    // Not through a teammate: none within 1 m of the line of fire.
+    bool clear = true;
+    float lx = b.ex - x, lz = b.ez - z, ll = std::max(lx * lx + lz * lz, 0.01f);
+    for (uint32_t o : soldiers) {
+      if (o == so || o == b.enemy || !IsCommitted(o + 0x20C) || Ld32(o) != 0x820118D0 || Ld32(o + 0x48) != b.team ||
+          LdF(o + 0x3C) <= 0)
+        continue;
+      float ox = LdF(o + 0x200) - x, oz = LdF(o + 0x208) - z, t = (ox * lx + oz * lz) / ll;
+      if (t > 0 && t < 1 && std::hypot(ox - t * lx, oz - t * lz) < 1.0f) clear = false;
+    }
+    if (now - b.engaged_at > 400 && clear) {
       set(0x28, 1.0f), St32(in + 0x3C, 0x3C000000u | (Ld32(in + 0x3C) & 0xFFFFu));
       b.fired = true;
-      // A fake player's bullets hurt nobody (hits are the shooter's client's
-      // to tell): its shots are rolled here, one every 150 ms, hitting less
-      // the further the enemy (90 % at 5 m, 15 % from 40 m), and each hit is
-      // damage the server applies (DamageSoldier, from the input copy hook).
-      // BF_BOT_NO_ROLL=1 (testing): no rolled hits, only what its own bullets do.
-      static const bool no_roll = getenv("BF_BOT_NO_ROLL") != nullptr;
-      if (!no_roll && now >= b.next_shot) {
+      // Its own bullets hit (12 a hit through 822D1AA0, credited to it) now that
+      // its aim has the yaw and pitch toward the target; they didn't while the
+      // gun followed a body that never turned. BF_BOT_ROLL=1: rolled hits as
+      // before (one every 150 ms, 90 % at 5 m down to 15 % from 40 m).
+      static const bool roll = getenv("BF_BOT_ROLL") != nullptr;
+      if (roll && now >= b.next_shot) {
         b.next_shot = now + 150;
         float chance = std::clamp(1.05f - b.edist / 40.0f, 0.15f, 0.9f);
         if (float(rand()) / RAND_MAX < chance) b.hit = b.enemy;
@@ -2496,6 +2526,51 @@ static void BotBrain(Bot& b, uint32_t in) {
       heights(before);
     }
     if (now - t0 < 300) St32(in + 0x84, Ld32(in + 0x84) | (1u << kCands[step]));
+  }
+  // BF_BOT_BULLET_TEST=1 (testing): while bot 0 fights, every 2 s: its body's
+  // facing (forward row +320/+328), its aim's (-(+134)), the wanted one, and
+  // the classes with Bullet or Projectile in their name that exist (once), with
+  // each one's float triples of 50-2000 in length (a velocity) near the bot.
+  static const bool bullet_test = getenv("BF_BOT_BULLET_TEST") != nullptr;
+  if (bullet_test && b.index == 0 && b.enemy) {
+    static int64_t last = 0;
+    static std::vector<uint32_t> vts;
+    if (vts.empty()) {
+      std::set<uint32_t> seen;
+      for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+        if (page >= 0x80000000 && page < 0xA0000000) continue;
+        if (!IsCommitted(uint32_t(page))) continue;
+        for (uint32_t i = 0; i < 0x1000; i += 4) {
+          uint32_t v = Ld32(uint32_t(page) + i);
+          if (v < 0x82000000 || v >= 0x82100000 || (v & 3) || !seen.insert(v).second) continue;
+          std::string n = VtName(v);
+          if (n.find("Bullet") != std::string::npos || n.find("Projectile") != std::string::npos)
+            vts.push_back(v), RT_INFO("bot bullet test: class %08X %s", v, n.c_str());
+        }
+      }
+      if (vts.empty()) vts.push_back(0);
+    }
+    if (now - last > 2000) {
+      last = now;
+      float bodyh = std::atan2(LdF(so + 0x320), LdF(so + 0x328));
+      std::string seen;
+      for (uint32_t v : vts) {
+        if (!v) continue;
+        for (uint32_t o : Scan(v)) {
+          for (uint32_t k = 0; k + 8 < 0x200 && IsCommitted(o + k + 8); k += 4) {
+            float vx = LdF(o + k), vy = LdF(o + k + 4), vz = LdF(o + k + 8), sp = std::sqrt(vx * vx + vy * vy + vz * vz);
+            if (!std::isfinite(sp) || sp < 50 || sp > 2000 || std::fabs(vx) + std::fabs(vz) < 1) continue;
+            char buf[96];
+            snprintf(buf, sizeof(buf), " [%s %08X +%X dir %.2f speed %.0f]", VtName(v).c_str(), o, k, std::atan2(vx, vz), sp);
+            seen += buf;
+            break;
+          }
+          if (seen.size() > 600) break;
+        }
+      }
+      RT_INFO("bot bullet test: to the enemy %.2f, body %.2f, aim %.2f;%s", std::atan2(b.ex - x, b.ez - z), bodyh,
+              b.aim_obj ? -LdF(b.aim_obj + 0x134) : 0.0f, seen.empty() ? " no bullets seen" : seen.c_str());
+    }
   }
   // BF_BOT_GRENADE_TEST=1 (testing): bot 0 stands; every 8 s one candidate
   // weapon slot button (bits 19, 18, 20, 29, 30, 31 of +84, bits 0-1 of +88)
@@ -2572,6 +2647,7 @@ static void BotBrain(Bot& b, uint32_t in) {
   // from atan2(dx, dz)).
   float want = b.enemy ? std::atan2(b.ex - x, b.ez - z) : std::atan2(px - x, pz - z);
   b.want_heading = want + 3.14159265f, b.steer = b.aim_obj != 0;
+  b.face = want, b.facing = true;
   // Looking up or down: at the enemy's chest from the eye, else level.
   b.want_pitch = b.enemy ? std::atan2(b.ey + 1.2f - (y + 1.6f), std::max(b.edist, 0.5f)) : 0.0f;
   if (now - b.logged > 3000) {
@@ -3435,4 +3511,37 @@ PPC_FUNC(sub_8235FD80) {
   static int seen = 0;
   if (seen++ < 8) RT_INFO("net: player connection %08X (vt %08X) dropped", ctx.r4.u32, Ptr(ctx.r4.u32) ? Ld32(ctx.r4.u32) : 0);
   __imp__sub_8235FD80(ctx, base);
+}
+
+// The body's facing: a fake soldier's never turns (its aim does, and walking
+// follows the aim), and its bullets fly where the body faces, not where it
+// aims (bots fighting at 8 m hurt each other only when standing in that
+// line). Its transform is copied in each update by 822757E8 (r3 the soldier's,
+// r4 the new matrix: three rotation rows and the position, 16 bytes apart):
+// for a bot's soldier the rows are first turned about the vertical so the
+// forward row (+20) faces where the bot wants.
+extern "C" PPC_FUNC(__imp__sub_822757E8);
+PPC_FUNC(sub_822757E8) {
+  uint32_t r3 = ctx.r3.u32, m = ctx.r4.u32;
+  // The matrix goes to r3's +30 (the storage; seen at the soldier's +300 with
+  // BF_BOT_WATCH_HEADING), so the bot is the one whose soldier holds it.
+  uint32_t dest = Ptr(r3) && IsCommitted(r3 + 0x34) ? Ld32(r3 + 0x30) : 0;
+  for (const Bot& b : g_bots) {
+    bool mine = b.soldier && ((r3 >= b.soldier && r3 < b.soldier + 0x800) || (dest >= b.soldier && dest < b.soldier + 0x800));
+    static int said = 0;
+    if (mine && said < 4) ++said, RT_INFO("bot %d: its body's transform (822757E8 r3 %08X, to %08X; soldier %08X)", b.index, r3, dest, b.soldier);
+    if (!b.facing || !mine || !IsCommitted(m + 0x3C)) continue;
+    float fx = LdF(m + 0x20), fz = LdF(m + 0x28);
+    if (!std::isfinite(fx) || !std::isfinite(fz) || std::fabs(fx) + std::fabs(fz) < 0.1f) break;
+    float d = b.face - std::atan2(fx, fz), c = std::cos(d), sn = std::sin(d);
+    for (uint32_t row = 0; row < 0x30; row += 0x10) {
+      float x = LdF(m + row), z = LdF(m + row + 8);
+      float nx = x * c + z * sn, nz = z * c - x * sn;
+      uint32_t ux, uz;
+      memcpy(&ux, &nx, 4), memcpy(&uz, &nz, 4);
+      St32(m + row, ux), St32(m + row + 8, uz);
+    }
+    break;
+  }
+  __imp__sub_822757E8(ctx, base);
 }
