@@ -1511,6 +1511,16 @@ struct Bot {
   bool fired = false;
   uint32_t use_entity = 0;  // an interaction to use (arm, defuse), from the input copy hook
   uint32_t hit = 0;         // a soldier its shot hit, for the input copy hook to damage
+  uint32_t enter_vehicle = 0;  // a server vehicle to get into (seat 0), from the input copy hook
+  uint32_t in_vehicle = 0;     // the server vehicle it is in (this tick)
+  uint32_t vehicle = 0;        // the one it got into (until it is out)
+  int seat = -1, enter_seat = 0;
+  bool exit_vehicle = false;   // a request for the input copy hook
+  uint32_t vehicle_target = 0; // one it walks to
+  int vehicle_target_seat = 0;
+  int64_t vehicle_target_at = 0, vehicle_looked = 0, vehicle_moved_at = 0, vehicle_in_at = 0;
+  float vehicle_last[2] = {0, 0}, vehicle_heading = 0;
+  std::map<uint32_t, int64_t> vehicle_skip;  // vehicles not to try again until
   int64_t next_shot = 0;
   std::set<uint32_t> used;  // the interactions it used
   float want_heading = 0;   // for the aim setter (824ADEE8)
@@ -2026,6 +2036,21 @@ const bool g_host_pilot_started = [] {
           continue;
         }
       }
+      // BF_BOT_PILOT_BUTTONS=1: standing, each pad button in turn (0.4 s, then
+      // 3.6 s up), and how many grenades (ServerGrenadeEntity) there are after.
+      if (getenv("BF_BOT_PILOT_BUTTONS")) {
+        static const uint16_t kButtons[] = {0x0100, 0x0200, 0x8000, 0x4000, 0x2000, 0x0040, 0x0080,
+                                            0x0001, 0x0002, 0x0004, 0x0008, 0x0020};
+        static const char* kNames[] = {"LB", "RB", "Y", "X", "B", "LS", "RS", "up", "down", "left", "right", "back"};
+        int i = int((now / 4000) % 12);
+        g_pilot_buttons = now % 4000 < 400 ? kButtons[i] : 0;
+        static int said = -1;
+        if (now % 4000 > 3000 && said != int(now / 4000)) {
+          said = int(now / 4000);
+          RT_INFO("bot pilot: pressed %s: %zu grenades", kNames[i], Scan(0x82017440).size());
+        }
+        continue;
+      }
       // BF_BOT_PILOT_STAY=1: it stays where it spawned (only turns and fires).
       if (getenv("BF_BOT_PILOT_STAY")) {
         g_pilot_buttons = 0;
@@ -2273,6 +2298,142 @@ static void NoteInteractions() {
 static bool CanArmNow(uint32_t ie) { return Enabled(ie) && g_role.count(ie) && g_role[ie] == 1; }
 static bool CanDefuseNow(uint32_t ie) { return Enabled(ie) && g_role.count(ie) && g_role[ie] == 2; }
 
+// A server vehicle's name (its data +14, the name at +C: Humvee, M1A2, M3A3,
+// Pbl, Truck, AH60, KORD, Howitzer) and its place: a moving one's physics
+// object (+78) holds its transform at +130 (the place +160), a fixed gun's own +590.
+static std::string VehicleKind(uint32_t v) {
+  uint32_t data = Ptr(v) ? Ld32(v + 0x14) : 0;
+  return Ptr(data) && Ptr(Ld32(data + 0xC)) ? std::string(G<char>(Ld32(data + 0xC))).substr(0, 16) : "";
+}
+static bool VehiclePlace(uint32_t v, float out[3]) {
+  auto ok = [](float x, float y, float z) {
+    return std::isfinite(x) && std::isfinite(z) && std::fabs(x) < 2048 && std::fabs(z) < 2048 && y > 30 && y < 400 &&
+           std::fabs(x) + std::fabs(z) > 1;
+  };
+  // Where it is now: its ServerSoldierEntryComponent's transform (+130, the
+  // place +160) moves with it; the physics object's (+78) stays where it spawned.
+  static std::map<uint32_t, uint32_t> entry_off;  // vehicle -> the offset of that component's pointer
+  auto it = entry_off.find(v);
+  if (it == entry_off.end()) {
+    uint32_t off = 0;
+    for (uint32_t k = 4; k < 0x800 && !off && IsCommitted(v + k); k += 4)
+      if (TypeName(Ld32(v + k)) == "ServerSoldierEntryComponent") off = k;
+    it = entry_off.emplace(v, off).first;
+  }
+  if (it->second) {
+    uint32_t e = Ld32(v + it->second);
+    if (Ptr(e) && IsCommitted(e + 0x16C) && ok(LdF(e + 0x160), LdF(e + 0x164), LdF(e + 0x168))) {
+      out[0] = LdF(e + 0x160), out[1] = LdF(e + 0x164), out[2] = LdF(e + 0x168);
+      return true;
+    }
+  }
+  uint32_t p = Ld32(v + 0x78);
+  if (Ptr(p) && IsCommitted(p + 0x16C) && ok(LdF(p + 0x160), LdF(p + 0x164), LdF(p + 0x168))) {
+    out[0] = LdF(p + 0x160), out[1] = LdF(p + 0x164), out[2] = LdF(p + 0x168);
+    return true;
+  }
+  if (IsCommitted(v + 0x59C) && ok(LdF(v + 0x590), LdF(v + 0x594), LdF(v + 0x598))) {
+    out[0] = LdF(v + 0x590), out[1] = LdF(v + 0x594), out[2] = LdF(v + 0x598);
+    return true;
+  }
+  return false;
+}
+// The server's vehicles (ServerVehicleEntity, 82011AA8), scanned every 3 s.
+static const std::vector<uint32_t>& ServerVehicles() {
+  static std::vector<uint32_t> list;
+  static int64_t at = 0;
+  int64_t now = int64_t(GetTickCount64());
+  if (now - at > 3000) at = now, list = Scan(0x82011AA8);
+  return list;
+}
+extern "C" PPC_FUNC(__imp__sub_823458B0);
+extern "C" PPC_FUNC(__imp__sub_82341670);
+// Vehicles. A vehicle's seats (ServerPlayerEntryComponent) are an array at
+// +90 (822ACAF8), the end at +94; a seat's occupant (+D0) is a player (its
+// spawn object). Getting in or changing seat: 823458B0(player, vehicle, seat),
+// what a client's "enter" message makes the server do (it moves the player
+// out of its seat or soldier first); getting out: 82341670(player, 1).
+// Driving: the bot's input record still feeds the vehicle: +8 throttle, +C
+// steering, +90/+94 the aim (a tank's gun, a gunner's), +28 fire.
+static int SeatCount(uint32_t v) {
+  uint32_t a = Ld32(v + 0x90), e = Ld32(v + 0x94);
+  return Ptr(a) && e > a && e - a < 0x40 ? int((e - a) / 4) : 0;
+}
+static uint32_t SeatOccupant(uint32_t v, int i) {
+  uint32_t seat = Ld32(Ld32(v + 0x90) + 4 * i);
+  return Ptr(seat) && IsCommitted(seat + 0xD4) ? Ld32(seat + 0xD0) : 0;
+}
+static bool IsBotPlayer(uint32_t player) {
+  for (const Bot& b : g_bots)
+    if (b.spawner == player) return true;
+  return false;
+}
+static bool Drivable(const std::string& kind) {
+  return kind.rfind("Humvee", 0) == 0 || kind.rfind("M1A2", 0) == 0 || kind.rfind("M3A3", 0) == 0 ||
+         kind.rfind("Truck", 0) == 0 || kind.rfind("T90", 0) == 0 || kind.rfind("BMD", 0) == 0;
+}
+static bool IsTank(const std::string& kind) {
+  return kind.rfind("M1A2", 0) == 0 || kind.rfind("M3A3", 0) == 0 || kind.rfind("T90", 0) == 0 || kind.rfind("BMD", 0) == 0;
+}
+// From the input copy hook (the game's context): the bot's seat, the requests
+// its brain made (in, change, out), and a human in its vehicle getting the
+// driver's seat.
+static void VehicleUpdate(PPCContext& ctx, uint8_t* base, Bot& b) {
+  auto enter = [&](uint32_t player, uint32_t v, int seat) {
+    PPCContext c = ctx;
+    c.r3.u64 = player, c.r4.u64 = v, c.r5.u64 = uint64_t(seat);
+    __imp__sub_823458B0(c, base);
+  };
+  if (b.enter_vehicle) {
+    uint32_t v = b.enter_vehicle;
+    b.enter_vehicle = 0;
+    enter(b.spawner, v, b.enter_seat);
+    RT_INFO("bot %d: into %s %08X, seat %d", b.index, VehicleKind(v).c_str(), v, b.enter_seat);
+  }
+  // Where it sits (the seat whose occupant is its player).
+  b.in_vehicle = 0, b.seat = -1;
+  if (uint32_t v = b.vehicle) {
+    if (!Ptr(v) || Ld32(v) != 0x82011AA8) {
+      b.vehicle = 0;
+      return;
+    }
+    for (int i = 0; i < SeatCount(v); ++i)
+      if (SeatOccupant(v, i) == b.spawner) b.in_vehicle = v, b.seat = i;
+    if (!b.in_vehicle) {  // out (it died, or the game moved it)
+      b.vehicle = 0;
+      return;
+    }
+    if (b.exit_vehicle) {
+      b.exit_vehicle = false;
+      PPCContext c = ctx;
+      c.r3.u64 = b.spawner, c.r4.u64 = 1;
+      __imp__sub_82341670(c, base);
+      RT_INFO("bot %d: out of %s", b.index, VehicleKind(v).c_str());
+      b.vehicle = 0, b.in_vehicle = 0, b.seat = -1;
+      return;
+    }
+    // A human in its vehicle while it drives: it moves to a free seat (or
+    // gets out) and the human gets the driver's seat.
+    if (b.seat == 0)
+      for (int i = 1; i < SeatCount(v); ++i) {
+        uint32_t o = SeatOccupant(v, i);
+        if (!o || IsBotPlayer(o)) continue;
+        int free_seat = -1;
+        for (int k = 1; k < SeatCount(v) && free_seat < 0; ++k)
+          if (k != i && !SeatOccupant(v, k)) free_seat = k;
+        if (free_seat > 0) enter(b.spawner, v, free_seat);
+        else {
+          PPCContext c = ctx;
+          c.r3.u64 = b.spawner, c.r4.u64 = 1;
+          __imp__sub_82341670(c, base);
+        }
+        enter(o, v, 0);
+        RT_INFO("bot %d: a player got into its %s: the player drives, the bot %s", b.index, VehicleKind(v).c_str(),
+                free_seat > 0 ? "moves to another seat" : "gets out");
+        break;
+      }
+  }
+}
 // A bot's brain, run on its soldier's input (r4 of the input copy, vtable
 // 8200DC48: +8 forward, +C strafe, +1C turn, +28 fire, +2C.. held times as
 // half floats, +84 button bits, +90/+94 the aim's yaw and pitch).
@@ -2314,6 +2475,50 @@ static void BotBrain(Bot& b, uint32_t in) {
       if (b.team == 1 ? CanDefuseNow(ie) : CanArmNow(ie)) consider(ie, true);
   float tx = x, ty = y, tz = z;
   if (goal) tx = LdF(goal + 0xD0), ty = LdF(goal + 0xD4), tz = LdF(goal + 0xD8);
+  // Taking a vehicle (BF_BOT_NO_VEHICLES=1: never): on foot, no enemy, the
+  // goal over 120 m off: the nearest drivable one within 30 m with the
+  // driver's seat free (a gunner's seat 1 when a teammate drives a Humvee or a
+  // tank), none another bot is after; walked to, got into within 3.5 m (given
+  // up after 40 s, not tried again for 2 minutes).
+  static const bool no_vehicles = getenv("BF_BOT_NO_VEHICLES") != nullptr;
+  bool vehicle_press = false;
+  if (!no_vehicles && !b.in_vehicle && !b.vehicle) {
+    if (!b.vehicle_target && !b.enemy && best > 120.0f && now - b.vehicle_looked > 3000) {
+      b.vehicle_looked = now;
+      float vd = 30.0f;
+      for (uint32_t v : ServerVehicles()) {
+        std::string kind = VehicleKind(v);
+        if (!Drivable(kind) || (b.vehicle_skip.count(v) && now < b.vehicle_skip[v])) continue;
+        bool taken = false;
+        for (const Bot& o : g_bots) taken |= &o != &b && (o.vehicle_target == v || o.vehicle == v);
+        if (taken) continue;
+        float p[3];
+        if (!VehiclePlace(v, p) || std::fabs(p[1] - y) > 8.0f) continue;
+        float d = std::hypot(p[0] - x, p[2] - z);
+        if (d >= vd) continue;
+        uint32_t driver = SeatOccupant(v, 0);
+        int seat = !driver ? 0 : SeatCount(v) > 1 && !SeatOccupant(v, 1) && IsBotPlayer(driver) ? 1 : -1;
+        if (seat < 0) continue;
+        vd = d, b.vehicle_target = v, b.vehicle_target_seat = seat, b.vehicle_target_at = now;
+      }
+      if (b.vehicle_target)
+        RT_INFO("bot %d: to the %s %.0f m off (seat %d)", b.index, VehicleKind(b.vehicle_target).c_str(), vd, b.vehicle_target_seat);
+    }
+    if (uint32_t v = b.vehicle_target) {
+      float p[3];
+      bool seat_free = SeatOccupant(v, b.vehicle_target_seat) == 0;
+      if (!VehiclePlace(v, p) || !seat_free || now - b.vehicle_target_at > 40000) {
+        b.vehicle_skip[v] = now + 120000, b.vehicle_target = 0;
+      } else {
+        float d = std::hypot(p[0] - x, p[2] - z);
+        goal = v, guard = false, best = d, tx = p[0], ty = p[1], tz = p[2];
+        if (d < 3.5f) {
+          b.enter_vehicle = v, b.enter_seat = b.vehicle_target_seat, b.vehicle = v, b.vehicle_in_at = now;
+          b.vehicle_target = 0, b.vehicle_moved_at = now, b.vehicle_last[0] = x, b.vehicle_last[1] = z;
+        }
+      }
+    }
+  }
   if (goal && now - b.planned > 5000) {
     b.planned = now;
     float from[3] = {x, y, z}, to[3] = {tx, ty, tz};
@@ -2404,7 +2609,7 @@ static void BotBrain(Bot& b, uint32_t in) {
   if (now < b.unstick_until && !b.enemy) forward = 0.3f, strafe = float(b.side);
 
   // Arming or defusing at the crate.
-  if (goal && !guard && best < 2.0f && !b.used.count(goal)) b.use_entity = goal;
+  if (goal && !guard && best < 2.0f && !b.used.count(goal) && Ld32(goal) == 0x82011680) b.use_entity = goal;
 
   // The pad.
   bool jump = now < b.jump_until, reload = now < b.reload_until;
@@ -2437,6 +2642,7 @@ static void BotBrain(Bot& b, uint32_t in) {
   // (the left stick's click: 21 m in 4 s against 15 walking, BF_BOT_SPRINT_TEST).
   // Sprinting on the way when the goal is over 20 m off.
   bool sprint = forward > 0.9f && !b.enemy && best > 20.0f && now >= b.unstick_until && !sprint_test;
+  if (vehicle_press) extra_bits |= (1u << 14) | (1u << 17);
   St32(in + 0x84, (jump ? 0x2000u : 0u) | (reload ? 0x200000u : 0u) | (sprint ? 0x800000u : 0u) | extra_bits);
   St32(in + 0x44, jump ? 0x00003C00u : 0u);
   St32(in + 0x54, reload ? 0x00003C00u : 0u);
@@ -2526,6 +2732,37 @@ static void BotBrain(Bot& b, uint32_t in) {
       heights(before);
     }
     if (now - t0 < 300) St32(in + 0x84, Ld32(in + 0x84) | (1u << kCands[step]));
+  }
+  // BF_BOT_INVENTORY=1 (testing): once per bot soldier, the classes it points
+  // at (first 0x800 bytes) and, for those with Weapon in their name, theirs.
+  static const bool inventory = getenv("BF_BOT_INVENTORY") != nullptr;
+  if (inventory) {
+    static std::set<uint32_t> listed;
+    if (listed.insert(so).second) {
+      std::string out;
+      for (uint32_t k = 0; k < 0x800; k += 4) {
+        uint32_t q = Ld32(so + k);
+        std::string n = TypeName(q);
+        if (n.empty()) continue;
+        out += " +" + std::to_string(k) + ":" + n;
+        if (n.find("Weapon") != std::string::npos) {
+          std::string inner;
+          for (uint32_t j = 0; j < 0x400; j += 4) {
+            std::string m = TypeName(Ld32(q + j));
+            if (!m.empty()) inner += " +" + std::to_string(j) + ":" + m;
+            uint32_t r = Ld32(q + j);
+            if (m.find("Data") != std::string::npos && Ptr(Ld32(r + 0xC))) {
+              const char* c = G<char>(Ld32(r + 0xC));
+              int len = 0;
+              while (len < 40 && c[len] >= 32 && c[len] < 127) ++len;
+              if (len > 2) inner += "='" + std::string(c, len) + "'";
+            }
+          }
+          out += "{" + inner.substr(0, 500) + "}";
+        }
+      }
+      RT_INFO("bot %d inventory (%s):%s", b.index, b.kit_class ? b.kit_class : "?", out.substr(0, 2500).c_str());
+    }
   }
   // BF_BOT_BULLET_TEST=1 (testing): while bot 0 fights, every 2 s: its body's
   // facing (forward row +320/+328), its aim's (-(+134)), the wanted one, and
@@ -2628,6 +2865,65 @@ static void BotBrain(Bot& b, uint32_t in) {
   set(0x8, forward);
   set(0xC, strafe);
   set(0x1C, 0.0f);
+  // In a vehicle. Driver (seat 0): along the route, steering toward
+  // the next corner (+C), throttle (+8) eased in sharp turns; out 25 m from
+  // the goal, when it hasn't moved 1 m in 5 s, or (not a tank) with an enemy
+  // within 25 m. A tank stops for an enemy in sight and fires its gun at it
+  // (the aim +90/+94, fire +28). A gunner (seat 1+) fires at enemies and gets
+  // out when the vehicle has no driver or has stood still for 15 s.
+  if (b.in_vehicle) {
+    std::string kind = VehicleKind(b.in_vehicle);
+    // Its heading: the soldier's forward row rides with the vehicle (it agrees
+    // with the way it moves, BF_BOT_DRIVE_TEST).
+    b.vehicle_heading = std::atan2(LdF(so + 0x320), LdF(so + 0x328));
+    if (std::hypot(x - b.vehicle_last[0], z - b.vehicle_last[1]) > 1.0f)
+      b.vehicle_last[0] = x, b.vehicle_last[1] = z, b.vehicle_moved_at = now;
+    bool still = now - b.vehicle_moved_at > (b.seat == 0 ? 5000 : 15000) && now - b.vehicle_in_at > 6000;
+    float throttle = 0, steer = 0;
+    bool fire = false;
+    if (b.seat == 0) {
+      float d = std::atan2(px - x, pz - z) - b.vehicle_heading;
+      while (d > 3.14159265f) d -= 6.2831853f;
+      while (d < -3.14159265f) d += 6.2831853f;
+      steer = std::clamp(-d * 1.5f, -1.0f, 1.0f);  // +1 turns the heading down (BF_BOT_DRIVE_TEST)
+      throttle = std::fabs(d) > 1.2f ? 0.4f : 1.0f;
+      if (b.enemy && IsTank(kind)) throttle = 0, steer = 0, fire = true;
+      if (best < 25.0f || still || (b.enemy && !IsTank(kind) && b.edist < 25.0f)) b.exit_vehicle = true;
+      if (still) b.vehicle_skip[b.in_vehicle] = now + 120000;  // stuck in it: not again for 2 minutes
+    } else {
+      fire = b.enemy != 0;
+      if (!SeatOccupant(b.in_vehicle, 0) || still) b.exit_vehicle = true;
+    }
+    // BF_BOT_DRIVE_TEST=1 (testing): the driver steers +1 for 3 s, then -1,
+    // at full throttle, never getting out; every 0.5 s its movement's heading
+    // and the soldier's forward row's (+320/+328): which way is +C.
+    if (getenv("BF_BOT_DRIVE_TEST") && b.seat == 0) {
+      throttle = 1.0f, steer = (now / 3000) % 2 ? -1.0f : 1.0f, b.exit_vehicle = false;
+      static int64_t dl = 0;
+      static float lx = x, lz = z;
+      if (now - dl > 500) {
+        RT_INFO("bot drive test: steer %+.0f: moved %.2f m, heading %.2f, row %.2f", steer, std::hypot(x - lx, z - lz),
+                std::atan2(x - lx, z - lz), std::atan2(LdF(so + 0x320), LdF(so + 0x328)));
+        dl = now, lx = x, lz = z;
+      }
+    }
+    set(0x8, throttle), set(0xC, steer);
+    St32(in + 0x84, 0);
+    if (fire) {
+      float yaw = std::atan2(b.ex - x, b.ez - z);
+      set(0x90, yaw);
+      set(0x94, std::atan2(b.ey + 1.2f - (y + 1.6f), std::max(b.edist, 0.5f)));
+      set(0x28, 1.0f), St32(in + 0x3C, 0x3C000000u | (Ld32(in + 0x3C) & 0xFFFFu));
+    } else {
+      set(0x28, 0.0f);
+    }
+    static int64_t vlog = 0;
+    if (now - vlog > 3000) {
+      vlog = now;
+      RT_INFO("bot %d: in %s seat %d at %.1f %.1f, heading %.2f, throttle %.1f steer %.2f%s%s", b.index, kind.c_str(), b.seat, x, z,
+              b.vehicle_heading, throttle, steer, fire ? ", firing" : "", b.exit_vehicle ? ", getting out" : "");
+    }
+  }
 
   // The aim object (vtable 820264A8, two levels of pointers from the soldier).
   if (b.aim_for != so) {
@@ -2647,7 +2943,7 @@ static void BotBrain(Bot& b, uint32_t in) {
   // from atan2(dx, dz)).
   float want = b.enemy ? std::atan2(b.ex - x, b.ez - z) : std::atan2(px - x, pz - z);
   b.want_heading = want + 3.14159265f, b.steer = b.aim_obj != 0;
-  b.face = want, b.facing = true;
+  b.face = want, b.facing = !b.in_vehicle;
   // Looking up or down: at the enemy's chest from the eye, else level.
   b.want_pitch = b.enemy ? std::atan2(b.ey + 1.2f - (y + 1.6f), std::max(b.edist, 0.5f)) : 0.0f;
   if (now - b.logged > 3000) {
@@ -2776,6 +3072,8 @@ std::map<uint32_t, float> g_record_yaw;  // received input record -> its aim yaw
 }  // namespace rt
 extern "C" PPC_FUNC(__imp__sub_822C4F48);
 extern "C" PPC_FUNC(__imp__sub_822D1AA0);
+extern "C" PPC_FUNC(__imp__sub_823458B0);
+extern "C" PPC_FUNC(__imp__sub_82341670);
 static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, float amount, uint32_t attacker);
 PPC_FUNC(sub_821BF2A8) {
   uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32;
@@ -2786,10 +3084,21 @@ PPC_FUNC(sub_821BF2A8) {
   // The source is the player's received input (vtable 8200DC48): for a bot's
   // soldier, its brain fills it before the copy; then the interaction it
   // asked for (arming, defusing: 822C4F48 needs the game's context).
+  // BF_BOT_VEHICLE_TEST: a bot's record copied into something other than its
+  // soldier's input state (a vehicle's, once it is in one): what, once.
+  if (getenv("BF_BOT_VEHICLE_TEST") && IsCommitted(r4) && Ld32(r4) == 0x8200DC48)
+    for (Bot& b : g_bots)
+      if (b.record == r4 && r3 != b.input) {
+        static std::set<uint32_t> said;
+        if (said.insert(r3).second)
+          RT_INFO("bot %d: its input goes to %08X (vt %08X %s; +4 %08X %s)", b.index, r3, Ld32(r3), TypeName(r3).c_str(),
+                  Ld32(r3 + 4), TypeName(Ld32(r3 + 4)).c_str());
+      }
   if (IsCommitted(r4) && Ld32(r4) == 0x8200DC48)
     for (Bot& b : g_bots) {
       if (!b.input || r3 != b.input) continue;
       b.record = r4;
+      VehicleUpdate(ctx, base, b);
       BotBrain(b, r4);
       if (uint32_t target = b.hit) {
         b.hit = 0;
@@ -2826,6 +3135,14 @@ PPC_FUNC(sub_821BF2A8) {
       }
       break;
     }
+  // BF_BOT_PILOT_BUTTONS: a player's (not a bot's) button bits (+84, +88) as they change.
+  if (getenv("BF_BOT_PILOT_BUTTONS") && IsCommitted(r4 + 0x8C) && Ld32(r4) == 0x8200DC48) {
+    bool bot = false;
+    for (const Bot& b : g_bots) bot |= b.input && r3 == b.input;
+    static uint64_t last = 0;
+    uint64_t bits = uint64_t(Ld32(r4 + 0x84)) << 32 | Ld32(r4 + 0x88);
+    if (!bot && bits != last) last = bits, RT_INFO("bot pilot: player input bits +84 %08X +88 %08X", Ld32(r4 + 0x84), Ld32(r4 + 0x88));
+  }
   __imp__sub_821BF2A8(ctx, base);
   // BF_BOT_INPUT_MAP=1 (testing): a player's received input (r4) whenever its
   // first 0x60 bytes change, the non-zero words shown: which field is which.
@@ -3545,3 +3862,87 @@ PPC_FUNC(sub_822757E8) {
   }
   __imp__sub_822757E8(ctx, base);
 }
+
+// BF_BOT_SEAT_TRACE=1 (testing): how a player gets into a vehicle's seat. The
+// server seat class's own virtual functions (ServerPlayerEntryComponent,
+// vtable 82011298), the first 6 calls of each with r3-r7 (a pointer's class),
+// and every 0.5 s the seats whose occupant (+D0) changed, with the seat's owner.
+static const bool g_seat_trace = getenv("BF_BOT_SEAT_TRACE") != nullptr;
+#define SEAT_TRACE(addr)                                                                                      \
+  extern "C" PPC_FUNC(__imp__sub_##addr);                                                                     \
+  PPC_FUNC(sub_##addr) {                                                                                      \
+    static int n = 0;                                                                                         \
+    if (g_seat_trace && Ptr(ctx.r3.u32) && Ld32(ctx.r3.u32) == 0x82011298 && n++ < 6)                         \
+      RT_INFO("bot seat trace: %s(%s %s %s %s %s)", #addr, ArmArg(ctx.r3.u32).c_str(), ArmArg(ctx.r4.u32).c_str(), \
+              ArmArg(ctx.r5.u32).c_str(), ArmArg(ctx.r6.u32).c_str(), ArmArg(ctx.r7.u32).c_str());           \
+    __imp__sub_##addr(ctx, base);                                                                             \
+  }
+SEAT_TRACE(822A5410)
+SEAT_TRACE(822B7D68)
+SEAT_TRACE(82266C30)
+SEAT_TRACE(823DBA18)
+SEAT_TRACE(82266C68)
+SEAT_TRACE(82671430)
+SEAT_TRACE(82267978)
+SEAT_TRACE(8226CFC8)
+SEAT_TRACE(822677A0)
+SEAT_TRACE(82670E28)
+SEAT_TRACE(822677F8)
+SEAT_TRACE(82670E68)
+SEAT_TRACE(8226AB60)
+SEAT_TRACE(82294580)
+static const bool g_seat_watch_started = [] {
+  if (!g_seat_trace) return false;
+  std::thread([] {
+    std::map<uint32_t, uint32_t> occupant;
+    bool watching = false;
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      // The first seat to get an occupant (a soldier's own, at the deploy):
+      // who writes its +D0 next (the occupant leaving it for a vehicle).
+      if (!watching && getenv("BF_BOT_SEAT_WATCH"))
+        for (auto& [e, o] : occupant)
+          if (o && Ld32(e + 0xD0) == o && Scan(0x820118D0).size() > 0) {
+            watching = true;
+            RT_INFO("bot seat trace: watching seat %08X +D0 (occupant %08X)", e, o);
+            StartWriteWatch(e + 0xD0, 4, 0);
+            break;
+          }
+      for (uint32_t e : Scan(0x82011298)) {
+        uint32_t o = Ld32(e + 0xD0);
+        auto it = occupant.find(e);
+        if (it != occupant.end() && it->second != o) {
+          std::string owner;
+          for (uint32_t k = 4; k < 0x100; k += 4) {
+            std::string n = TypeName(Ld32(e + k));
+            if (n.find("Vehicle") != std::string::npos || n.find("Soldier") != std::string::npos) owner += " +" + std::to_string(k) + ":" + n;
+          }
+          RT_INFO("bot seat trace: seat %08X occupant %08X -> %08X (%s); seat's links:%s", e, it->second, o, TypeName(o).c_str(),
+                  owner.c_str());
+        }
+        occupant[e] = o;
+      }
+    }
+  }).detach();
+  return true;
+}();
+// The enter and exit paths (BF_BOT_SEAT_WATCH on the host pressing B at a
+// gun: a seat's occupant +D0 written by 82294638 < 823369A8 < 823458B0 <
+// 82345AD0, the client message dispatcher; leaving by 82336778 < 8233E898):
+// their arguments, a pointer's class and the words it holds.
+#define SEAT_CALL_TRACE(addr)                                                                                       \
+  extern "C" PPC_FUNC(__imp__sub_##addr);                                                                           \
+  PPC_FUNC(sub_##addr) {                                                                                            \
+    static int n = 0;                                                                                               \
+    bool log = g_seat_trace && n++ < 8;                                                                             \
+    std::string args;                                                                                               \
+    if (log)                                                                                                        \
+      args = ArmArg(ctx.r3.u32) + " " + ArmArg(ctx.r4.u32) + " " + ArmArg(ctx.r5.u32) + " " + ArmArg(ctx.r6.u32) +   \
+             " " + ArmArg(ctx.r7.u32) + " | r4:" + DamageWords(ctx.r4.u32) + " | r5:" + DamageWords(ctx.r5.u32);     \
+    __imp__sub_##addr(ctx, base);                                                                                   \
+    if (log) RT_INFO("bot seat trace: %s(%s) -> %08X", #addr, args.substr(0, 1200).c_str(), ctx.r3.u32);           \
+  }
+SEAT_CALL_TRACE(823458B0)
+SEAT_CALL_TRACE(823369A8)
+SEAT_CALL_TRACE(82336778)
+SEAT_CALL_TRACE(8233E898)
