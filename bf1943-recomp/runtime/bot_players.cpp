@@ -105,17 +105,39 @@ constexpr uint32_t kNetPlayer = 0x8201C6C8;       // a player's network object: 
 // The level's soldier kits (SoldierEntityData, 8205AD34: its name at +C,
 // Infantry, Rifleman, Scout) per team, told apart by the weapon assets they
 // lead to (an object they point at names them: Japan's jap_..., k98, nambu).
+struct Kit {
+  uint32_t soldier = 0, weapon = 0;  // SoldierEntityData (+1F4) and its first weapon's data (+1F8)
+  std::string name;
+};
 struct Kits {
-  std::vector<std::pair<uint32_t, std::string>> team[3];  // [1] US, [2] Japan
+  std::vector<Kit> team[3];  // [1] US, [2] Japan
 };
 bool LeadsToJapanese(uint32_t kit);
 std::vector<uint32_t> Scan(uint32_t vtable);
+// A spawn object's +1F8 is its kit's first weapon (a real player's: US
+// Infantry and Thompson): a weapon the kit doesn't carry crashed the soldier's
+// making (8285BC80, its animations). The weapons by name (SoldierWeaponData,
+// 8205F284, the name at +C).
 Kits FindKits() {
+  static const struct { int team; const char* kit; const char* weapon; } kFirst[] = {
+      {1, "Infantry", "Thompson"}, {1, "Rifleman", "Garand"}, {1, "Scout", "m1903"},
+      {2, "Infantry", "Nambu100"}, {2, "Rifleman", "Type5"}, {2, "Scout", "K98"}};
+  std::map<std::string, uint32_t> weapons;
+  for (uint32_t o : Scan(0x8205F284)) {
+    uint32_t name = Ld32(o + 0xC);
+    if (name >= 0x40000000 && name < 0xC0000000 && IsCommitted(name))
+      weapons[std::string(G<char>(name), strnlen(G<char>(name), 32))] = o;
+  }
   Kits k;
   for (uint32_t o : Scan(0x8205AD34)) {
     uint32_t name = Ld32(o + 0xC);
     if (name < 0x40000000 || name >= 0xC0000000 || !IsCommitted(name)) continue;
-    k.team[LeadsToJapanese(o) ? 2 : 1].push_back({o, std::string(G<char>(name), strnlen(G<char>(name), 24))});
+    Kit kit;
+    kit.soldier = o, kit.name = std::string(G<char>(name), strnlen(G<char>(name), 24));
+    int team = LeadsToJapanese(o) ? 2 : 1;
+    for (auto& f : kFirst)
+      if (f.team == team && kit.name == f.kit && weapons.count(f.weapon)) kit.weapon = weapons[f.weapon];
+    if (kit.weapon) k.team[team].push_back(kit);  // (none known: not used)
   }
   return k;
 }
@@ -567,7 +589,16 @@ GAME_PATCH(8237EE38) {  // the spawn object's constructor (Bad Company's 8232ECB
 // game picks one of the team's).
 extern "C" PPC_FUNC(__imp__sub_82382720);
 extern "C" PPC_FUNC(__imp__sub_823B2C80);
-PPC_FUNC(sub_8275D2F8);
+// A bot player's move being handled (its own id, and the soldier or vehicle
+// it names): 8275D2F8(table, id) -> that entity + 80 for it.
+thread_local uint32_t t_move_id = 0, t_move_entity = 0;
+GAME_PATCH(8275D2F8) {
+  if (t_move_id && (ctx.r4.u32 & 0xFFFF) == t_move_id) {
+    ctx.r3.u64 = t_move_entity + 80;
+    return;
+  }
+  __imp__sub_8275D2F8(ctx, base);
+}
 // A move record names the entity it moves by its network id (+9C; 823B2C80
 // reads it with 8251A288), looked up per connection: 8275D2F8(*(receiver),
 // id) -> the entity + 80. A bot's own connection never gets its soldier (no
@@ -592,8 +623,10 @@ uint32_t GhostId(PPCContext& ctx, uint8_t* base, uint32_t table, uint32_t entity
   }
   return 0;
 }
+void ApplyHits(PPCContext& ctx, uint8_t* base);  // (below: the bot players' hits)
 GAME_PATCH(82414430) {
   __imp__sub_82414430(ctx, base);
+  ApplyHits(ctx, base);
   // BF_BOT_TICK_TRACE: server updates a second (every 5 s).
   if (getenv("BF_BOT_TICK_TRACE")) {
     static int n = 0;
@@ -641,6 +674,7 @@ GAME_PATCH(82414430) {
   if (drive && g_have_template)
     for (BotPlayer& b : g_players) {
       if (!b.soldier || Ld32(b.soldier) != kSoldier) continue;
+      if (LdF(b.soldier + 0x3C) <= 0) continue;  // dead (a hit this update): no moves for it
       if (!b.mover) {
         // Its network object's +2FC (made with the join).
         if (uint32_t np = FindNetPlayer(b.conn)) b.mover = Ld32(np + 0x2FC);
@@ -661,43 +695,24 @@ GAME_PATCH(82414430) {
         if (!b.mover) continue;
       }
       if (!b.move_msg) b.move_msg = g_system_heap->Alloc(0x100, 16);
-      if (b.ghost_for != b.soldier) {
-        uint32_t table = HostTable();
-        b.ghost_id = table ? GhostId(ctx, base, table, b.soldier) : 0;
-        b.ghost_for = b.soldier;
-        RT_INFO("bot %d: soldier %08X is network id %X in the host's table %08X", b.index, b.soldier, b.ghost_id, table);
-        if (b.ghost_id) St32(b.mover, table);  // look it up there
-      }
-      if (!b.ghost_id) continue;
+      // The ids its moves name (+9C): its own, not in any table. The move
+      // handler looks them up (8275D2F8), answered with its soldier or vehicle
+      // by the hook below while it handles them. (The host's own client's table,
+      // where the soldier's id was found before, changes on another thread:
+      // looking ids up in it crashed the server now and then.)
+      b.ghost_id = 0xFE00 + 2 * uint32_t(b.index), b.ghost_for = b.soldier;
+      b.vehicle_id = b.ghost_id + 1;
       bool seated = (Ld32(b.soldier + 0x34C) >> 24) == 0;
+      if (b.vehicle && (!IsCommitted(b.vehicle + 0x100) || Ld32(b.vehicle) != 0x82013068)) {
+        RT_INFO("bot %d: its vehicle %08X is gone", b.index, b.vehicle);
+        b.vehicle = 0;
+      }
       if (seated && b.vehicle && b.vehicle_id_for != b.vehicle) {
-        uint32_t table = HostTable();
-        b.vehicle_id = table && IsCommitted(b.vehicle) && Ld32(b.vehicle) == 0x82013068 ? GhostId(ctx, base, table, b.vehicle) : 0;
         b.vehicle_id_for = b.vehicle;
-        RT_INFO("bot %d: in vehicle %08X, network id %X", b.index, b.vehicle, b.vehicle_id);
+        RT_INFO("bot %d: in vehicle %08X", b.index, b.vehicle);
       }
-      // BF_BOT_VEH_TRACE: every 2 s, the soldier's place and float triples in
-      // its vehicle (and what +78 points at) within 60 m of it: where the
-      // vehicle keeps its own.
-      if (getenv("BF_BOT_VEH_TRACE") && seated && b.vehicle && IsCommitted(b.vehicle + 0x800)) {
-        static int64_t nx = 0;
-        if (now >= nx) {
-          nx = now + 2000;
-          float sx = LdF(b.soldier + 0x180), sy = LdF(b.soldier + 0x184), sz = LdF(b.soldier + 0x188);
-          std::string o;
-          char buf[64];
-          uint32_t phys = Ld32(b.vehicle + 0x78);
-          for (uint32_t obj : {b.vehicle, IsCommitted(phys + 0x400) ? phys : 0u})
-            for (uint32_t k = 0; obj && k < 0x800; k += 4) {
-              float x = LdF(obj + k), y = LdF(obj + k + 4), z = LdF(obj + k + 8);
-              if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::fabs(x - sx) < 60 &&
-                  std::fabs(y - sy) < 60 && std::fabs(z - sz) < 60 && std::fabs(x) > 1 && std::fabs(z) > 1)
-                snprintf(buf, sizeof(buf), " %s+%X(%.0f %.0f %.0f)", obj == b.vehicle ? "v" : "p", k, x, y, z), o += buf;
-            }
-          RT_INFO("bot %d: soldier at %.0f %.0f %.0f; vehicle:%s", b.index, sx, sy, sz, o.substr(0, 600).c_str());
-        }
-      }
-      bool in_vehicle = seated && b.vehicle && b.vehicle_id && !getenv("BF_BOT_SEATED_SOLDIER_ID");
+      bool in_vehicle = seated && b.vehicle && !getenv("BF_BOT_SEATED_SOLDIER_ID");
+      t_move_entity = in_vehicle ? b.vehicle : b.soldier;
       memcpy(G<uint8_t>(b.move_msg), g_move_template, sizeof(g_move_template));
       St32(b.move_msg + 4, ++b.move_seq);
       float fwd = 0.8f;
@@ -705,6 +720,7 @@ GAME_PATCH(82414430) {
       memcpy(&u, &fwd, 4);
       St32(b.move_msg + 0x10 + 8, u);
       St32(b.move_msg + 0x10 + 0x9C, in_vehicle ? b.vehicle_id : b.ghost_id);
+      t_move_id = in_vehicle ? b.vehicle_id : b.ghost_id;
       if (b.aim_set) {
         auto putf = [](uint32_t a, float v) {
           uint32_t w;
@@ -829,6 +845,9 @@ GAME_PATCH(82414430) {
       c.r5.u64 = 1;
       c.r6.u64 = 0;
       __imp__sub_823B2C80(c, base);
+      struct ClearMove {
+        ~ClearMove() { t_move_id = 0, t_move_entity = 0; }
+      } clear_move;
       // A move a tick (the server moves a soldier on foot a step per move;
       // BF_BOT_PUMP=n: n a tick). (Three made up for a server held to 18
       // frames a second, gpu.cpp's background cap, now off without a window.)
@@ -939,28 +958,45 @@ GAME_PATCH(82414430) {
     St32(b.spawner + 0x30, b.team);
     // Mixed kits (as Bad Company's bots): its team's kits in turn by bot (and
     // life), unless BF_BOT_SAME_KIT=1 (the borrowed one, as before).
-    uint32_t my_kit = kit;
+    uint32_t my_kit = kit, my_weapon = kit2;
     static Kits kits;
     static int64_t kits_at = 0;
     if (!getenv("BF_BOT_SAME_KIT") && b.team >= 1 && b.team <= 2) {
       auto& list = kits.team[b.team];
       bool stale = list.empty();
-      for (auto& [o, n] : list) stale |= !IsCommitted(o + 0x100) || Ld32(o) != 0x8205AD34;
+      for (auto& k : list) stale |= !IsCommitted(k.soldier + 0x100) || Ld32(k.soldier) != 0x8205AD34;
       if (stale && now - kits_at > 5000) {
         kits_at = now, kits = FindKits();
         std::string us, jp;
-        for (auto& [o, n] : kits.team[1]) us += " " + n;
-        for (auto& [o, n] : kits.team[2]) jp += " " + n;
+        for (auto& k : kits.team[1]) us += " " + k.name;
+        for (auto& k : kits.team[2]) jp += " " + k.name;
         RT_INFO("bot players: kits: US%s; Japan%s", us.c_str(), jp.c_str());
       }
       if (!list.empty()) {
         ++b.lives;
         auto& pick = list[size_t(b.index + b.lives) % list.size()];
-        my_kit = pick.first;
-        RT_INFO("bot %d: kit %s", b.index, pick.second.c_str());
+        my_kit = pick.soldier, my_weapon = pick.weapon;
+        RT_INFO("bot %d: kit %s", b.index, pick.name.c_str());
       }
     }
-    St32(b.spawner + 0x1F4, my_kit), St32(b.spawner + 0x1F8, kit2);
+    St32(b.spawner + 0x1F4, my_kit), St32(b.spawner + 0x1F8, my_weapon);
+    // Its spawn object's list at +218..+21C (begin, end): deploying goes
+    // through it (82348640 reads each entry's object). After a bot died in a
+    // vehicle an entry pointed into freed memory and the deploy crashed: such
+    // entries are taken out first.
+    {
+      uint32_t lo = Ld32(b.spawner + 0x218), hi = Ld32(b.spawner + 0x21C), out = lo;
+      if (lo && hi > lo && hi - lo < 0x400 && IsCommitted(lo) && IsCommitted(hi - 4)) {
+        for (uint32_t e = lo; e < hi; e += 4) {
+          uint32_t q = Ld32(e);
+          bool live = q >= 0x40000000 && q < 0xC0000000 && IsCommitted(q) && IsCommitted(q + 0x10) &&
+                      Ld32(q) >= 0x82000000 && Ld32(q) < 0x82E00000;
+          if (live) St32(out, q), out += 4;
+          else RT_WARN("bot %d: its spawn object's list had a dead entry %08X: taken out", b.index, q);
+        }
+        if (out != hi) St32(b.spawner + 0x21C, out);
+      }
+    }
     std::vector<uint32_t> before = Scan(kSoldier);
     PPCContext c = ctx;
     c.r3.u64 = b.spawner;
@@ -1511,6 +1547,12 @@ GAME_PATCH(822C1818) {
 }
 
 extern "C" PPC_FUNC(__imp__sub_823194B0);
+struct Hit {
+  uint32_t soldier, spawner;
+  int bot;
+  float dist, at[3], dir[3], from[3];
+};
+std::vector<Hit> g_hits;  // the bot players' hits waiting for the end of the server's update
 // Every soldier stepped lately (on foot: a seated one isn't), with when.
 std::map<uint32_t, int64_t> g_seen_soldiers;
 
@@ -1562,24 +1604,43 @@ void BotShoot(PPCContext& ctx, uint8_t* base, BotPlayer& b, int64_t now) {
     for (int i = 0; i < 3; ++i) hit[i] = o[i] + along * dir[i];
   }
   if (!best) return;
+  // Applied after the server's update (ApplyHits), not here in a soldier's
+  // step: a kill there took a soldier away while the game went through them,
+  // and the server crashed somewhere later.
+  Hit h{best, b.spawner, b.index, best_t};
+  for (int i = 0; i < 3; ++i) h.at[i] = hit[i], h.dir[i] = dir[i], h.from[i] = o[i];
+  g_hits.push_back(h);
+}
+
+// The bot players' hits of this update, through the server's damage.
+void ApplyHits(PPCContext& ctx, uint8_t* base) {
+  if (g_hits.empty()) return;
   static uint32_t record = 0, giver = 0;
   if (!record) record = g_system_heap->Alloc(0x100, 16), giver = g_system_heap->Alloc(0x10, 16);
-  memset(G<uint8_t>(record), 0, 0x100);
   auto put = [](uint32_t a, float v) {
     uint32_t u;
     memcpy(&u, &v, 4);
     St32(a, u);
   };
-  for (int i = 0; i < 3; ++i) put(record + 4 * i, hit[i]), put(record + 0x10 + 4 * i, dir[i]), put(record + 0x20 + 4 * i, o[i]);
-  put(record + 0x38, 20.0f);  // (a rifle's, as a real player's hits)
-  St32(giver, giver + 4), St32(giver + 4, b.spawner + 0xDC);
-  float before = LdF(best + 0x3C);
-  PPCContext c = ctx;
-  c.r3.u64 = best, c.r4.u64 = record, c.r5.u64 = giver;
-  __imp__sub_823194B0(c, base);
   static const bool trace = getenv("BF_BOT_SHOT_TRACE") != nullptr;
-  if (trace)
-    RT_INFO("bot %d: hit soldier %08X at %.0f m, health %.0f -> %.0f", b.index, best, best_t, before, LdF(best + 0x3C));
+  std::vector<Hit> hits;
+  hits.swap(g_hits);
+  for (const Hit& h : hits) {
+    // (still there and alive: it may have died or gone since)
+    if (!IsCommitted(h.soldier + 0x400) || Ld32(h.soldier) != kSoldier || LdF(h.soldier + 0x3C) <= 0) continue;
+    memset(G<uint8_t>(record), 0, 0x100);
+    for (int i = 0; i < 3; ++i)
+      put(record + 4 * i, h.at[i]), put(record + 0x10 + 4 * i, h.dir[i]), put(record + 0x20 + 4 * i, h.from[i]);
+    put(record + 0x38, 20.0f);  // (a rifle's, as a real player's hits)
+    St32(giver, giver + 4), St32(giver + 4, h.spawner + 0xDC);
+    float before = LdF(h.soldier + 0x3C);
+    PPCContext c = ctx;
+    c.r3.u64 = h.soldier, c.r4.u64 = record, c.r5.u64 = giver;
+    __imp__sub_823194B0(c, base);
+    if (trace)
+      RT_INFO("bot %d: hit soldier %08X at %.0f m, health %.0f -> %.0f", h.bot, h.soldier, h.dist, before,
+              LdF(h.soldier + 0x3C));
+  }
 }
 
 GAME_PATCH(822F05C8) {
