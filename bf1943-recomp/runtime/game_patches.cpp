@@ -121,7 +121,6 @@ GAME_PATCH(82413BC0) {
   __imp__sub_82413BC0(ctx, base);
   // Online (--online-server): list it on Arcadia so Quick Match finds it.
   if (multiplayer) RegisterHostedGame(uint16_t(1003 + g_port_offset), g_host_map);
-  if (multiplayer && g_lan_host && !g_port_offset) LaunchBots();  // --bots: join this server
 }
 
 // UI callback dispatch (ActionScript fscommand): r3 = UI manager, r4 = callback
@@ -134,7 +133,7 @@ GAME_PATCH(82413BC0) {
 static uint32_t g_ui_manager;
 static std::atomic<int> g_dialogs{-1};
 bool rt::CustomMenus() {
-  // Not in the windowless bot copies; BF_STOCK_MENUS keeps the game's.
+  // Not without a window (a dedicated server); BF_STOCK_MENUS keeps the game's.
   static const bool stock = std::getenv("BF_STOCK_MENUS") != nullptr;
   return !stock && g_present;
 }

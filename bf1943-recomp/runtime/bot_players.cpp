@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "bot_knowledge.h"
 #include "bot_players.h"
 #include "guest.h"
 #include "kernel.h"
@@ -274,13 +275,10 @@ uint8_t g_move_template[0x100];
 bool g_have_template = false;
 uint32_t g_real_mover = 0;  // a real player's move receiver (to clone for the bots)
 std::deque<BotPlayer> g_players;
-// How many bot players: --bots N (BF_BOT_COPIES=1: none, the bots are copies
-// of the game joining as clients instead, main.cpp), or BF_BOT_FAKE=N.
-// Read once the arguments are (the first join).
+// How many bot players: --bots N, or BF_BOT_FAKE=N. Read once the arguments
+// are (the first join).
 int FakeCount() {
-  static const int n = getenv("BF_BOT_FAKE")     ? std::clamp(atoi(getenv("BF_BOT_FAKE")), 1, 31)
-                       : getenv("BF_BOT_COPIES") ? 0
-                                                 : std::clamp(g_bot_count, 0, 31);
+  static const int n = getenv("BF_BOT_FAKE") ? std::clamp(atoi(getenv("BF_BOT_FAKE")), 1, 31) : std::clamp(g_bot_count, 0, 31);
   return n;
 }
 #define g_fake_count FakeCount()
@@ -398,7 +396,7 @@ GAME_PATCH(823B59E0) {  // the player manager's join
               b.conn, b.spawner);
     }
     memcpy(G<uint8_t>(ctx.r5.u32), snap.data(), snap.size());
-    StartBotDirector(0);  // the brain drives them (bots.cpp), as the bot copies
+    StartBotDirector();  // the brain drives them (bots.cpp)
   }
   __imp__sub_823B59E0(ctx, base);
 }
@@ -1715,6 +1713,7 @@ void BotShoot(PPCContext& ctx, uint8_t* base, BotPlayer& b, int64_t now) {
 }
 
 // The bot players' hits of this update, through the server's damage.
+PPC_FUNC(sub_823194B0);  // (the damage hook below)
 void ApplyHits(PPCContext& ctx, uint8_t* base) {
   if (g_hits.empty()) return;
   static uint32_t record = 0, giver = 0;
@@ -1738,7 +1737,7 @@ void ApplyHits(PPCContext& ctx, uint8_t* base) {
     float before = LdF(h.soldier + 0x3C);
     PPCContext c = ctx;
     c.r3.u64 = h.soldier, c.r4.u64 = record, c.r5.u64 = giver;
-    __imp__sub_823194B0(c, base);
+    sub_823194B0(c, base);  // (through the hook: a kill is learned from)
     if (trace)
       RT_INFO("bot %d: hit soldier %08X at %.0f m, health %.0f -> %.0f", h.bot, h.soldier, h.dist, before,
               LdF(h.soldier + 0x3C));
@@ -1821,6 +1820,32 @@ GAME_PATCH(82308978) {
 
 GAME_PATCH(823194B0) {  // damage a soldier
   Note("damage", g_damages, ctx);
+  // Learning (bot_knowledge.h): a kill, where the soldier died and where its
+  // killer stood (the giver: a word pointing at its spawn object + DC, whose
+  // +120 is its soldier). A real player's counts fully, a bot's a little.
+  uint32_t victim = ctx.r3.u32, giver_w = ctx.r5.u32;
+  float hp_before = IsCommitted(victim + 0x400) && Ld32(victim) == kSoldier ? LdF(victim + 0x3C) : 0;
+  struct NoteKill {
+    uint32_t victim, giver_w;
+    float before;
+    ~NoteKill() {
+      if (before <= 0 || LdF(victim + 0x3C) > 0) return;
+      auto is_bot = [](uint32_t so) {
+        for (const BotPlayer& b : g_players)
+          if (b.soldier == so) return true;
+        return false;
+      };
+      knowledge::Add(knowledge::kDeaths, int(Ld32(victim + 0x48)), LdF(victim + 0x180), LdF(victim + 0x188),
+                     is_bot(victim) ? 0.3f : 1.0f);
+      uint32_t w1 = IsCommitted(giver_w) ? Ld32(giver_w) : 0, w2 = IsCommitted(w1) ? Ld32(w1) : 0;
+      uint32_t sp = w2 >= 0xDC ? w2 - 0xDC : 0;
+      if (!IsCommitted(sp + 0x200) || Ld32(sp) != kSpawnObject) return;
+      uint32_t killer = Ld32(sp + 0x120);
+      if (!IsCommitted(killer + 0x400) || Ld32(killer) != kSoldier || killer == victim) return;
+      knowledge::Add(knowledge::kKills, int(Ld32(killer + 0x48)), LdF(killer + 0x180), LdF(killer + 0x188),
+                     is_bot(killer) ? 0.3f : 1.0f);
+    }
+  } note_kill{victim, giver_w, hp_before};
   // BF_BOT_DAMAGE_TRACE: each call: the soldier (vt), the record's first
   // words, the giver and what it points at, and the soldier's words that
   // changed (its health).

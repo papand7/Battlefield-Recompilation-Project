@@ -97,3 +97,6 @@ add_custom_command(TARGET bf1943 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ROOT}/data/pbr_shaders.txt $<TARGET_FILE_DIR:bf1943>/pbr_shaders.txt)
 add_custom_command(TARGET bf1943 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${ROOT}/data/fonts $<TARGET_FILE_DIR:bf1943>/fonts)
+# What the bots learned of each map (runtime/bot_knowledge.h, tools/bot_knowledge.py).
+add_custom_command(TARGET bf1943 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory ${ROOT}/data/bot_knowledge $<TARGET_FILE_DIR:bf1943>/bot_knowledge)

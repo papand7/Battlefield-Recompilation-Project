@@ -112,87 +112,11 @@ static void ParsePresses(const std::string& spec) {
   }
 }
 
-// --bots N: once the --host game's server exists, start N more copies of this
-// program that join it as players: no window and no GPU emulation (--toy-gpu
-// --headless), each with its own ports (--port-offset) and user folder. A
-// client always connects to 127.0.0.1:1003, the host's server, since only
-// bound ports are offset. The job object closes them with the host.
+// --bots N: N bot players on the host's own server (bot_players.cpp).
 int rt::g_bot_count = 0;
 bool rt::g_no_audio = false;  // --no-audio (the Linux server decodes XMA too; it has no sound device)
-static std::vector<std::string> g_argv;
-void rt::LaunchBots() {
-  static bool launched = false;
-  if (launched || !g_bot_count) return;
-  launched = true;
-  // The bots are players on this server (bot_players.cpp); BF_BOT_COPIES=1:
-  // copies of the game joining it, as before.
-  if (!getenv("BF_BOT_COPIES")) return;
-#ifndef _WIN32
-  // Linux: fork + exec of this program; each bot ends with the server
-  // (PR_SET_PDEATHSIG), its output in <user>_botN/bot.log.
-  std::string ai = StartBotDirector(g_bot_count);
-  for (int i = 1; i <= g_bot_count; ++i) {
-    std::filesystem::path user = g_user_root.string() + "_bot" + std::to_string(i);
-    std::filesystem::create_directories(user);
-    std::vector<std::string> args = {g_argv[0], "--game", g_game_root.string(), "--user", user.string(), "--host",
-                                     "--toy-gpu", "--headless", "--port-offset", std::to_string(10 * i),
-                                     "--host-map", g_host_map, "--gamertag", "Bot" + std::to_string(i)};
-    if (!ai.empty()) {
-      args.insert(args.end(), {"--bot-ai", ai, "--bot-slot", std::to_string(i - 1)});
-    }
-    std::vector<char*> argv_c;
-    for (std::string& a : args) argv_c.push_back(a.data());
-    argv_c.push_back(nullptr);
-    std::string log = (user / "bot.log").string();
-    pid_t pid = fork();
-    if (pid == 0) {
-      prctl(PR_SET_PDEATHSIG, SIGTERM);
-      int fd = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-      if (fd >= 0) dup2(fd, 1), dup2(fd, 2);
-      execv("/proc/self/exe", argv_c.data());
-      _exit(127);
-    }
-    if (pid > 0) RT_INFO("bots: started bot %d (log %s)", i, log.c_str());
-    else RT_WARN("bots: could not start bot %d", i);
-  }
-}
-#else
-  std::string ai = StartBotDirector(g_bot_count);
-  HANDLE job = CreateJobObjectW(nullptr, nullptr);
-  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-  SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
-  for (int i = 1; i <= g_bot_count; ++i) {
-    std::filesystem::path user = g_user_root.string() + "_bot" + std::to_string(i);
-    std::filesystem::create_directories(user);
-    std::string cmd = "\"" + g_argv[0] + "\" --game \"" + g_game_root.string() + "\" --user \"" + user.string() +
-                      "\" --host --toy-gpu --headless --port-offset " + std::to_string(10 * i) + " --host-map " +
-                      g_host_map + " --gamertag Bot" + std::to_string(i) +
-                      (ai.empty() ? "" : " --bot-ai " + ai + " --bot-slot " + std::to_string(i - 1));
-    std::filesystem::path log = user / "bot.log";
-    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-    HANDLE out = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, 0, nullptr);
-    STARTUPINFOA si{sizeof(si)};
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = si.hStdError = out;
-    PROCESS_INFORMATION pi{};
-    if (CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
-                       nullptr, &si, &pi)) {
-      AssignProcessToJobObject(job, pi.hProcess);
-      ResumeThread(pi.hThread);
-      ::CloseHandle(pi.hThread);
-      ::CloseHandle(pi.hProcess);
-      RT_INFO("bots: started bot %d (log %s)", i, log.string().c_str());
-    } else {
-      RT_WARN("bots: could not start bot %d (%lu)", i, GetLastError());
-    }
-    ::CloseHandle(out);
-  }
-}
-#endif
 
 int main(int argc, char** argv) {
-  g_argv.assign(argv, argv + argc);
   std::filesystem::path exe_dir = std::filesystem::path(argv[0]).parent_path();
   g_game_root = "original/v106";
   g_user_root = "userdata";
@@ -204,8 +128,6 @@ int main(int argc, char** argv) {
   // shadows falling there vanish (which half a receiver lands in moves with
   // the shadow distance).
   int shadowmap = 1600;
-  std::string bot_ai;  // --bot-ai <shared memory> --bot-slot N: this is a bot, driven by the host's AI
-  int bot_slot = -1;
   uint32_t texture_mb = 0;
   std::string shader_dump;  // --dump-shaders <dir>
   int res_scale = 2, present_effect = 2, window_w = 0, window_h = 0;  // --res-scale, --sharpen, --window
@@ -301,8 +223,6 @@ int main(int argc, char** argv) {
     else if (a == "--worldrender" && i + 1 < argc) g_worldrender = argv[++i];
     else if (a == "--overgrowth" && i + 1 < argc) g_overgrowth = argv[++i];
     else if (a == "--lod" && i + 1 < argc) g_lod = float(atof(argv[++i]));
-    else if (a == "--bot-ai" && i + 1 < argc) bot_ai = argv[++i];
-    else if (a == "--bot-slot" && i + 1 < argc) bot_slot = atoi(argv[++i]);
     else if (a == "--watch-write" && i + 1 < argc) {  // DEBUG: addr,size,seconds
       uint32_t addr = 0, size = 4;
       double at = 0;
@@ -377,8 +297,7 @@ int main(int argc, char** argv) {
   if (shadowmap) shadowmap = std::max(80, shadowmap / 80 * 80);  // whole EDRAM tiles
   xgpu::SetDisplayOptions(res_scale, present_effect, window_w, window_h, shadowmap ? shadowmap : 1024);
   g_shadow_size = uint32_t(shadowmap);
-  if (!bot_ai.empty() && bot_slot >= 0) SetBotSlot(bot_ai, bot_slot);
-  g_auto_start = g_dedicated || bot_slot >= 0;
+  g_auto_start = g_dedicated;
   if (!join_address.empty() && !rt::lan::PrepareJoin(join_address, g_host_map.empty() ? "Wake_island_s" : g_host_map))
     RT_WARN("--join: not an IPv4 address: %s", join_address.c_str());
   if (g_dedicated) {

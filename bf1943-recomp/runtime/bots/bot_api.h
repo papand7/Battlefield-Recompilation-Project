@@ -10,7 +10,7 @@
 
 namespace botapi {
 
-constexpr int kVersion = 5;      // bump when a struct here changes
+constexpr int kVersion = 6;      // bump when a struct here changes
 constexpr int kMaxBots = 16;
 constexpr int kMemSize = 1024;   // per-bot brain state
 constexpr float kPi = 3.14159265f;
@@ -68,6 +68,10 @@ struct World {
   bool (*sight)(Vec a, Vec b);
   // The terrain's height there (-1e9 off it or not known yet). Null without it.
   float (*ground)(float x, float z);
+  // What the matches on this map showed (bot_knowledge.h): the sum within
+  // radius of `at` of what (0 where players of that team went, 1 where they
+  // died, 2 where they killed from). Null without it.
+  float (*learned)(int what, int team, Vec at, float radius);
 };
 
 using ThinkFn = void (*)(World*);

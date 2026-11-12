@@ -110,7 +110,7 @@ bool CustomMenus();
 // --dedicated: a console server (no window, GPU or menus) that hosts
 // g_host_map, then each map of --maps in turn when a round ends.
 extern bool g_dedicated;
-extern bool g_auto_start;  // main.cpp: dedicated server or bot copy: Start, dialogs and loading screen pressed by xam.cpp
+extern bool g_auto_start;  // main.cpp: dedicated server: Start, dialogs and loading screen pressed by xam.cpp
 extern std::vector<std::string> g_map_rotation;
 int GameDialogs();
 extern double g_test_mouse_at;     // --test-mouse <s>
@@ -119,9 +119,7 @@ float MouseLookAxis(int axis);
 void InstallPcUi();                // pc_ui.cpp: PC key icons in the UI atlases
 void PatchPcText(uint8_t* data, size_t size);  // pc_ui.cpp: PC wording in the string tables
 extern int g_bot_count;              // --bots N: extra clients that join the --host game
-void LaunchBots();                    // main.cpp
-std::string StartBotDirector(int count);  // bots.cpp: host side AI; returns the shared memory name
-void SetBotSlot(const std::string& shared_name, int slot);  // bots.cpp: bot process side
+void StartBotDirector();               // bots.cpp: the bot players' AI (bot_players.cpp starts it)
 extern bool g_lan_host;            // --host: local game over real UDP (LAN server)
 extern std::string g_host_map;     // --host-map: level hosted from the main menu
 extern uint32_t g_join_address;    // lan.cpp: the joined host (network order, 0 none)

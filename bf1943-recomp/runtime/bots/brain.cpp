@@ -68,6 +68,11 @@ struct Bot {
   float boat_heading = 0, boat_travel = 0;
   bool ride_land = false;  // a jeep or tank (or a plane) rather than a landing craft
   bool ride_air = false;   // a plane
+  double spot_t = -100;       // when the learned spot at its flag was last chosen (LearnedSpot)
+  int spot_point = -1;
+  float threat_yaw = 0;       // where enemies usually come from around here (Threat), and when
+  double threat_t = -100;
+  bool threat = false;
   uint32_t seen_enemy = 0;  // the last enemy in sight, and until when it counts
   double seen_until = 0;
   float fly_last_y = 0;
@@ -230,6 +235,43 @@ struct Brain {
         best = score, out = c;
       }
     return best < 1e9f;
+  }
+
+  // ---- what the matches on this map showed (World::learned) ----
+  // A spot to hold at a flag: of points 6 to 20 m around it, the one its team
+  // killed from most and died at least (kills - 1.5 deaths, within 6 m), with
+  // at least 3 of either there. False without one (or without knowledge).
+  bool LearnedSpot(Vec flag, int team, Vec& offset) {
+    if (!w.learned) return false;
+    float best = 0;
+    bool found = false;
+    for (float r : {6.0f, 12.0f, 20.0f})
+      for (int k = 0; k < 8; ++k) {
+        float a = k * 0.785f;
+        Vec p{flag.x + r * std::sin(a), flag.y, flag.z + r * std::cos(a)};
+        float kills = w.learned(2, team, p, 6.0f), deaths = w.learned(1, team, p, 6.0f);
+        if (kills + deaths < 3.0f) continue;
+        float score = kills - 1.5f * deaths;
+        if (score > best) best = score, found = true, offset = {p.x - flag.x, 0, p.z - flag.z};
+      }
+    return found;
+  }
+  // Where enemies usually come from around here: of 12 ways, the one with the
+  // most enemy players gone through and killed from 15 to 50 m off. False
+  // when there is too little to go by.
+  bool Threat(Vec at, int team, float& yaw) {
+    if (!w.learned) return false;
+    int enemy = 3 - team;
+    float best = 0;
+    for (int k = 0; k < 12; ++k) {
+      float a = k * 0.5236f, score = 0;
+      for (float r : {15.0f, 30.0f, 50.0f}) {
+        Vec p{at.x + r * std::sin(a), at.y, at.z + r * std::cos(a)};
+        score += w.learned(0, enemy, p, 8.0f) + 4.0f * w.learned(2, enemy, p, 8.0f);
+      }
+      if (score > best) best = score, yaw = a;
+    }
+    return best >= 20.0f;
   }
 
   const Soldier* Find(uint32_t obj) const {
@@ -937,13 +979,34 @@ struct Brain {
       }
       snprintf(io.state, sizeof(io.state), "detour %d", b.stuck_level);
     } else if (b.target_point >= 0) {
-      Vec goal = w.points[b.target_point].pos;
+      Vec flag = w.points[b.target_point].pos;
+      // Near its flag: the spot the matches showed is good to hold there
+      // (chosen again every 30 s, and for each new flag).
+      if (Dist2D(me->pos, flag) < 60 && (b.spot_point != b.target_point || w.now - b.spot_t > 30)) {
+        b.spot_point = b.target_point, b.spot_t = w.now;
+        Vec off;
+        if (LearnedSpot(flag, me->team, off)) {
+          b.target_offset = off;
+          if (getenv("BF_BOT_LEARN_TRACE"))
+            Log("learned: bot%d holds %.0f,%.0f off flag %d", io.slot + 1, off.x, off.z, b.target_point);
+        }
+      }
+      Vec goal = flag;
       goal.x += b.target_offset.x, goal.z += b.target_offset.z;
       float dx = goal.x - me->pos.x, dz = goal.z - me->pos.z;
       Vec next = NextOnRoute(io, b, *me, goal);
-      Steer(cmd, *me, std::atan2(next.x - me->pos.x, next.z - me->pos.z), 0.0f);
+      // Near the flag: looking where enemies usually come from (it walks on
+      // all the same), else where it goes.
+      if (Dist2D(me->pos, flag) < 60 && w.now - b.threat_t > 3.0)
+        b.threat_t = w.now, b.threat = Threat(me->pos, me->team, b.threat_yaw);
+      if (b.threat && getenv("BF_BOT_LEARN_TRACE")) {
+        static double said = 0;
+        if (w.now > said) said = w.now + 10, Log("learned: bot%d watches %.0f deg near flag %d", io.slot + 1, b.threat_yaw * 57.3f, b.target_point);
+      }
+      bool watch = b.threat && Dist2D(me->pos, flag) < 60;
+      Steer(cmd, *me, watch ? b.threat_yaw : std::atan2(next.x - me->pos.x, next.z - me->pos.z), 0.0f);
       Walk(cmd, *me, next, 1.0f);
-      if (!at_point && std::hypot(dx, dz) > 25) cmd.buttons |= kLeftThumb;  // sprint
+      if (!watch && !at_point && std::hypot(dx, dz) > 25) cmd.buttons |= kLeftThumb;  // sprint
       snprintf(io.state, sizeof(io.state), at_point ? "at flag %d" : "to flag %d", b.target_point);
     }
     io.pad = cmd;

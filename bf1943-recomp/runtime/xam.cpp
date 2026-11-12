@@ -348,11 +348,9 @@ MouseLook SampleMouse() {
 }
 }  // namespace
 
-namespace rt { bool BotLookAxis(int axis, float& value); }  // bots.cpp
 static std::atomic<bool> g_local_flying{false};
 bool rt::SimulatedKeyDown(int vk) { return TestKeyDown(vk); }
 float rt::MouseLookAxis(int axis) {
-  if (float v; BotLookAxis(axis, v)) return v;
   if (Down(VK_MENU) && g_test_mouse_at <= 0) return 0;
   MouseLook look = SampleMouse();
   float v = axis == 0 ? look.rx : look.ry;
@@ -559,12 +557,10 @@ static void AddKeyboard(XINPUT_GAMEPAD& g) {
 }
 #else
 // Linux (the console server): no keyboard, mouse or window; the pad is the
-// scripted presses and the bots'.
-namespace rt { bool BotLookAxis(int axis, float& value); }  // bots.cpp
+// scripted presses.
 namespace rt { std::atomic<bool> g_title_passed{false}; }  // declared in kernel.h
 bool rt::SimulatedKeyDown(int) { return false; }
 float rt::MouseLookAxis(int axis) {
-  if (float v; BotLookAxis(axis, v)) return v;
   return 0.0f;
 }
 static void AddKeyboard(XINPUT_GAMEPAD&) {}
@@ -589,7 +585,9 @@ static void AddScripted(XINPUT_GAMEPAD& g) {
   }
 }
 
-namespace rt { bool AddBotInput(XINPUT_GAMEPAD& g); }  // bots.cpp
+// The game's own additions to the pad (Bad Company: its test automation, menus
+// and intro skipping, bfbc1_game.cpp; BF1943: none, bots.cpp).
+namespace rt { bool AddBotInput(XINPUT_GAMEPAD& g); }
 
 // Input recording (BF_RECORD=<file>): writes "<ms since the main menu opened> <buttons>"
 // for each change of the player's pad buttons, so a run can be replayed (BF_REPLAY).
@@ -649,10 +647,10 @@ GUEST_IMPORT(XamInputGetState) {
     stage[3] = s.Gamepad.wButtons;
     AddBotInput(s.Gamepad);
     stage[4] = s.Gamepad.wButtons;
-    // Dedicated server and bot copies: Start until the title screen is passed
-    // and A on the dialogs after it (however long loading takes), then A on
-    // the loading screen (or the level times out back to the menu). The
-    // server's player then waits on the spawn screen; a bot's AI takes over.
+    // Dedicated server: Start until the title screen is passed and A on the
+    // dialogs after it (however long loading takes), then A on the loading
+    // screen (or the level times out back to the menu). The server's player
+    // then waits on the spawn screen.
     if (g_auto_start) {
       static bool spawn_seen = false;
       if (g_in_menus) spawn_seen = false;

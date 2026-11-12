@@ -126,8 +126,8 @@ cmake --build bf1943-recomp/build/linux
 
 The cross-compiled server runs on Ubuntu 24.04 (tested in WSL2): it passes the title,
 hosts the map, and a Windows client joined it (`--join <server IP>`). Copy the game files
-onto the Linux disk: loading them from a Windows drive in WSL is slow. Bots run as on Windows (shared memory
-through shm_open, bot copies by fork/exec, ending with the server). Audio: Xenia's XMA decoder (FFmpeg xmaframes) is built for Linux too, with no sound
+onto the Linux disk: loading them from a Windows drive in WSL is slow. Bots run as on Windows (players on
+the server itself). Audio: Xenia's XMA decoder (FFmpeg xmaframes) is built for Linux too, with no sound
 device (the game's audio code needs the decoding, without it the front end hangs);
 `--no-audio` runs Windows the same way, and a dedicated server run like that hosted a
 game a client joined and played. Still missing: a full Linux client (Vulkan presenter,
