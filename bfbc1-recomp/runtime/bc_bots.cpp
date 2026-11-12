@@ -2920,21 +2920,24 @@ static void BotBrain(Bot& b, uint32_t in) {
         }
       }
     }
-    static const int kCands[] = {10, 9, 11, 12, 10, 9, 11, 12};  // EIAAltFire (10) and its neighbours
-    if (!t0 || now - t0 > 8000) {
-      t0 = now, phase = (phase + 1) % 8;
+    // The digital actions are bits of the 64-bit word at +80 (8227A6E0): id < 32
+    // in +84, 32 and up in +80. Weapon slots and gadgets around 29-36.
+    static const int kCands[] = {29, 30, 31, 32, 33, 34, 35, 36, 10, 18, 19, 20};
+    if (!t0 || now - t0 > 5000) {
+      t0 = now, phase = (phase + 1) % 12;
       was.clear();
       for (uint32_t k = 0; k < 0x800; k += 4) was.push_back(Ld32(so + k));
       RT_INFO("bot grenade test: trying bit %d", kCands[phase]);
     }
     int64_t t = now - t0;
     int bit = kCands[phase];
-    if (t < 1000) {
+    if (t >= 1200 && t < 1700) set(0x28, 1.0f), St32(in + 0x3C, 0x3C000000u | (Ld32(in + 0x3C) & 0xFFFFu));  // fire
+    if (t < 300) {
       if (bit < 32) St32(in + 0x84, Ld32(in + 0x84) | (1u << bit));
-      else St32(in + 0x88, Ld32(in + 0x88) | (1u << (bit - 32)));
+      else St32(in + 0x80, Ld32(in + 0x80) | (1u << (bit - 32)));
     }
     static int reported = -1;
-    if (t >= 4000 && reported != phase) {
+    if (t >= 3500 && reported != phase) {
       reported = phase;
       std::string counts, d;
       for (uint32_t v : vts) counts += " " + VtName(v) + "=" + std::to_string(Scan(v).size());
@@ -3011,12 +3014,11 @@ static void BotBrain(Bot& b, uint32_t in) {
     uint32_t test_field = 0;
     if (drive_test) {
       static int64_t t0 = now;
-      int64_t t = (now - t0) % 7200;
-      int phase = int(t / 1200);  // each analog field in turn, 1.2 s
+      int64_t t = (now - t0) % 5000;
+      int phase = int(t / 2500);  // +C +1 then -1, 2.5 s each
       bool steering = true;
-      static const char* names[] = {"+24 +1", "+20 +1", "+18 +1", "+14 +1", "+10 +1", "none"};
-      static const uint32_t kField[] = {0x24, 0x20, 0x18, 0x14, 0x10, 0};
-      test_field = kField[phase];
+      static const char* names[] = {"+C +1", "+C -1"};
+      test_c = phase == 0 ? 1.0f : -1.0f;
       throttle = 0.6f, b.exit_vehicle = false;
       static int64_t dl = 0;
       if (now - dl > 500) {
@@ -3034,7 +3036,12 @@ static void BotBrain(Bot& b, uint32_t in) {
     } else {
       set(0x8, throttle), set(0xC, steer), set(0x1C, 0.0f);
     }
-    St32(in + 0x84, 0);
+    // The bits a real player's record carries nearly always (+84 0x163: the
+    // analog actions 0, 1, 5, 6 and 8 marked in use; BF1943's bot players
+    // found bits 40 and 43 too, +80 bits 8 and 11): without them the steering
+    // read nothing.
+    St32(in + 0x84, 0x163u);
+    St32(in + 0x80, Ld32(in + 0x80) | 0x900u);
     if (fire) {
       float yaw = std::atan2(b.ex - x, b.ez - z);
       set(0x90, yaw);
@@ -4104,6 +4111,23 @@ PPC_FUNC(sub_8227A6E0) {
   static const bool trace = getenv("BF_BOT_ACTION_TRACE") != nullptr;
   uint32_t holder = ctx.r3.u32, id = ctx.r4.u32;
   __imp__sub_8227A6E0(ctx, base);
+  // BF_BOT_DRIVE_LOG=1 (a player driving, to see what steers): for a record
+  // that isn't a bot's, each (holder, action) read and its value when it
+  // changes by over 0.2, the first 400.
+  static const bool drive_log = getenv("BF_BOT_DRIVE_LOG") != nullptr;
+  if (drive_log && Ptr(holder) && IsCommitted(holder + 0x174)) {
+    uint32_t rec = Ld32(holder + 0x170);
+    bool bot = false;
+    for (const Bot& b : g_bots) bot |= b.record && rec == b.record;
+    static std::map<uint64_t, float> last;
+    static int n = 0;
+    uint64_t key = uint64_t(holder) << 32 | id;
+    auto it = last.find(key);
+    if (!bot && n < 400 && (it == last.end() || std::fabs(it->second - float(ctx.f1.f64)) > 0.2f)) {
+      ++n, last[key] = float(ctx.f1.f64);
+      RT_INFO("drive log: holder %08X (vt %08X) action %u = %.2f", holder, Ld32(holder), id, ctx.f1.f64);
+    }
+  }
   if (trace && Ptr(holder) && IsCommitted(holder + 0x174)) {
     uint32_t rec = Ld32(holder + 0x170);
     for (const Bot& b : g_bots)
