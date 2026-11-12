@@ -4139,3 +4139,26 @@ PPC_FUNC(sub_8227A6E0) {
       }
   }
 }
+
+// ServerGrenadeEntity's factory (823097D8: 544 bytes from the allocator r5,
+// then the constructor 82307EE8(object, r4, r4 +24)): with BF_BOT_DRIVE_LOG or
+// BF_BOT_GRENADE_TRACE, each grenade made: r3-r5, the record r4 points at
+// (0x60 bytes, and what its words point at), the new grenade and the call
+// stack, the first 6: what a thrower passes, to make one for a bot.
+extern "C" PPC_FUNC(__imp__sub_823097D8);
+PPC_FUNC(sub_823097D8) {
+  static const bool trace = getenv("BF_BOT_DRIVE_LOG") || getenv("BF_BOT_GRENADE_TRACE");
+  static int n = 0;
+  bool log = trace && n++ < 6;
+  std::string args;
+  if (log) {
+    args = ArmArg(ctx.r3.u32) + " " + ArmArg(ctx.r4.u32) + " " + ArmArg(ctx.r5.u32) + " | r4:" + DamageWords(ctx.r4.u32);
+    for (uint32_t k = 0; k < 0x60; k += 4) {
+      uint32_t q = Ld32(ctx.r4.u32 + k);
+      if (Ptr(q) && !TypeName(q).empty()) args += " | +" + std::to_string(k) + "->" + TypeName(q) + ":" + DamageWords(q).substr(0, 300);
+    }
+    bf_crash_diag::PrintStack(nullptr);
+  }
+  __imp__sub_823097D8(ctx, base);
+  if (log) RT_INFO("grenade made: 823097D8(%s) -> %08X (%s)", args.substr(0, 2500).c_str(), ctx.r3.u32, TypeName(ctx.r3.u32).c_str());
+}
