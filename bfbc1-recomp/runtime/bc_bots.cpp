@@ -1520,6 +1520,11 @@ struct Bot {
   int vehicle_target_seat = 0;
   int64_t vehicle_target_at = 0, vehicle_looked = 0, vehicle_moved_at = 0, vehicle_in_at = 0;
   float vehicle_last[2] = {0, 0}, vehicle_heading = 0;
+  std::vector<std::array<float, 3>> vroute;  // the route on the vehicles' mesh
+  int reverses = 0;
+  int64_t reverse_until = 0;
+  size_t vstep = 0;
+  int64_t vplanned = 0;
   std::map<uint32_t, int64_t> vehicle_skip;  // vehicles not to try again until
   int64_t next_shot = 0;
   std::set<uint32_t> used;  // the interactions it used
@@ -1720,37 +1725,33 @@ static bool NearestMain(const float p[3], const float ext[3], const dtQueryFilte
   }
   return *ref != 0;
 }
-static bool LoadNavMesh() {
-  static bool tried = false;
-  if (tried) return g_navquery != nullptr;
-  tried = true;
-  std::string path = "nav/" + g_host_map + ".nav";
+// A .nav file (navgen's): version 1 one tile (its data's size, the data);
+// version 2 tiles: dtNavMeshParams, the tile count, then each tile's x, y,
+// size, data. Null if it isn't there or Detour can't read it.
+static dtNavMesh* ReadNav(const std::string& path, int* bytes, int* tile_count) {
   FILE* f = fopen(path.c_str(), "rb");
-  if (!f) return false;
-  // Version 1: one tile (its data's size, the data); version 2 (navgen's
-  // tiles): dtNavMeshParams, the tile count, then each tile's x, y, size, data.
+  if (!f) return nullptr;
   char magic[4];
   int version = 0;
   bool ok = fread(magic, 1, 4, f) == 4 && !memcmp(magic, "BFNV", 4) && fread(&version, 4, 1, f) == 1;
-  g_navmesh = dtAllocNavMesh();
+  dtNavMesh* mesh = dtAllocNavMesh();
   int size = 0, tiles = 0;
   if (ok && version == 1) {
     ok = fread(&size, 4, 1, f) == 1 && size > 0;
     unsigned char* data = ok ? static_cast<unsigned char*>(dtAlloc(size, DT_ALLOC_PERM)) : nullptr;
     ok = ok && data && fread(data, 1, size_t(size), f) == size_t(size) &&
-         dtStatusSucceed(g_navmesh->init(data, size, DT_TILE_FREE_DATA));
+         dtStatusSucceed(mesh->init(data, size, DT_TILE_FREE_DATA));
     tiles = 1;
   } else if (ok && version == 2) {
     dtNavMeshParams params;
     int count = 0;
-    ok = fread(&params, sizeof(params), 1, f) == 1 && fread(&count, 4, 1, f) == 1 &&
-         dtStatusSucceed(g_navmesh->init(&params));
+    ok = fread(&params, sizeof(params), 1, f) == 1 && fread(&count, 4, 1, f) == 1 && dtStatusSucceed(mesh->init(&params));
     for (int i = 0; ok && i < count; ++i) {
       int tx, ty, ts;
       ok = fread(&tx, 4, 1, f) == 1 && fread(&ty, 4, 1, f) == 1 && fread(&ts, 4, 1, f) == 1 && ts > 0;
       unsigned char* data = ok ? static_cast<unsigned char*>(dtAlloc(ts, DT_ALLOC_PERM)) : nullptr;
       ok = ok && data && fread(data, 1, size_t(ts), f) == size_t(ts) &&
-           dtStatusSucceed(g_navmesh->addTile(data, ts, DT_TILE_FREE_DATA, 0, nullptr));
+           dtStatusSucceed(mesh->addTile(data, ts, DT_TILE_FREE_DATA, 0, nullptr));
       size += ts, ++tiles;
     }
   } else {
@@ -1759,15 +1760,67 @@ static bool LoadNavMesh() {
   fclose(f);
   if (!ok) {
     RT_WARN("bot nav: %s isn't a navigation mesh Detour can read", path.c_str());
-    dtFreeNavMesh(g_navmesh);
-    g_navmesh = nullptr;
-    return false;
+    dtFreeNavMesh(mesh);
+    return nullptr;
   }
+  *bytes = size, *tile_count = tiles;
+  return mesh;
+}
+static bool LoadNavMesh() {
+  static bool tried = false;
+  if (tried) return g_navquery != nullptr;
+  tried = true;
+  std::string path = "nav/" + g_host_map + ".nav";
+  int size = 0, tiles = 0;
+  g_navmesh = ReadNav(path, &size, &tiles);
+  if (!g_navmesh) return false;
   g_navquery = dtAllocNavMeshQuery();
   g_navquery->init(g_navmesh, 4096);
   RT_INFO("bot nav: navigation mesh %s (%d bytes, %d tiles)", path.c_str(), size, tiles);
   FindPieces();
   return true;
+}
+// The vehicles' mesh (nav/<map>.vnav: navgen with a vehicle's size, 2 m radius,
+// 0.6 m climb, 35 degree slopes) and a route on it: the nearest polygons to
+// both ends (the goal's within 20 m across), A* (a partial route is driven
+// too), the straight path's corners. Empty without the mesh.
+static dtNavMesh* g_vnavmesh = nullptr;
+static dtNavMeshQuery* g_vnavquery = nullptr;
+static std::vector<std::array<float, 3>> RouteVehicle(const float a[3], const float b[3]) {
+  std::vector<std::array<float, 3>> out;
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    int size = 0, tiles = 0;
+    g_vnavmesh = ReadNav("nav/" + g_host_map + ".vnav", &size, &tiles);
+    if (g_vnavmesh) {
+      g_vnavquery = dtAllocNavMeshQuery();
+      g_vnavquery->init(g_vnavmesh, 4096);
+      RT_INFO("bot nav: vehicles' navigation mesh (%d bytes, %d tiles)", size, tiles);
+    }
+  }
+  if (!g_vnavquery) return out;
+  dtQueryFilter filter;
+  const float ext[3] = {6, 10, 6}, goal_ext[3] = {20, 60, 20};
+  dtPolyRef sa = 0, sb = 0;
+  float pa[3], pb[3];
+  g_vnavquery->findNearestPoly(a, ext, &filter, &sa, pa);
+  g_vnavquery->findNearestPoly(b, goal_ext, &filter, &sb, pb);
+  if (!sa || !sb) return out;
+  dtPolyRef polys[512];
+  int n = 0;
+  g_vnavquery->findPath(sa, sb, pa, pb, &filter, polys, &n, 512);
+  if (!n) return out;
+  float corners[128 * 3];
+  unsigned char flags[128];
+  dtPolyRef refs[128];
+  int nc = 0;
+  float end[3];
+  dtVcopy(end, pb);
+  if (polys[n - 1] != sb) g_vnavquery->closestPointOnPoly(polys[n - 1], pb, end, nullptr);
+  g_vnavquery->findStraightPath(pa, end, polys, n, corners, flags, refs, &nc, 128);
+  for (int i = 0; i < nc; ++i) out.push_back({corners[3 * i], corners[3 * i + 1], corners[3 * i + 2]});
+  return out;
 }
 // Learnt blockers: polygons a bot couldn't get onto (the navigation mesh can
 // be wrong: a ledge it thinks a soldier steps up, a gap he doesn't fit), off
@@ -1944,10 +1997,14 @@ extern std::atomic<bool> g_arm_trace_on;
 namespace rt {
 extern std::atomic<int16_t> g_pilot_lx, g_pilot_ly, g_pilot_rx, g_pilot_ry;
 extern std::atomic<uint16_t> g_pilot_buttons;
-extern std::atomic<uint8_t> g_pilot_rt;
+extern std::atomic<uint8_t> g_pilot_rt, g_pilot_lt;
 }  // namespace rt
 static bool InSight(float ax, float ay, float az, float bx, float by, float bz);
 static bool SightReady();
+static uint32_t g_host_record = 0;  // a player's (not a bot's) input record, the last seen
+static std::string VehicleKind(uint32_t v);
+static bool VehiclePlace(uint32_t v, float out[3]);
+static bool Drivable(const std::string& kind);
 const bool g_host_pilot_started = [] {
   if (!getenv("BF_BOT_HOST_PILOT")) return false;
   std::thread([] {
@@ -1977,7 +2034,7 @@ const bool g_host_pilot_started = [] {
           if (!BotWithSoldier(o) && (Ld32(o + 0x48) == 1 || Ld32(o + 0x48) == 2) &&
               std::fabs(LdF(o + 0x200)) + std::fabs(LdF(o + 0x208)) > 1.0f)
             so = o;  // a real soldier (a stray word can match the vtable)
-        crates = Scan(pilot_vehicle ? 0x820082E8 : 0x82011680);
+        crates = Scan(pilot_vehicle ? 0x82011AA8 : 0x82011680);
       }
       if (!so || !LoadNavMesh()) {
         g_pilot_buttons = 0;
@@ -1988,9 +2045,10 @@ const bool g_host_pilot_started = [] {
       float best = 1e9f, tx = 0, ty = 0, tz = 0;
       uint32_t target = 0;
       for (uint32_t c : crates) {
-        if (pilot_vehicle && std::fabs(LdF(c + at_off + 4) - y) > 2.5f) continue;  // one on the ground, at its height
-        float d = std::hypot(LdF(c + at_off) - x, LdF(c + at_off + 8) - z);
-        if (d < best) best = d, tx = LdF(c + at_off), ty = LdF(c + at_off + 4), tz = LdF(c + at_off + 8), target = c;
+        float cp[3] = {LdF(c + at_off), LdF(c + at_off + 4), LdF(c + at_off + 8)};
+        if (pilot_vehicle && (!Drivable(VehicleKind(c)) || !VehiclePlace(c, cp) || std::fabs(cp[1] - y) > 8.0f)) continue;
+        float d = std::hypot(cp[0] - x, cp[2] - z);
+        if (d < best) best = d, tx = cp[0], ty = cp[1], tz = cp[2], target = c;
       }
       if (best > 1e8f) continue;
       int64_t now = int64_t(GetTickCount64());
@@ -2044,6 +2102,7 @@ const bool g_host_pilot_started = [] {
         static const char* kNames[] = {"LB", "RB", "Y", "X", "B", "LS", "RS", "up", "down", "left", "right", "back"};
         int i = int((now / 4000) % 12);
         g_pilot_buttons = now % 4000 < 400 ? kButtons[i] : 0;
+        g_pilot_rt = now % 4000 >= 1200 && now % 4000 < 1600 ? 255 : 0;  // then fire (a grenade, if one got selected)
         static int said = -1;
         if (now % 4000 > 3000 && said != int(now / 4000)) {
           said = int(now / 4000);
@@ -2054,6 +2113,32 @@ const bool g_host_pilot_started = [] {
       // BF_BOT_PILOT_STAY=1: it stays where it spawned (only turns and fires).
       if (getenv("BF_BOT_PILOT_STAY")) {
         g_pilot_buttons = 0;
+        continue;
+      }
+      // BF_BOT_PILOT_VEHICLE: by the vehicle, B (in), then the sticks and
+      // triggers 2 s each (LX right, LX left, RT, LT), the player's input record
+      // (+8..+28) logged every 0.5 s: which field a car reads.
+      if (pilot_vehicle && best < 3.5f) {
+        static int64_t at_since = 0;
+        if (!at_since) at_since = now;
+        int64_t t = now - at_since;
+        g_pilot_buttons = t < 400 ? 0x2000 : 0;  // B: in
+        int ph = t < 3000 ? -1 : int((t - 3000) / 2000) % 4;
+        static const char* kPh[] = {"LX right", "LX left", "RT", "LT"};
+        lx = ph == 0 ? 30000 : ph == 1 ? -30000 : 0;
+        g_pilot_rt = ph == 2 ? 255 : 0;
+        g_pilot_lt = ph == 3 ? 255 : 0;
+        static int64_t logged_at = 0;
+        if (ph >= 0 && now - logged_at > 500 && g_host_record) {
+          logged_at = now;
+          std::string w;
+          for (uint32_t k = 8; k <= 0x28; k += 4) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), " +%X:%.2f", k, LdF(g_host_record + k));
+            w += buf;
+          }
+          RT_INFO("bot pilot: %s: record%s", kPh[ph], w.c_str());
+        }
         continue;
       }
       if (best < (pilot_vehicle ? 3.0f : 1.0f)) {  // at the crate: each button in turn, 6 s held then 2 s up
@@ -2513,7 +2598,7 @@ static void BotBrain(Bot& b, uint32_t in) {
         float d = std::hypot(p[0] - x, p[2] - z);
         goal = v, guard = false, best = d, tx = p[0], ty = p[1], tz = p[2];
         if (d < 3.5f) {
-          b.enter_vehicle = v, b.enter_seat = b.vehicle_target_seat, b.vehicle = v, b.vehicle_in_at = now;
+          b.enter_vehicle = v, b.enter_seat = b.vehicle_target_seat, b.vehicle = v, b.vehicle_in_at = now, b.reverses = 0;
           b.vehicle_target = 0, b.vehicle_moved_at = now, b.vehicle_last[0] = x, b.vehicle_last[1] = z;
         }
       }
@@ -2878,15 +2963,38 @@ static void BotBrain(Bot& b, uint32_t in) {
     b.vehicle_heading = std::atan2(LdF(so + 0x320), LdF(so + 0x328));
     if (std::hypot(x - b.vehicle_last[0], z - b.vehicle_last[1]) > 1.0f)
       b.vehicle_last[0] = x, b.vehicle_last[1] = z, b.vehicle_moved_at = now;
-    bool still = now - b.vehicle_moved_at > (b.seat == 0 ? 5000 : 15000) && now - b.vehicle_in_at > 6000;
+    bool still = b.seat == 0 ? b.reverses >= 3 && now > b.reverse_until && now - b.vehicle_moved_at > 2500
+                             : now - b.vehicle_moved_at > 15000 && now - b.vehicle_in_at > 6000;
     float throttle = 0, steer = 0;
     bool fire = false;
     if (b.seat == 0) {
+      // Along the vehicles' mesh when there is one (re-planned every 3 s; next
+      // corner within 6 m), else the soldiers' route.
+      if (now - b.vplanned > 6000) {
+        b.vplanned = now;
+        float from[3] = {x, y, z}, to[3] = {tx, ty, tz};
+        b.vroute = RouteVehicle(from, to), b.vstep = 0;
+      }
+      while (b.vstep < b.vroute.size() && std::hypot(b.vroute[b.vstep][0] - x, b.vroute[b.vstep][2] - z) < 8.0f) ++b.vstep;
+      if (b.vstep < b.vroute.size()) px = b.vroute[b.vstep][0], pz = b.vroute[b.vstep][2];
       float d = std::atan2(px - x, pz - z) - b.vehicle_heading;
       while (d > 3.14159265f) d -= 6.2831853f;
       while (d < -3.14159265f) d += 6.2831853f;
-      steer = std::clamp(-d * 1.5f, -1.0f, 1.0f);  // +1 turns the heading down (BF_BOT_DRIVE_TEST)
-      throttle = std::fabs(d) > 1.2f ? 0.4f : 1.0f;
+      // +C steers: +1 turns the heading down, -1 up (BF_BOT_DRIVE_TEST: four
+      // seconds of each, the heading every 0.5 s); it answers slowly, so the
+      // throttle is eased while the heading is off: full within 0.4 rad, 0.3
+      // past 1 rad. Stuck (under 1 m in 2.5 s): backing up 1.5 s with the
+      // steering the other way, three times before it gets out.
+      steer = std::clamp(-d * 2.0f, -1.0f, 1.0f);
+      float off = std::fabs(d);
+      throttle = off < 0.4f ? 1.0f : off < 1.0f ? 0.6f : 0.3f;
+      if (now < b.reverse_until) throttle = -0.7f, steer = -steer;
+      else if (now - b.vehicle_moved_at > 2500 && now - b.vehicle_in_at > 4000) {
+        if (b.reverses < 3) {
+          ++b.reverses, b.reverse_until = now + 1500, b.vehicle_moved_at = now + 1500;
+          RT_INFO("bot %d: stuck in the %s: backing up (%d)", b.index, kind.c_str(), b.reverses);
+        }
+      }
       if (b.enemy && IsTank(kind)) throttle = 0, steer = 0, fire = true;
       if (best < 25.0f || still || (b.enemy && !IsTank(kind) && b.edist < 25.0f)) b.exit_vehicle = true;
       if (still) b.vehicle_skip[b.in_vehicle] = now + 120000;  // stuck in it: not again for 2 minutes
@@ -2894,20 +3002,38 @@ static void BotBrain(Bot& b, uint32_t in) {
       fire = b.enemy != 0;
       if (!SeatOccupant(b.in_vehicle, 0) || still) b.exit_vehicle = true;
     }
-    // BF_BOT_DRIVE_TEST=1 (testing): the driver steers +1 for 3 s, then -1,
-    // at full throttle, never getting out; every 0.5 s its movement's heading
-    // and the soldier's forward row's (+320/+328): which way is +C.
-    if (getenv("BF_BOT_DRIVE_TEST") && b.seat == 0) {
-      throttle = 1.0f, steer = (now / 3000) % 2 ? -1.0f : 1.0f, b.exit_vehicle = false;
+    // BF_BOT_DRIVE_TEST=1 (testing): the driver at 0.6 throttle, never getting
+    // out, cycles: straight 2 s, then 4 s each of +C +1, +C -1, +1C +1, +1C -1
+    // (straight 2 s between); every 0.5 s the heading (forward row): which
+    // field steers, and which way.
+    bool drive_test = getenv("BF_BOT_DRIVE_TEST") && b.seat == 0;
+    float test_c = 0, test_1c = 0;
+    uint32_t test_field = 0;
+    if (drive_test) {
+      static int64_t t0 = now;
+      int64_t t = (now - t0) % 7200;
+      int phase = int(t / 1200);  // each analog field in turn, 1.2 s
+      bool steering = true;
+      static const char* names[] = {"+24 +1", "+20 +1", "+18 +1", "+14 +1", "+10 +1", "none"};
+      static const uint32_t kField[] = {0x24, 0x20, 0x18, 0x14, 0x10, 0};
+      test_field = kField[phase];
+      throttle = 0.6f, b.exit_vehicle = false;
       static int64_t dl = 0;
-      static float lx = x, lz = z;
       if (now - dl > 500) {
-        RT_INFO("bot drive test: steer %+.0f: moved %.2f m, heading %.2f, row %.2f", steer, std::hypot(x - lx, z - lz),
-                std::atan2(x - lx, z - lz), std::atan2(LdF(so + 0x320), LdF(so + 0x328)));
-        dl = now, lx = x, lz = z;
+        dl = now;
+        RT_INFO("bot drive test: %s: heading %.2f at %.1f %.1f", steering ? names[phase] : "straight", b.vehicle_heading, x, z);
       }
     }
-    set(0x8, throttle), set(0xC, steer);
+    if (drive_test) {
+      set(0x8, throttle), set(0xC, test_c), set(0x1C, test_1c);
+      for (uint32_t f : {0x10u, 0x14u, 0x18u, 0x20u, 0x24u}) set(f, f == test_field ? 1.0f : 0.0f);
+      // the held times too (half floats from +2C, one per analog action in turn:
+      // throttle +2C high, strafe +2C low, ..., yaw +34 low)
+      St32(in + 0x2C, 0x3C000000u | (test_c != 0 ? 0x3C00u : 0u));
+      St32(in + 0x34, test_1c != 0 ? 0x00003C00u : 0u);
+    } else {
+      set(0x8, throttle), set(0xC, steer), set(0x1C, 0.0f);
+    }
     St32(in + 0x84, 0);
     if (fire) {
       float yaw = std::atan2(b.ex - x, b.ez - z);
@@ -2920,8 +3046,9 @@ static void BotBrain(Bot& b, uint32_t in) {
     static int64_t vlog = 0;
     if (now - vlog > 3000) {
       vlog = now;
-      RT_INFO("bot %d: in %s seat %d at %.1f %.1f, heading %.2f, throttle %.1f steer %.2f%s%s", b.index, kind.c_str(), b.seat, x, z,
-              b.vehicle_heading, throttle, steer, fire ? ", firing" : "", b.exit_vehicle ? ", getting out" : "");
+      RT_INFO("bot %d: in %s seat %d at %.1f %.1f, heading %.2f, to %.1f %.1f (corner %zu of %zu, goal %.0f m), throttle %.1f steer %.2f%s%s",
+              b.index, kind.c_str(), b.seat, x, z, b.vehicle_heading, px, pz, b.vstep, b.vroute.size(), best, throttle, steer,
+              fire ? ", firing" : "", b.exit_vehicle ? ", getting out" : "");
     }
   }
 
@@ -3135,6 +3262,12 @@ PPC_FUNC(sub_821BF2A8) {
       }
       break;
     }
+  // The host's input record (a player's that isn't a bot's), for the pilot's logging.
+  if (IsCommitted(r4 + 0x8C) && Ld32(r4) == 0x8200DC48) {
+    bool bot = false;
+    for (const Bot& b : g_bots) bot |= b.record == r4;
+    if (!bot) g_host_record = r4;
+  }
   // BF_BOT_PILOT_BUTTONS: a player's (not a bot's) button bits (+84, +88) as they change.
   if (getenv("BF_BOT_PILOT_BUTTONS") && IsCommitted(r4 + 0x8C) && Ld32(r4) == 0x8200DC48) {
     bool bot = false;
@@ -3724,7 +3857,22 @@ static std::string ArmArg(uint32_t v) {
     if (log) RT_INFO("bot arm trace: %s(%s) -> %08X", #addr, args.c_str(), ctx.r3.u32);                      \
   }
 ARM_TRACE(822C4F48)
-ARM_TRACE(82345AD0)
+static std::string DamageWords(uint32_t a);
+// The client message dispatcher (arming and getting into vehicles come
+// through it): with BF_BOT_MSG_TRACE=1 every message type (r4) a player (r3,
+// not a bot) sends, the first time each, with its payload (r5, 0x60 bytes).
+extern "C" PPC_FUNC(__imp__sub_82345AD0);
+PPC_FUNC(sub_82345AD0) {
+  static const bool trace = getenv("BF_BOT_MSG_TRACE") != nullptr;
+  if (trace && !BotWithSpawner(ctx.r3.u32)) {
+    static std::map<uint32_t, int> seen;
+    uint32_t type = ctx.r4.u32;
+    if (seen[type]++ < 2)
+      RT_INFO("bot msg trace: player %08X message %u (0x%X): r5 %s | r5:%s", ctx.r3.u32, type, type, ArmArg(ctx.r5.u32).c_str(),
+              DamageWords(ctx.r5.u32).c_str());
+  }
+  __imp__sub_82345AD0(ctx, base);
+}
 ARM_TRACE(82349920)
 ARM_TRACE(82349A30)
 
@@ -3946,3 +4094,24 @@ SEAT_CALL_TRACE(823458B0)
 SEAT_CALL_TRACE(823369A8)
 SEAT_CALL_TRACE(82336778)
 SEAT_CALL_TRACE(8233E898)
+
+// The game's input action getter (8227A6E0: r3 an input holder, its record at
+// +170, r4 the action: analog ones 0-8 the floats at record +8 + 4 * id, the
+// others bits of the 64-bit word at +80). BF_BOT_ACTION_TRACE=1: for a bot's
+// record, each (holder, action) the first time, with the value.
+extern "C" PPC_FUNC(__imp__sub_8227A6E0);
+PPC_FUNC(sub_8227A6E0) {
+  static const bool trace = getenv("BF_BOT_ACTION_TRACE") != nullptr;
+  uint32_t holder = ctx.r3.u32, id = ctx.r4.u32;
+  __imp__sub_8227A6E0(ctx, base);
+  if (trace && Ptr(holder) && IsCommitted(holder + 0x174)) {
+    uint32_t rec = Ld32(holder + 0x170);
+    for (const Bot& b : g_bots)
+      if (b.record && rec == b.record) {
+        static std::set<uint64_t> seen;
+        if (seen.insert(uint64_t(holder) << 32 | id).second)
+          RT_INFO("bot action trace: bot %d holder %08X (%s) action %u = %.2f%s", b.index, holder, TypeName(holder).c_str(), id,
+                  ctx.f1.f64, b.in_vehicle ? " (in a vehicle)" : "");
+      }
+  }
+}

@@ -5,7 +5,8 @@
 // makes ships.
 //
 //   navgen <out.nav> <in.obj>... [--bounds x0 z0 x1 z1] [--cell 0.3] [--obj walkable.obj]
-//          [--radius 0.7] [--climb 0.4]
+//          [--radius 0.7] [--climb 0.4] [--slope 45]   (a vehicle's: --cell 0.4 --radius 2
+//          --climb 0.6 --slope 35)
 //   navgen --islands <in.nav> [x y z]...   which joined piece of the mesh each
 //          point is on (and the biggest pieces), to see why a route can't be found
 //
@@ -193,6 +194,7 @@ int main(int argc, char** argv) {
   float bounds[4] = {-1e9f, -1e9f, 1e9f, 1e9f};
   bool have_bounds = false;
   float cell = 0.3f, radius = 0.7f, climb = 0.4f;  // in cells: 3 (0.9 m) and 2 (0.4 m)
+  float slope_limit = 45.0f;
   const char* walkable_obj = nullptr;
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--bounds") && i + 4 < argc) {
@@ -202,6 +204,8 @@ int main(int argc, char** argv) {
       cell = float(atof(argv[++i]));
     } else if (!strcmp(argv[i], "--radius") && i + 1 < argc) {
       radius = float(atof(argv[++i]));
+    } else if (!strcmp(argv[i], "--slope") && i + 1 < argc) {
+      slope_limit = float(atof(argv[++i]));
     } else if (!strcmp(argv[i], "--climb") && i + 1 < argc) {
       climb = float(atof(argv[++i]));
     } else if (!strcmp(argv[i], "--obj") && i + 1 < argc) {
@@ -218,7 +222,7 @@ int main(int argc, char** argv) {
   if (!ntris) return 1;
 
   // A soldier.
-  const float agent_height = 1.8f, agent_radius = radius, agent_climb = climb, slope = 45.0f;
+  const float agent_height = 1.8f, agent_radius = radius, agent_climb = climb, slope = slope_limit;
   rcConfig base{};
   base.cs = cell;
   base.ch = 0.2f;

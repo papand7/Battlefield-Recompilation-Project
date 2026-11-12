@@ -54,7 +54,7 @@ static std::atomic<uint8_t> g_auto_rt{0};
 // The host's autopilot (bc_bots.cpp, BF_BOT_HOST_PILOT): sticks and buttons.
 std::atomic<int16_t> g_pilot_lx{0}, g_pilot_ly{0}, g_pilot_rx{0}, g_pilot_ry{0};
 std::atomic<uint16_t> g_pilot_buttons{0};
-std::atomic<uint8_t> g_pilot_rt{0};
+std::atomic<uint8_t> g_pilot_rt{0}, g_pilot_lt{0};
 // The pad, every poll: our Multiplayer menu (bc_mp_menu.cpp) takes it while open.
 bool AddBotInput(XINPUT_GAMEPAD& pad) {
   // SKIP INTRO: the startup movies (the EA and Dolby logos, the intro) end on
@@ -76,6 +76,7 @@ bool AddBotInput(XINPUT_GAMEPAD& pad) {
   if (int16_t v = g_pilot_ry.load()) pad.sThumbRY = v;
   pad.wButtons |= g_pilot_buttons.load();
   if (uint8_t v = g_pilot_rt.load()) pad.bRightTrigger = v;
+  if (uint8_t v = g_pilot_lt.load()) pad.bLeftTrigger = v;
   if (bcmp::Update(pad)) pad = {};
   return false;
 }
