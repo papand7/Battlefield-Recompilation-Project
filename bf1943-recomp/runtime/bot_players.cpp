@@ -143,6 +143,11 @@ struct BotPlayer {
   // The brain's pad (SetBotPlayerInput), applied in its soldier's step.
   float lx = 0, ly = 0, rx = 0, ry = 0;
   uint32_t buttons = 0, triggers = 0;
+  // Where it aims (the move records' +88 is minus the yaw, +8C the pitch),
+  // turned by rx / ry: written into every record it is driven by.
+  float heading = 0, pitch = 0;
+  bool aim_set = false;
+  uint64_t bits = 0;  // the button bits of its last step (the move messages carry them: entering a vehicle is one)
   uint32_t ghost_for = 0; // the soldier that id is for
   uint32_t move_seq = 0;
 };
@@ -569,6 +574,20 @@ GAME_PATCH(82414430) {
       memcpy(&u, &fwd, 4);
       St32(b.move_msg + 0x10 + 8, u);
       St32(b.move_msg + 0x10 + 0x9C, b.ghost_id);
+      if (b.aim_set) {
+        auto putf = [](uint32_t a, float v) {
+          uint32_t w;
+          memcpy(&w, &v, 4);
+          St32(a, w);
+        };
+        putf(b.move_msg + 0x10 + 0x88, b.heading);
+        putf(b.move_msg + 0x10 + 0x8C, b.pitch);
+        putf(b.move_msg + 0x10 + 0x90, 1.0f);
+        putf(b.move_msg + 0x10 + 8, b.ly);
+        putf(b.move_msg + 0x10 + 0xC, b.lx);
+        uint64_t m = b.bits ? b.bits : (uint64_t(1) << 40 | uint64_t(1) << 43);
+        St32(b.move_msg + 0x10 + 0x78, uint32_t(m >> 32)), St32(b.move_msg + 0x10 + 0x7C, uint32_t(m));
+      }
       // EXPERIMENT (BF_BOT_CONTROL): the receiver's +118 is the entity it
       // controls (823B2C80 compares it with the one the move names).
       static int64_t said = 0;
@@ -578,6 +597,15 @@ GAME_PATCH(82414430) {
                 IsCommitted(Ld32(b.mover + 0x118)) ? Ld32(Ld32(b.mover + 0x118)) : 0, b.soldier);
       }
       if (getenv("BF_BOT_CONTROL")) St32(b.mover + 0x118, b.soldier);
+      // The entry it is in (+11C: 0 its own, as a real player on foot; FFFF
+      // is "none", and then the move handler enters nothing).
+      static int64_t said11c = 0;
+      if (now - said11c > 5000) {
+        said11c = now;
+        RT_INFO("bot %d: receiver +118 %08X +11C %08X", b.index, Ld32(b.mover + 0x118), Ld32(b.mover + 0x11C));
+      }
+      if (Ld32(b.mover + 0x118) == b.soldier && Ld32(b.mover + 0x11C) == 0xFFFF && !getenv("BF_BOT_NO_11C"))
+        St32(b.mover + 0x11C, 0);
       // EXPERIMENT (BF_BOT_YAW_SPIN): turn the soldier through its aim (the
       // character entity, soldier +130: heading +134), a little each tick.
       if (getenv("BF_BOT_YAW_SPIN")) {
@@ -824,6 +852,50 @@ GAME_PATCH(823B2C80) {
               LdF(rec + 0x24), LdF(rec + 0x8C));
     }
   }
+  // BF_BOT_ENTRYLOG: a real player's record +98..+B8 and its receiver's
+  // +118/+11C at every move whose words there change (entering a vehicle).
+  if (getenv("BF_BOT_ENTRYLOG") && Ld32(ctx.r4.u32) == 0x8200E490) {
+    static uint32_t last[12];
+    uint32_t rec = ctx.r4.u32 + 0x10, now_w[12];
+    for (int k = 0; k < 8; ++k) now_w[k] = Ld32(rec + 0x98 + 4 * k);
+    now_w[8] = Ld32(ctx.r3.u32 + 0x118), now_w[9] = Ld32(ctx.r3.u32 + 0x11C);
+    now_w[10] = Ld32(rec + 0x78), now_w[11] = Ld32(rec + 0x7C);
+    bool changed = false;
+    for (int k = 0; k < 12; ++k)
+      if (k != 0 && k != 3 && now_w[k] != last[k]) changed = true;  // (+98, +A4: tick counters)
+    if (changed) {
+      memcpy(last, now_w, sizeof(last));
+      uint32_t so = now_w[8];
+      RT_INFO("bot players: entry: rec 98:%08X 9C:%08X A0:%08X A4:%08X A8:%08X AC:%08X B0:%08X B4:%08X | rcv 118:%08X 11C:%08X | bits %08X%08X | on foot %u",
+              now_w[0], now_w[1], now_w[2], now_w[3], now_w[4], now_w[5], now_w[6], now_w[7], now_w[8], now_w[9],
+              now_w[10], now_w[11], so && IsCommitted(so + 0x400) ? Ld32(so + 0x34C) >> 24 : 9);
+    }
+  }
+  // BF_BOT_WATCH_SEAT: a write watch on a real soldier's on-foot byte (+34C):
+  // the call stack that puts it in a vehicle seat.
+  if (getenv("BF_BOT_WATCH_SEAT") && Ld32(ctx.r4.u32) == 0x8200E490) {
+    static bool armed = false;
+    uint32_t so = Ld32(ctx.r3.u32 + 0x118);
+    if (!armed && so && IsCommitted(so + 0x400) && Ld32(so) == kSoldier) {
+      armed = true;
+      RT_INFO("bot players: watching soldier %08X +34C", so);
+      StartWriteWatch(so + 0x34C, 4, 0);
+    }
+  }
+  // BF_BOT_AIMLOG: a real player's record +80..+94 beside its soldier's aim
+  // (yaw +134, pitch +138), once a second: which field is the pitch.
+  if (getenv("BF_BOT_AIMLOG") && Ld32(ctx.r4.u32) == 0x8200E490) {
+    static int64_t next = 0;
+    int64_t t = int64_t(GetTickCount64());
+    uint32_t so = Ld32(ctx.r3.u32 + 0x118);
+    if (t >= next && so && IsCommitted(so + 0x400) && Ld32(so) == kSoldier) {
+      next = t + 1000;
+      uint32_t rec = ctx.r4.u32 + 0x10, aim = Ld32(so + 0x130);
+      RT_INFO("bot players: aim yaw %.2f pitch %.2f | record 80:%.2f 84:%.2f 88:%.2f 8C:%.2f 90:%.2f 94:%.2f | 10:%.2f 14:%.2f",
+              LdF(aim + 0x134), LdF(aim + 0x138), LdF(rec + 0x80), LdF(rec + 0x84), LdF(rec + 0x88), LdF(rec + 0x8C),
+              LdF(rec + 0x90), LdF(rec + 0x94), LdF(rec + 0x10), LdF(rec + 0x14));
+    }
+  }
   bool bot_mover = false;
   for (BotPlayer& b : g_players) bot_mover |= b.mover == ctx.r3.u32;
   if (!bot_mover && LdF(ctx.r4.u32 + 0x10 + 8) > 0.5f) g_real_mover = ctx.r3.u32;
@@ -870,7 +942,7 @@ GAME_PATCH(8236F238) {
         if (g_have_template) {
           uint32_t in = ctx.r3.u32, keep4 = Ld32(in + 4), id = Ld32(in + 0x9C), keep160 = Ld32(in + 0x160);
           // BF_BOT_TPL_RANGE=from,to (hex, record offsets): which part of it.
-          uint32_t lo = 4, hi = 0xB4;
+          uint32_t lo = 0x78, hi = 0x78;  // (nothing: the bits, heading and pitch are written below)
           if (const char* rg = getenv("BF_BOT_TPL_RANGE")) sscanf(rg, "%x,%x", &lo, &hi);
           memcpy(G<uint8_t>(in + lo), g_move_template + 0x10 + lo, hi - lo);
           St32(in + 4, keep4), St32(in + 0x9C, id), St32(in + 0x160, keep160);
@@ -930,23 +1002,42 @@ GAME_PATCH(8236F238) {
             if (lt > 0.5f) bit(11);               // LT: zoom
           }
           put(rec + 0x24, rt);                    // RT: fire
-          if (b.buttons & 0x2000) bit(13), bit(16);  // B: in or out of a vehicle, use
+          static const int ebit = getenv("BF_BOT_E_BIT") ? atoi(getenv("BF_BOT_E_BIT")) : -1;
+          if (b.buttons & 0x2000) {  // B: in or out of a vehicle, use
+            if (ebit >= 0) bits |= uint64_t(1) << ebit;
+            else bit(13), bit(16);
+          }
           if (b.buttons & 0x4000) bit(21);        // X: reload
           // (with the flags every live soldier's moves carry)
           uint64_t base = getenv("BF_BOT_BASE_BITS") ? strtoull(getenv("BF_BOT_BASE_BITS"), nullptr, 16)
                                                      : (uint64_t(1) << 40 | uint64_t(1) << 43);
           uint64_t mask = base | bits;
+          b.bits = mask;
+          // (the input object too: the move handler enters vehicles from it, 8239D040)
+          St32(ctx.r3.u32 + 0x78, uint32_t(mask >> 32)), St32(ctx.r3.u32 + 0x7C, uint32_t(mask));
+          if (ebit == 43 && !(b.buttons & 0x2000)) mask &= ~(uint64_t(1) << 43);  // (43 only while E is held)
           St32(rec + 0x78, uint32_t(mask >> 32)), St32(rec + 0x7C, uint32_t(mask));
           // The heading (the input object's +88; the soldier's aim +134 is
           // minus it): turned by rx, as a pad's right stick turns the view.
           uint32_t aim = Ld32(b.soldier + 0x130);
           if (aim && IsCommitted(aim + 0x140) && !getenv("BF_BOT_HEADING_SPIN")) {
+            if (!b.aim_set) b.heading = -LdF(aim + 0x134), b.pitch = LdF(aim + 0x138), b.aim_set = true;
             float yaw = LdF(aim + 0x134) - b.rx * 0.12f;
             put(ctx.r3.u32 + 0x88, -yaw);
             // The pitch beside it (+8C; the aim's +138, up positive), turned by ry.
             static const float psign = getenv("BF_BOT_PITCH_SIGN") ? float(atof(getenv("BF_BOT_PITCH_SIGN"))) : 1.0f;
-            float pitch = std::clamp(LdF(aim + 0x138) + b.ry * 0.08f, -1.3f, 1.3f);
-            if (getenv("BF_BOT_PITCH")) put(ctx.r3.u32 + 0x8C, psign * pitch);  // EXPERIMENT: crashed (8285BC80)
+            float pitch = std::clamp(LdF(aim + 0x138) + b.ry * 0.08f, -1.0f, 1.0f);
+            (void)psign;
+            b.heading = -yaw, b.pitch = pitch;
+            put(ctx.r3.u32 + 0x8C, pitch);
+            if (rec != ctx.r3.u32) put(rec + 0x88, -yaw), put(rec + 0x8C, pitch);
+            static int64_t next = 0;
+            int64_t t = int64_t(GetTickCount64());
+            if (getenv("BF_BOT_AIMLOG") && t >= next) {
+              next = t + 1000;
+              RT_INFO("bot %d: rx %.2f ry %.2f, aim yaw %.2f pitch %.2f -> wrote heading %.2f pitch %.2f (input %08X, record %08X)",
+                      b.index, b.rx, b.ry, LdF(aim + 0x134), LdF(aim + 0x138), -yaw, pitch, ctx.r3.u32, rec);
+            }
             St32(ctx.r3.u32 + 0x90, 0x3F800000);
           }
         }
