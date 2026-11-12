@@ -158,7 +158,9 @@ struct BotPlayer {
   float heading = 0, pitch = 0;
   bool aim_set = false;
   uint64_t bits = 0;  // the button bits of its last step (the move messages carry them: entering a vehicle is one)
-  float held[64] = {};  // how long each digital action has been held (s)
+  float held[64] = {};
+  int e_steps = 0;  // steps B has been held
+  bool press13 = false;  // a ChangeVehicle press not yet seen by 822BD2B0  // how long each digital action has been held (s)
   int64_t e_until = 0;
   uint32_t ghost_for = 0; // the soldier that id is for
   uint32_t move_seq = 0;
@@ -1019,9 +1021,16 @@ GAME_PATCH(8236F238) {
           static const bool latch = getenv("BF_BOT_E_LATCH") != nullptr;
           if (b.buttons & 0x2000) b.e_until = int64_t(GetTickCount64()) + 1500;
           bool e_on = (b.buttons & 0x2000) || (latch && int64_t(GetTickCount64()) < b.e_until);
-          if (e_on) {  // B: in or out of a vehicle, use
+          // B: in or out of a vehicle (13), use (16). Entering wants a press
+          // (13 set in this step's record, clear in the last one: 822BD2B0),
+          // so a held B pulses it: one step on, then off, again every 0.5 s.
+          b.e_steps = e_on ? b.e_steps + 1 : 0;
+          if (e_on) {
             if (ebit >= 0) bits |= uint64_t(1) << ebit;
-            else bit(13), bit(16);
+            else {
+              bit(16);
+              if (b.e_steps % 15 == 1) bit(13), b.press13 = true;
+            }
           }
           if (b.buttons & 0x4000) bit(21);        // X: reload
           // (with the flags every live soldier's moves carry)
@@ -1151,6 +1160,63 @@ GAME_PATCH(8239D040) {
     }
   }
   __imp__sub_8239D040(ctx, base);
+}
+
+// BF_BOT_CHECK_TRACE: the Interact checks entering a vehicle runs on an
+// input object (822BD2B0 pressed, 822C1818 held long enough): what record
+// they read, its bit and hold time, the time wanted, the answer.
+bool BotInput(uint32_t in) {
+  for (BotPlayer& b : g_players)
+    if (b.spawner && Ld32(b.spawner + 280) == in) return true;
+  return false;
+}
+GAME_PATCH(822BD2B0) {
+  uint32_t in = ctx.r3.u32, act = ctx.r4.u32;
+  if (getenv("BF_BOT_CHECK_TRACE")) {
+    static std::map<uint32_t, int> by;
+    static int64_t nx = 0;
+    by[act]++;
+    int64_t t = int64_t(GetTickCount64());
+    if (t >= nx) {
+      nx = t + 10000;
+      std::string o;
+      for (auto& [k, v] : by) o += " " + std::to_string(k) + ":" + std::to_string(v);
+      RT_INFO("bot players: pressed() calls by action:%s", o.c_str());
+    }
+  }
+  __imp__sub_822BD2B0(ctx, base);
+  // A fake player's ChangeVehicle press: its records never show the edge
+  // (something else writes bit 13 into both), so the check is answered from
+  // the brain's pulse, once.
+  if (act == 13)
+    for (BotPlayer& b : g_players)
+      if (b.spawner && Ld32(b.spawner + 280) == in) {
+        ctx.r3.u64 = b.press13 ? 1 : 0;
+        b.press13 = false;
+      }
+  if (getenv("BF_BOT_CHECK_TRACE") && act == 13) {
+    static int n = 0;
+    bool bot = BotInput(in), want = false;
+    for (BotPlayer& b : g_players)
+      if (b.spawner && Ld32(b.spawner + 280) == in) want = (b.bits >> 13) & 1;
+    if ((bot && want && n++ < 40) || ctx.r3.u8)
+      RT_INFO("bot players: pressed(13)%s in %08X cur %08X (mask %08X%08X) prev %08X (mask %08X%08X) -> %u", bot ? " BOT" : "",
+              in, Ld32(in + 352), Ld32(Ld32(in + 352) + 0x78), Ld32(Ld32(in + 352) + 0x7C), Ld32(in + 356),
+              Ld32(Ld32(in + 356) + 0x78), Ld32(Ld32(in + 356) + 0x7C), ctx.r3.u8);
+  }
+}
+GAME_PATCH(822C1818) {
+  uint32_t in = ctx.r3.u32, act = ctx.r4.u32;
+  double want = ctx.f1.f64;
+  __imp__sub_822C1818(ctx, base);
+  if (getenv("BF_BOT_CHECK_TRACE") && act == 16) {
+    static int n = 0;
+    bool bot = BotInput(in);
+    uint32_t rec = Ld32(in + 352);
+    if (n++ < 40 || ctx.r3.u8)
+      RT_INFO("bot players: held(16)%s in %08X rec %08X mask %08X%08X hold %04X want %.2f -> %u", bot ? " BOT" : "", in, rec,
+              Ld32(rec + 0x78), Ld32(rec + 0x7C), Ld16(rec + 0x48), want, ctx.r3.u8);
+  }
 }
 
 GAME_PATCH(822F05C8) {
