@@ -41,6 +41,10 @@ struct MapView {
   std::function<bool(const float* a, const float* b)> sight;
   float eye[3] = {0, 0, 0}, eye_yaw = 0;
   int kind = 0;  // what the question is about (1 stuck, 2 cover, ...: the training record)
+  // The structures (optional; the training replay's whole level): the highest
+  // collision surface over an n x n grid of mpp metres from (x0, z0), rows
+  // going south, NAN where none; false when not known.
+  std::function<bool(float x0, float z0, float mpp, int n, std::vector<float>& top)> tops;
 };
 
 // Asks for bot `bot` (one question at a time each; not again within

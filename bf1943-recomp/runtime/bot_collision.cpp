@@ -476,6 +476,51 @@ float TerrainHeight(float x, float z) {
   if (col < 0 || row < 0 || col >= 2048 || row >= 2048) return -1e9f;
   return Ld16(g->hf + 2 * uint32_t(row * 2048 + col)) * g->hf_scale;
 }
+// Whether the map's sight (its collision and terrain) is built.
+bool SightReadyFor(const std::string& map) { return !g_sight_building && g_sight && g_sight_map == map; }
+// The highest surface of the map's collision (buildings, walls, rocks, ships)
+// over n x n pixels of mpp metres, the first one's corner at x0, z0 (rows go
+// south): NAN where there is none. Each triangle filled from above, and its
+// edges drawn too (walls stand edge-on from above). False before it is built.
+bool CollisionTops(float x0, float z0, float mpp, int n, std::vector<float>& top) {
+  SightGrid* g = g_sight;
+  if (!g) return false;
+  top.assign(size_t(n) * n, NAN);
+  auto put = [&](int x, int y, float h) {
+    if (x < 0 || y < 0 || x >= n || y >= n) return;
+    float& t = top[size_t(y) * n + x];
+    if (!(t >= h)) t = h;
+  };
+  for (const auto& t : g->tris) {
+    float px[3], py[3], h[3];
+    for (int k = 0; k < 3; ++k) px[k] = (t[3 * k] - x0) / mpp, py[k] = (z0 - t[3 * k + 2]) / mpp, h[k] = t[3 * k + 1];
+    float lx = std::min({px[0], px[1], px[2]}), hx = std::max({px[0], px[1], px[2]});
+    float ly = std::min({py[0], py[1], py[2]}), hy = std::max({py[0], py[1], py[2]});
+    if (hx < 0 || hy < 0 || lx >= n || ly >= n) continue;
+    // The edges (every half pixel).
+    for (int e = 0; e < 3; ++e) {
+      int a = e, b = (e + 1) % 3;
+      int steps = int(std::hypot(px[b] - px[a], py[b] - py[a]) * 2) + 1;
+      for (int s = 0; s <= steps; ++s) {
+        float f = float(s) / steps;
+        put(int(px[a] + (px[b] - px[a]) * f), int(py[a] + (py[b] - py[a]) * f), h[a] + (h[b] - h[a]) * f);
+      }
+    }
+    // The face: the pixels whose centres are inside, at its height there.
+    float area = (px[1] - px[0]) * (py[2] - py[0]) - (px[2] - px[0]) * (py[1] - py[0]);
+    if (std::fabs(area) < 0.25f) continue;
+    for (int y = std::max(0, int(ly)); y <= std::min(n - 1, int(hy)); ++y)
+      for (int x = std::max(0, int(lx)); x <= std::min(n - 1, int(hx)); ++x) {
+        float cx = x + 0.5f, cy = y + 0.5f;
+        float w0 = ((px[1] - cx) * (py[2] - cy) - (px[2] - cx) * (py[1] - cy)) / area;
+        float w1 = ((px[2] - cx) * (py[0] - cy) - (px[0] - cx) * (py[2] - cy)) / area;
+        float w2 = 1.0f - w0 - w1;
+        if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+        put(x, y, w0 * h[0] + w1 * h[1] + w2 * h[2]);
+      }
+  }
+  return true;
+}
 // Clear from a to b (true too before the map's is built).
 bool InSight(const float a[3], const float b[3]) {
   SightGrid* g = g_sight;

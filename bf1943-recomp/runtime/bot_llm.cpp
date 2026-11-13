@@ -416,8 +416,10 @@ function draw(){
   g.fillStyle=f;g.beginPath();g.arc(x,y,7,0,7);g.fill();g.fillStyle='#000';g.font='bold 9px sans-serif';g.fillText(K[c.kind]?K[c.kind][0]:'?',x-3,y+3);g.globalAlpha=1;
   if(sel===c){g.strokeStyle='#ff0';g.lineWidth=2;g.beginPath();g.arc(x,y,11,0,7);g.stroke();}}
  document.getElementById('clock').textContent=fmt(T)+' / '+fmt(end);}
+// (a picture not in the run's folder: the server's cases folder, two up)
+const fb="if(!this.dataset.f){this.dataset.f=1;this.src='../../'+this.getAttribute('src');}";
 function show(c){sel=c;const w=c.worked===true?'<b class=ok>worked</b>':c.worked===false?'<b class=bad>failed</b>':'<span class=unk>not judged</span>';
- document.getElementById('detail').innerHTML=`<h3>Bot ${c.bot}: ${kind(c)} at ${fmt(c.t)}</h3><p>Answer: place ${c.place}: ${esc(c.why)}<br>Outcome: ${w}</p><img src="${c.image}">${c.eye?`<img src="${c.eye}">`:''}<pre>${esc(c.prompt)}</pre><hr>`;
+ document.getElementById('detail').innerHTML=`<h3>Bot ${c.bot}: ${kind(c)} at ${fmt(c.t)}</h3><p>Answer: place ${c.place}: ${esc(c.why)}<br>Outcome: ${w}</p><p class=unk>The map it was shown:</p><img src="${c.image}" onerror="${fb}">${c.eye?`<p class=unk>Its own view ahead:</p><img src="${c.eye}" onerror="${fb}">`:''}<pre>${esc(c.prompt)}</pre><hr>`;
  T=c.t;tr.value=Math.floor(T);draw();}
 const list=document.getElementById('list');
 for(const c of R.cases){const e=document.createElement('div'),k=c.worked===true?'ok':c.worked===false?'bad':'unk';e.className='case';
@@ -462,8 +464,8 @@ void WriteRun() {  // (g_run_mutex held)
     o += std::string(i ? "," : "") + "{\"id\":" + id + ",\"bot\":" + std::to_string(c.bot) + ",\"kind\":" +
          std::to_string(c.kind) + "," + buf + ",\"place\":" + std::to_string(c.place);
     if (c.picked) snprintf(buf, sizeof(buf), ",\"px\":%.1f,\"pz\":%.1f", c.px, c.pz), o += buf;
-    o += ",\"worked\":" + std::string(c.worked < 0 ? "null" : c.worked ? "true" : "false") + ",\"image\":\"../../cases/" +
-         id + ".png\"" + (c.eye ? ",\"eye\":\"../../cases/" + id + "_eye.png\"" : "") + ",\"why\":\"" + Esc(c.why) +
+    o += ",\"worked\":" + std::string(c.worked < 0 ? "null" : c.worked ? "true" : "false") + ",\"image\":\"cases/" +
+         id + ".png\"" + (c.eye ? ",\"eye\":\"cases/" + id + "_eye.png\"" : "") + ",\"why\":\"" + Esc(c.why) +
          "\",\"prompt\":\"" + Esc(c.prompt) + "\"}";
   }
   o += "],\"learned\":[";
@@ -574,6 +576,17 @@ void Worker() {
                   job.prompt, why};
         if (c.picked) c.px = job.places_at[size_t(place - 1)][0], c.pz = job.places_at[size_t(place - 1)][1];
         g_run_cases.push_back(std::move(c));
+        // Its pictures in the run's own folder too: the replay shows them from
+        // there (a viewer may not reach ../../cases), and the folder can be
+        // copied or zipped whole.
+        std::error_code ec;
+        std::filesystem::create_directories(g_run_dir / "cases", ec);
+        std::string id = std::to_string(job.id);
+        std::ofstream(g_run_dir / "cases" / (id + ".png"), std::ios::binary)
+            .write(reinterpret_cast<const char*>(job.png.data()), std::streamsize(job.png.size()));
+        if (!job.eye_png.empty())
+          std::ofstream(g_run_dir / "cases" / (id + "_eye.png"), std::ios::binary)
+              .write(reinterpret_cast<const char*>(job.eye_png.data()), std::streamsize(job.eye_png.size()));
       }
     }
   }
@@ -587,7 +600,12 @@ struct Canvas {
   void Put(int x, int y, uint32_t rgb, float a = 1.0f) {
     if (x < 0 || y < 0 || x >= n || y >= n) return;
     uint8_t* p = &px[(y * n + x) * 3];
-    for (int c = 0; c < 3; ++c) p[c] = uint8_t(p[c] + ((rgb >> (16 - 8 * c) & 255) - p[c]) * a);
+    // (signed: a darker colour over a lighter pixel wrapped round as unsigned,
+    // black or garbage where it should have shaded)
+    for (int c = 0; c < 3; ++c) {
+      int to = int(rgb >> (16 - 8 * c) & 255);
+      p[c] = uint8_t(std::clamp(int(std::lround(p[c] + (to - int(p[c])) * a)), 0, 255));
+    }
   }
   void Disc(float cx, float cy, float r, uint32_t rgb) {
     for (int y = int(cy - r - 1); y <= int(cy + r + 1); ++y)
@@ -626,11 +644,52 @@ std::vector<uint8_t> Draw(const MapView& m, int n = kSize) {
   if (m.ground)
     for (int y = 0; y < n; ++y)
       for (int x = 0; x < n; ++x) h[y * n + x] = m.ground(m.cx - m.half + (x + 0.5f) * mpp, m.cz + m.half - (y + 0.5f) * mpp);
+  // Where soldiers walk: cells of 4 x 4 pixels, each asked once.
+  const int kCell = 4, kCells = n / kCell;
+  std::vector<char> walk;
+  float sea = -1e9f;  // the sea's level: as low as the ground soldiers walk on goes (none known: no water drawn)
+  if (m.walkable) {
+    walk.assign(size_t(kCells) * kCells, 0);
+    std::vector<float> walked;
+    for (int cy = 0; cy < kCells; ++cy)
+      for (int cx = 0; cx < kCells; ++cx) {
+        float wx = m.cx - m.half + (cx + 0.5f) * kCell * mpp, wz = m.cz + m.half - (cy + 0.5f) * kCell * mpp;
+        float gy = h[(cy * kCell + kCell / 2) * n + cx * kCell + kCell / 2];
+        bool ok = std::isfinite(gy) && gy > -1e8f;
+        walk[size_t(cy) * kCells + cx] = m.walkable(wx, ok ? gy : m.y, wz);
+        if (ok && walk[size_t(cy) * kCells + cx]) walked.push_back(gy);
+      }
+    // (a whole level's only: its beaches go down to the water; the bots' own
+    // small maps stay as the advisor's prompt describes them)
+    if (n >= 1024 && walked.size() > 200) {
+      std::nth_element(walked.begin(), walked.begin() + walked.size() / 100, walked.end());
+      sea = walked[walked.size() / 100];
+    }
+  }
+  // The structures (below), and the sea's surface among them: a flat
+  // collision plane over the sea bed, the commonest height of what lies over
+  // the ground (over a tenth of the picture). Its level is the sea's.
+  std::vector<float> top;
+  const bool structures = m.tops && m.tops(m.cx - m.half, m.cz + m.half, mpp, n, top);
+  float water = NAN;
+  if (structures) {
+    std::map<int, int> heights;  // (half metres)
+    for (size_t i = 0; i < top.size(); ++i)
+      if (std::isfinite(top[i]) && (!std::isfinite(h[i]) || top[i] > h[i] + 1.0f)) ++heights[int(std::lround(top[i] * 2))];
+    auto most = std::max_element(heights.begin(), heights.end(), [](auto& a, auto& b) { return a.second < b.second; });
+    if (most != heights.end() && most->second > int(top.size() / 10)) water = most->first / 2.0f, sea = water;
+  }
+  auto is_water = [&](size_t i) { return std::isfinite(water) && std::isfinite(top[i]) && std::fabs(top[i] - water) < 0.6f; };
   for (int y = 0; y < n; ++y)
     for (int x = 0; x < n; ++x) {
       float v = h[y * n + x];
       if (!std::isfinite(v) || v < -1e8f) {
         cv.Put(x, y, 0x5A6E78);
+        continue;
+      }
+      if (v < sea - 0.3f || (is_water(size_t(y) * n + x) && v < water)) {  // water: lighter in the shallows
+        float d = std::clamp((sea - v) / 15.0f, 0.0f, 1.0f);
+        cv.Put(x, y, uint32_t(70 - 40 * d) << 16 | uint32_t(140 - 70 * d) << 8 | uint32_t(170 - 60 * d));
         continue;
       }
       float t = std::clamp((v - m.y) / 30.0f * 0.5f + 0.5f, 0.0f, 1.0f);  // (30 m below to 30 m above it)
@@ -640,16 +699,44 @@ std::vector<uint8_t> Draw(const MapView& m, int n = kSize) {
       float r = (90 + 80 * t) * lit, g = (120 + 60 * t) * lit, b = (60 + 40 * t) * lit;
       cv.Put(x, y, uint32_t(std::min(r, 255.f)) << 16 | uint32_t(std::min(g, 255.f)) << 8 | uint32_t(std::min(b, 255.f)));
     }
-  // Where nobody walks: cells of 4 x 4 pixels, each asked once.
-  if (m.walkable) {
-    const int kCell = 4, kCells = n / kCell;
+  // Structures (buildings, walls, bunkers, rocks, ships): what stands over a
+  // metre above the ground, roofs lighter the taller, lit as the ground, their
+  // outlines dark. (Not the sea's surface: drawn as water above.)
+  if (structures) {
+    auto above = [&](int x, int y) {
+      if (x < 0 || y < 0 || x >= n || y >= n) return -1.0f;
+      float t = top[size_t(y) * n + x], g = h[size_t(y) * n + x];
+      if (!std::isfinite(t) || is_water(size_t(y) * n + x)) return -1.0f;
+      return std::isfinite(g) && g > -1e8f ? t - g : 99.0f;  // (off the terrain: ships, piers)
+    };
+    for (int y = 0; y < n; ++y)
+      for (int x = 0; x < n; ++x) {
+        float a = above(x, y);
+        if (a < 1.0f) continue;
+        const float* t = &top[size_t(y) * n + x];
+        float gx = x > 0 && x + 1 < n ? t[1] - t[-1] : 0, gy = y > 0 && y + 1 < n ? t[n] - t[-n] : 0;
+        float lit = std::isfinite(gx + gy) ? std::clamp(1.0f + (-gx - gy) / (4 * mpp) * 0.5f, 0.55f, 1.35f) : 1.0f;
+        bool edge = false;
+        for (auto [dx, dy] : {std::pair{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
+          float b = above(x + dx, y + dy);
+          if (b < 1.0f || std::fabs(top[size_t(y + dy) * n + x + dx] - *t) > 2.5f) edge = true;
+        }
+        float k = std::clamp(a / 15.0f, 0.0f, 1.0f) * 50 + 150;
+        float r = k * lit, g = (k - 8) * lit, b = (k - 22) * lit;
+        if (edge) r *= 0.45f, g *= 0.45f, b *= 0.45f;
+        cv.Put(x, y, uint32_t(std::min(r, 255.f)) << 16 | uint32_t(std::min(g, 255.f)) << 8 | uint32_t(std::min(b, 255.f)));
+      }
+  }
+  // Where nobody walks, darker (on land: the water shows it; with the
+  // structures drawn, lighter: they show it already).
+  if (!walk.empty()) {
     for (int cy = 0; cy < kCells; ++cy)
       for (int cx = 0; cx < kCells; ++cx) {
-        float wx = m.cx - m.half + (cx + 0.5f) * kCell * mpp, wz = m.cz + m.half - (cy + 0.5f) * kCell * mpp;
+        if (walk[size_t(cy) * kCells + cx]) continue;
         float gy = h[(cy * kCell + kCell / 2) * n + cx * kCell + kCell / 2];
-        if (m.walkable(wx, std::isfinite(gy) && gy > -1e8f ? gy : m.y, wz)) continue;
+        if (std::isfinite(gy) && gy < sea - 0.3f) continue;
         for (int y = 0; y < kCell; ++y)
-          for (int x = 0; x < kCell; ++x) cv.Put(cx * kCell + x, cy * kCell + y, 0x2A2A2A, 0.8f);
+          for (int x = 0; x < kCell; ++x) cv.Put(cx * kCell + x, cy * kCell + y, 0x2A2A2A, structures ? 0.35f : 0.8f);
       }
   }
   // A 10 m scale bar, bottom left.
@@ -898,7 +985,7 @@ void SetLevelMap(const std::string& map, const MapView& level) {
     std::ofstream(g_run_dir / "index.html", std::ios::binary) << kViewer;
   }
   // The whole level, 1024 pixels (outside the lock: it takes a moment).
-  std::vector<uint8_t> png = Draw(level, 1024);
+  std::vector<uint8_t> png = Draw(level, 2048);  // (about 0.8 m a pixel on Wake Island)
   std::lock_guard lock(g_run_mutex);
   std::ofstream(g_run_dir / "map.png", std::ios::binary).write(reinterpret_cast<const char*>(png.data()), std::streamsize(png.size()));
   WriteRun();

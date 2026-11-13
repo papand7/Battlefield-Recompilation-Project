@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace rt {
 
@@ -18,5 +19,8 @@ void SetBotPlayerVehicle(int i, uint32_t vehicle);  // the vehicle the director 
 void SightForMap(const std::string& map);
 bool InSight(const float a[3], const float b[3]);
 float TerrainHeight(float x, float z);  // -1e9 off the terrain or before it is known
+bool SightReadyFor(const std::string& map);
+// The collision's highest surface over a grid (the training replay's map).
+bool CollisionTops(float x0, float z0, float mpp, int n, std::vector<float>& top);
 
 }  // namespace rt

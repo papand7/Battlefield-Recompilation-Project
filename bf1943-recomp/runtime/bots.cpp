@@ -721,7 +721,8 @@ void StartBotDirector() {
       // Training: the run's record (bot_llm.h): the whole level drawn once a
       // map (the flags' extent and 150 m round), and every bot's track.
       static std::string recorded;
-      if (g_training && have_mesh && recorded != map) {
+      // (once the map's collision is in: its terrain and structures are drawn from it)
+      if (g_training && have_mesh && recorded != map && SightReadyFor(map)) {
         recorded = map;
         float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f, ys = 0;
         for (const Point& p : d.points)
@@ -735,6 +736,9 @@ void StartBotDirector() {
           return h < -1e8f ? NAN : h;
         };
         level.walkable = [](float x, float y, float z) { return nav::Walkable(x, y, z); };
+        level.tops = [](float x0, float z0, float mpp, int n, std::vector<float>& top) {
+          return CollisionTops(x0, z0, mpp, n, top);
+        };
         for (const Point& p : d.points) level.markers.push_back({botllm::Marker::kObjective, p.pos.x, p.pos.z});
         botllm::SetLevelMap(map, level);
       }
