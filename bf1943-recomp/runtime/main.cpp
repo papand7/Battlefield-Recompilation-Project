@@ -6,6 +6,7 @@
 #include "texture_replacement.h"  // xenia_shims
 #include "pbr_shaders.h"          // xenia_shims
 #include "xenia_bridge.h"
+#include "bot_knowledge.h"
 #include "bot_llm.h"
 namespace xe::gpu::scenefx { void Configure(const char* settings); }  // xenia gpu/vulkan/scene_fx.h
 
@@ -331,6 +332,7 @@ int main(int argc, char** argv) {
       std::this_thread::sleep_for(std::chrono::minutes(train_minutes));
       botllm::FinishRun();
       botllm::StopServer();
+      rt::knowledge::Save();  // (ExitProcess runs no atexit: the last minute's learning)
       RT_INFO("training: %d minutes are up", train_minutes);
       fflush(nullptr);
       ExitProcess(0);

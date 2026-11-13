@@ -51,8 +51,7 @@ file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS ${ROOT}/runtime/*.cpp)
 set(PC_UI_SOURCES  # (GDI / GDI+: the server has stand-ins, the game posix_gdiplus.cpp)
   ${ROOT}/runtime/pc_settings.cpp ${ROOT}/runtime/pc_menu.cpp ${ROOT}/runtime/pc_ui.cpp ${ROOT}/runtime/fps_overlay.cpp)
 list(REMOVE_ITEM RUNTIME_SOURCES
-  ${ROOT}/runtime/game_patches.cpp ${ROOT}/runtime/bots.cpp ${ROOT}/runtime/bot_players.cpp
-  ${ROOT}/runtime/bot_knowledge.cpp ${PC_UI_SOURCES})
+  ${ROOT}/runtime/game_patches.cpp ${ROOT}/runtime/bots.cpp ${ROOT}/runtime/bot_players.cpp ${PC_UI_SOURCES})
 file(GLOB BC_RUNTIME_SOURCES CONFIGURE_DEPENDS ${BC}/runtime/*.cpp)
 list(REMOVE_ITEM BC_RUNTIME_SOURCES ${BC}/runtime/bc_mp_menu.cpp)
 file(GLOB DETOUR_SOURCES CONFIGURE_DEPENDS ${ROOT}/thirdparty/recastnavigation/Detour/Source/*.cpp)
@@ -87,6 +86,9 @@ target_include_directories(bfbc1_server PRIVATE ${ROOT}/runtime ${ROOT}/runtime/
 target_compile_options(bfbc1_server PRIVATE -march=x86-64-v3 -fno-strict-aliasing)
 target_link_libraries(bfbc1_server PRIVATE bfbc1_ppc bfbc1_xexload bfbc1_xenia_apu Threads::Threads ${CMAKE_DL_LIBS})
 target_link_options(bfbc1_server PRIVATE -rdynamic)  # symbol names in crash stacks
+# What the bots learned of each map (runtime/bot_knowledge.h), next to the exe.
+add_custom_command(TARGET bfbc1_server POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory ${BC}/data/bot_knowledge $<TARGET_FILE_DIR:bfbc1_server>/bot_knowledge)
 
 # ---- The game (BFBC1_CLIENT=ON): as bf1943's (its CMake's notes: X11 and
 # Vulkan headers, SDL3 fetched, the shaders from tools/build_xenia_shaders.py).
@@ -129,4 +131,6 @@ if(BFBC1_CLIENT)
   target_link_options(bfbc1 PRIVATE -rdynamic)
   add_custom_command(TARGET bfbc1 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BC}/data/pbr_shaders.txt $<TARGET_FILE_DIR:bfbc1>/pbr_shaders.txt)
+  add_custom_command(TARGET bfbc1 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${BC}/data/bot_knowledge $<TARGET_FILE_DIR:bfbc1>/bot_knowledge)
 endif()

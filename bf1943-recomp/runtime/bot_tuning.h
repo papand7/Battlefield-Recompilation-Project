@@ -8,11 +8,15 @@
 // the champion. Saved per map as <user>/bot_knowledge/<map>.tune (shipped:
 // data/bot_knowledge/<map>.tune next to the exe, tools/bot_knowledge.py).
 #pragma once
+#include <cstdint>
 #include <string>
 
 namespace rt::tuning {
 
-void UseMap(const std::string& map, bool training);
+// A game's own defaults (kTuneCount values; null: kTuneInfo's, bf1943's
+// brain's) and which settings its bots use (bit 1 << Tune: only those are
+// moved in a candidate).
+void UseMap(const std::string& map, bool training, const float* defaults = nullptr, uint32_t used = ~0u);
 // The settings that bot slot plays with (botapi::kTuneCount values).
 const float* For(int slot);
 // What a bot did (from any thread): a kill, a death, a flag its team took

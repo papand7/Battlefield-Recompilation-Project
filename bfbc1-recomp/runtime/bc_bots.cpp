@@ -29,7 +29,10 @@
 // float triplets that look like a world position, to find the fields to read.
 #include "kernel.h"
 #include "bc_compat.h"
+#include "bot_knowledge.h"
 #include "bot_llm.h"
+#include "bot_tuning.h"
+#include "bots/bot_api.h"
 #include "DetourNavMesh.h"
 #include "DetourNavMeshQuery.h"
 #include "DetourCommon.h"
@@ -1620,8 +1623,51 @@ struct Bot {
   int64_t vdetour_until = 0;
   float idle_at[2] = {0, 0};  // where it has stood since then (within 5 m)
   int64_t idle_since = 0;
+  // What the matches taught (bot_knowledge.h): the spot to hold a crate from
+  // (for which crate, chosen when; none: the crate itself), and where enemies
+  // usually come from there (checked when).
+  uint32_t spot_for = 0;
+  bool have_spot = false;
+  float spot[3] = {0, 0, 0};
+  int64_t spot_at = 0, threat_at = 0;
+  bool threat = false;
+  float threat_yaw = 0;
+  // The training replay's shots (bot_llm.h): the last one noted, and the last
+  // time its fire hurt someone (822D1AA0) and where (the chest).
+  int64_t shot_at = 0, hit_at = 0;
+  float hit_pos[3] = {0, 0, 0};
 };
 static std::deque<Bot> g_bots;
+// Self-play tuning (bot_tuning.h): bf1943's settings (bots/bot_api.h's Tune)
+// where this brain has the same number, with its own numbers as the defaults:
+// engage_range 70 (enemies within), close_in 30 (farther: it walks at them;
+// nearer: it crouches), advance 1 (full stick, where bf1943's walks at 0.6),
+// strafe_period 1.2 s (0.6 to 1.8 s), strafe_amount 1, flag_mates 12 (a crate
+// 12 m worse per teammate going there) and flag_distance (how much a metre
+// counts: 0.04 is 1 m a metre, as it was) for its crates, sprint_distance 20
+// (bf1943's 25). Not here: aim_tolerance (its aim is put on the enemy, no
+// turning to wait for), flag_defend, flag_neutral and flag_enemy (crates
+// have no owner to weigh).
+static const float* BcTuneDefaults() {
+  static float d[botapi::kTuneCount];
+  static const bool once = [] {
+    for (int i = 0; i < botapi::kTuneCount; ++i) d[i] = botapi::kTuneInfo[i].def;
+    d[botapi::kAdvance] = 1.0f, d[botapi::kSprintDistance] = 20.0f;
+    return true;
+  }();
+  (void)once;
+  return d;
+}
+constexpr uint32_t kBcTuneUsed = 1u << botapi::kEngageRange | 1u << botapi::kCloseIn | 1u << botapi::kAdvance |
+                                 1u << botapi::kStrafePeriod | 1u << botapi::kStrafeAmount |
+                                 1u << botapi::kFlagMates | 1u << botapi::kFlagDistance |
+                                 1u << botapi::kSprintDistance;
+// The map's tuning and knowledge, taken up once the map is known.
+static void UseMapLearning() {
+  if (g_host_map.empty()) return;
+  tuning::UseMap(g_host_map, g_training, BcTuneDefaults(), kBcTuneUsed);
+  knowledge::UseMap(g_host_map);
+}
 static Bot* BotWithSoldier(uint32_t so) {
   for (Bot& b : g_bots)
     if (b.soldier && b.soldier == so) return &b;
@@ -2569,12 +2615,17 @@ static std::condition_variable g_sight_wake;
 static std::deque<SightAsk> g_sight_asks;
 static std::unordered_map<uint64_t, std::pair<bool, int64_t>> g_sight_answers;  // seen, when
 static std::set<uint64_t> g_sight_pending;
+// The level's sight, built as soon as it can be (on the game's thread):
+// whether it is there.
+static bool EnsureSight() {
+  if (g_sight.load()) return true;
+  StartSight();
+  if (!g_sight_buildable.load()) return false;
+  BuildSight();  // the game's thread
+  return true;
+}
 static bool InSightCached(uint32_t from, uint32_t to, const float a[3], const float b[3]) {
-  if (!g_sight.load()) {
-    StartSight();
-    if (!g_sight_buildable.load()) return false;
-    BuildSight();  // the game's thread
-  }
+  if (!EnsureSight()) return false;
   static std::once_flag once;
   std::call_once(once, [] {
     std::thread([] {
@@ -2950,6 +3001,59 @@ static void AskAdvisor(Bot& b, int why, const std::string& situation, float x, f
   }
 }
 
+// What the matches taught (bot_knowledge.h), as bf1943's brain uses it. The
+// spot to hold a crate from: of 24 around it (6, 12 and 20 m off), the one its
+// team killed from most and died at least (kills - 1.5 x deaths over 6 m, with
+// 3 or more of them to go by), on the mesh's main piece. False: none known.
+static bool LearnedSpot(const float at[3], int team, float out[3]) {
+  if (!g_navquery) return false;
+  float best = 0;
+  bool found = false;
+  for (float r : {6.0f, 12.0f, 20.0f})
+    for (int k = 0; k < 8; ++k) {
+      float a = k * 0.785f, px = at[0] + r * std::sin(a), pz = at[2] + r * std::cos(a);
+      float kills = knowledge::Get(knowledge::kKills, team, px, pz, 6.0f);
+      float deaths = knowledge::Get(knowledge::kDeaths, team, px, pz, 6.0f);
+      if (kills + deaths < 3.0f) continue;
+      float score = kills - 1.5f * deaths;
+      if (score <= best) continue;
+      dtQueryFilter filter;
+      const float c[3] = {px, at[1], pz}, ext[3] = {3, 6, 3};
+      dtPolyRef ref = 0;
+      float p[3];
+      if (!NearestMain(c, ext, filter, &ref, p) || std::hypot(p[0] - px, p[2] - pz) > 4.0f) continue;
+      best = score, found = true, memcpy(out, p, sizeof(p));
+    }
+  return found;
+}
+// Where enemies usually come from around x, z: of 12 ways, the one the
+// enemy's players went through and killed from most, 15 to 50 m off. False
+// when there is too little to go by.
+static bool Threat(float x, float z, int team, float* yaw) {
+  int enemy = 3 - team;
+  float best = 0;
+  for (int k = 0; k < 12; ++k) {
+    float a = k * 0.5236f, score = 0;
+    for (float r : {15.0f, 30.0f, 50.0f}) {
+      float px = x + r * std::sin(a), pz = z + r * std::cos(a);
+      score += knowledge::Get(knowledge::kVisits, enemy, px, pz, 8.0f) + 4.0f * knowledge::Get(knowledge::kKills, enemy, px, pz, 8.0f);
+    }
+    if (score > best) best = score, *yaw = a;
+  }
+  return best >= 20.0f;
+}
+// The training replay (bot_llm.h): a bot's fire, every 150 ms while it fires,
+// from its eyes to the enemy's chest where it aims, or to whom it hit (its
+// fire hurt someone since the last one noted: 822D1AA0).
+static void NoteShot(Bot& b, float x, float y, float z, int64_t now) {
+  if (!g_training || now - b.shot_at < 150) return;
+  bool hit = b.hit_at > b.shot_at;
+  b.shot_at = now;
+  const float from[3] = {x, y + 1.6f, z};
+  const float aim[3] = {b.ex, b.ey + 1.2f, b.ez};
+  botllm::Shot(b.index, from, hit ? b.hit_pos : aim, hit);
+}
+
 static void BotBrain(Bot& b, uint32_t in) {
   auto set = [in](uint32_t off, float f) {
     uint32_t u;
@@ -2962,20 +3066,26 @@ static void BotBrain(Bot& b, uint32_t in) {
   float x = LdF(so + 0x200), y = LdF(so + 0x204), z = LdF(so + 0x208);
   NoteInteractions();
   UnblockExpired();
+  // Its behaviour settings (self-play tuning, bot_tuning.h; BcTuneDefaults).
+  UseMapLearning();
+  const float* tune = g_host_map.empty() ? BcTuneDefaults() : tuning::For(b.index);
+  auto T = [tune](botapi::Tune t) { return tune[t]; };
   uint32_t goal = 0;
   float best = 1e9f;
   bool guard = false;
   // Each objective scored as bf1943's ChoosePoint: nearer is better, 12 m
   // worse for each teammate already going there (the bots spread out), 15 m
   // better for the one it is on already (no flip-flopping), and none it gave
-  // up on lately.
+  // up on lately. (Tuned: flag_mates, the metres a teammate counts; and
+  // flag_distance, how much a metre counts, 0.04 as 1.)
+  const float per_metre = T(botapi::kFlagDistance) / botapi::kTuneInfo[botapi::kFlagDistance].def;
   float best_score = 1e9f;
   auto consider = [&](uint32_t ie, bool as_guard) {
     if (b.avoid_until.count(ie) && now < b.avoid_until[ie]) return;
     float d = std::hypot(LdF(ie + 0xD0) - x, LdF(ie + 0xD8) - z);
     int going = 0;
     for (const Bot& o : g_bots) going += &o != &b && o.team == b.team && o.objective == ie;
-    float score = d + 12.0f * going - (ie == b.objective ? 15.0f : 0.0f);
+    float score = d * per_metre + T(botapi::kFlagMates) * going - (ie == b.objective ? 15.0f : 0.0f);
     if (score < best_score) best_score = score, best = d, goal = ie, guard = as_guard;
   };
   for (uint32_t ie : CrateEntities())
@@ -2986,6 +3096,29 @@ static void BotBrain(Bot& b, uint32_t in) {
   if (goal != b.objective) b.objective = goal, b.objective_stucks = 0, b.planned = 0;
   float tx = x, ty = y, tz = z;
   if (goal) tx = LdF(goal + 0xD0), ty = LdF(goal + 0xD4), tz = LdF(goal + 0xD8);
+  // Guarding a crate (the enemy's to arm or defuse): from the spot the
+  // matches showed is good to hold it from (LearnedSpot; chosen again every
+  // 30 s and for each crate, within 60 m of it), else at the crate; and
+  // watching where enemies usually come from there (Threat, every 3 s).
+  const float crate_d = best;
+  if (!goal || !guard) b.spot_for = 0, b.have_spot = false, b.threat = false;
+  else {
+    if (crate_d < 60.0f && (b.spot_for != goal || now - b.spot_at > 30000)) {
+      const float at[3] = {tx, ty, tz};
+      float was[3] = {b.spot[0], b.spot[1], b.spot[2]};
+      bool had = b.have_spot && b.spot_for == goal;
+      b.spot_for = goal, b.spot_at = now, b.have_spot = LearnedSpot(at, int(b.team), b.spot);
+      if (b.have_spot != had || (b.have_spot && std::hypot(b.spot[0] - was[0], b.spot[2] - was[2]) > 1.0f)) {
+        b.planned = 0;
+        if (b.have_spot)
+          RT_INFO("bot %d: holds crate %08X from a learned spot %.0f m off it", b.index, goal,
+                  std::hypot(b.spot[0] - tx, b.spot[2] - tz));
+      }
+    }
+    if (b.have_spot && b.spot_for == goal)
+      tx = b.spot[0], ty = b.spot[1], tz = b.spot[2], best = std::hypot(tx - x, tz - z);
+    if (crate_d < 60.0f && now - b.threat_at > 3000) b.threat_at = now, b.threat = Threat(x, z, int(b.team), &b.threat_yaw);
+  }
   // Taking a vehicle (BF_BOT_NO_VEHICLES=1: never): on foot, no enemy, the
   // goal over 120 m off: the nearest drivable one within 30 m with the
   // driver's seat free (a gunner's seat 1 when a teammate drives a Humvee or a
@@ -3039,17 +3172,22 @@ static void BotBrain(Bot& b, uint32_t in) {
   while (b.step < b.route.size() && std::hypot(b.route[b.step][0] - x, b.route[b.step][2] - z) < 1.5f) ++b.step;
   float px = tx, pz = tz;
   if (b.step < b.route.size()) px = b.route[b.step][0], pz = b.route[b.step][2];
-  bool arrived = !goal || (guard ? best < 6.0f : best < 1.0f && b.step >= b.route.size());
+  bool arrived = !goal || (guard ? best < (b.have_spot ? 2.5f : 6.0f) : best < 1.0f && b.step >= b.route.size());
   // The advisor's answer: the place it picked, as a detour (to cover: walked
   // to while fighting). Not for a soldier since dead, nor once far from there.
   JudgeAdvice(b, so, x, z, now);
   // Training: the run's record (bot_llm.h): the whole level drawn once a map
-  // (the crates' extent and 150 m round), and every bot's track.
+  // (the crates' extent and 350 m round), and every bot's track. Drawn once
+  // the level's sight is built (its collision: the structures, MapView::tops)
+  // and its terrain read, on a thread of its own (2048 pixels take seconds;
+  // the server goes on), with a navigation query of its own (Detour's are for
+  // one thread each).
   static std::string recorded;
-  if (g_training && recorded != g_host_map && g_navquery) {
+  if (g_training && recorded != g_host_map && g_navquery && EnsureSight()) {
     std::vector<uint32_t> crates = CrateEntities();
     if (!crates.empty()) {
       recorded = g_host_map;
+      TerrainOfMap();  // (read now)
       float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f, ys = 0;
       for (uint32_t c : crates) {
         float cx = LdF(c + 0xD0), cz = LdF(c + 0xD8);
@@ -3059,16 +3197,32 @@ static void BotBrain(Bot& b, uint32_t in) {
       level.cx = (x0 + x1) / 2, level.cz = (z0 + z1) / 2, level.half = std::max(x1 - x0, z1 - z0) / 2 + 350.0f;
       level.y = ys / float(crates.size());
       level.ground = [](float gx, float gz) { return TerrainHeight(gx, gz); };
-      level.walkable = [](float wx, float wy, float wz) {
-        dtQueryFilter filter;
-        const float ext[3] = {2.0f, 4.0f, 2.0f};
-        float p[3] = {wx, wy, wz}, q[3];
-        dtPolyRef r = 0;
-        g_navquery->findNearestPoly(p, ext, &filter, &r, q);
-        return r && InMainPiece(r);
+      level.tops = [](float tx0, float tz0, float mpp, int n, std::vector<float>& top) {
+        SightGrid* g = g_sight.load();
+        if (!g) return false;
+        botllm::TopsOfTriangles(g->tris, tx0, tz0, mpp, n, top);
+        return true;
       };
       for (uint32_t c : crates) level.markers.push_back({botllm::Marker::kObjective, LdF(c + 0xD0), LdF(c + 0xD8)});
-      botllm::SetLevelMap(g_host_map, level);
+      std::thread([level = std::move(level), map = g_host_map]() mutable {
+        dtNavMeshQuery* q = dtAllocNavMeshQuery();
+        if (q && dtStatusFailed(q->init(g_navmesh, 2048))) dtFreeNavMeshQuery(q), q = nullptr;
+        if (q)
+          level.walkable = [q](float wx, float wy, float wz) {
+            dtQueryFilter filter;
+            const float ext[3] = {2.0f, 4.0f, 2.0f};
+            float p[3] = {wx, wy, wz}, c[3];
+            dtPolyRef r = 0;
+            q->findNearestPoly(p, ext, &filter, &r, c);
+            return r && InMainPiece(r);
+          };
+        auto t0 = std::chrono::steady_clock::now();
+        botllm::SetLevelMap(map, level);
+        RT_INFO("training: %s's map drawn in %.1f s", map.c_str(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        level.walkable = nullptr;
+        if (q) dtFreeNavMeshQuery(q);
+      }).detach();
     }
   }
   botllm::Track(b.index, int(b.team), x, z);
@@ -3096,7 +3250,7 @@ static void BotBrain(Bot& b, uint32_t in) {
   static int64_t soldiers_at = 0;
   if (now - soldiers_at > 1000) soldiers_at = now, soldiers = QuickScan(0x820118D0);
   if (b.enemy && (!IsCommitted(b.enemy + 0x20C) || Ld32(b.enemy) != 0x820118D0 || LdF(b.enemy + 0x3C) <= 0)) b.enemy = 0;
-  // Enemies (bf1943's): the three nearest within 70 m, the first of them in
+  // Enemies (bf1943's): the three nearest within 70 m (engage_range), the first of them in
   // sight; one out of sight is kept for 1.5 s (fired at where it was).
   bool enemy_visible = false;
   if (now - b.looked_at > 250) {
@@ -3109,7 +3263,7 @@ static void BotBrain(Bot& b, uint32_t in) {
       float ex = LdF(e + 0x200), ey = LdF(e + 0x204), ez = LdF(e + 0x208);
       if (!std::isfinite(ex) || !std::isfinite(ez) || std::fabs(ex) + std::fabs(ez) < 1.0f) continue;
       float d = std::hypot(ex - x, ez - z);
-      if (d < 70.0f && std::fabs(ey - y) < 20.0f) close_by.push_back({d, e});
+      if (d < T(botapi::kEngageRange) && std::fabs(ey - y) < 20.0f) close_by.push_back({d, e});
     }
     std::sort(close_by.begin(), close_by.end());
     uint32_t seen = 0;
@@ -3281,16 +3435,16 @@ static void BotBrain(Bot& b, uint32_t in) {
   }
   // Crouching (bit 16, a toggle: heights of 1.38 fell to 1.00, BF_BOT_POSE_TEST)
   // while fighting an enemy over 8 m off; standing again to move on.
-  // (Not beyond 30 m, where it closes in, nor while strafing.)
-  bool want_crouch = b.enemy && b.edist > 8.0f && b.edist <= 30.0f && b.strafe == 0 && now >= b.cover_until;
+  // (Not beyond 30 m, close_in, where it closes in, nor while strafing.)
+  bool want_crouch = b.enemy && b.edist > 8.0f && b.edist <= T(botapi::kCloseIn) && b.strafe == 0 && now >= b.cover_until;
   bool toggle = want_crouch != b.crouched && now - b.pose_at > 800;
   if (toggle) b.crouched = want_crouch, b.pose_at = now;
   if (now - b.pose_at < 200) extra_bits |= 1u << 16;
   if (b.crouched && !b.enemy) forward = 0;  // until it has stood up
   // Buttons are bits of +84: 13 jump (A), 16 crouch, 21 reload (X), 23 sprint
   // (the left stick's click: 21 m in 4 s against 15 walking, BF_BOT_SPRINT_TEST).
-  // Sprinting on the way when the goal is over 20 m off.
-  bool sprint = forward > 0.9f && !b.enemy && best > 20.0f && now >= b.unstick_until && !sprint_test;
+  // Sprinting on the way when the goal is over 20 m off (sprint_distance).
+  bool sprint = forward > 0.9f && !b.enemy && best > T(botapi::kSprintDistance) && now >= b.unstick_until && !sprint_test;
   if (vehicle_press) extra_bits |= (1u << 14) | (1u << 17);
   St32(in + 0x84, (jump ? 0x2000u : 0u) | (reload ? 0x200000u : 0u) | (sprint ? 0x800000u : 0u) | extra_bits);
   if (!b.in_vehicle) St32(in + 0x80, Ld32(in + 0x80) & ~0x900u);  // the seated bits (below), not on foot
@@ -3308,10 +3462,14 @@ static void BotBrain(Bot& b, uint32_t in) {
   }
   if (b.enemy) {
     // Moving while fighting (bf1943's): a strafe left, right or none, changed
-    // every 0.6 to 1.8 s; closing in on an enemy over 30 m off.
-    if (now >= b.strafe_until) b.strafe = rand() % 3 - 1, b.strafe_until = now + 600 + rand() % 1200;
-    forward = b.edist > 30.0f && !b.crouched ? 1.0f : 0.0f;
-    strafe = b.crouched ? 0.0f : float(b.strafe);
+    // every 0.6 to 1.8 s (strafe_period 1.2 s: half to one and a half times
+    // it), at strafe_amount; closing in on an enemy over 30 m off (close_in)
+    // at advance.
+    if (now >= b.strafe_until)
+      b.strafe = rand() % 3 - 1,
+      b.strafe_until = now + int64_t((0.5f + float(rand()) / float(RAND_MAX)) * T(botapi::kStrafePeriod) * 1000.0f);
+    forward = b.edist > T(botapi::kCloseIn) && !b.crouched ? T(botapi::kAdvance) : 0.0f;
+    strafe = b.crouched ? 0.0f : float(b.strafe) * T(botapi::kStrafeAmount);
     // To the cover the advisor picked, facing the enemy: the way there split
     // along its forward row (+320/+328) and minus its right row (+300/+308).
     if (now < b.cover_until && !b.crouched) {
@@ -3340,6 +3498,7 @@ static void BotBrain(Bot& b, uint32_t in) {
     if (now - b.engaged_at > 400 && clear && enemy_visible) {
       set(0x28, 1.0f), St32(in + 0x3C, 0x3C000000u | (Ld32(in + 0x3C) & 0xFFFFu));
       b.fired = true;
+      NoteShot(b, x, y, z, now);
       // Its own bullets hit (12 a hit through 822D1AA0, credited to it) now that
       // its aim has the yaw and pitch toward the target; they didn't while the
       // gun followed a body that never turned. BF_BOT_ROLL=1: rolled hits as
@@ -3635,6 +3794,7 @@ static void BotBrain(Bot& b, uint32_t in) {
     static const bool bit40 = getenv("BF_BOT_SEAT_BIT40") != nullptr;
     St32(in + 0x80, (Ld32(in + 0x80) & ~(bit40 ? 0u : 0x100u)) | (bit40 ? 0x900u : 0x800u));
     if (fire) {
+      if (b.enemy) NoteShot(b, x, y, z, now);
       float yaw = std::atan2(b.ex - x, b.ez - z);
       set(0x90, yaw);
       set(0x94, std::atan2(b.ey + 1.2f - (y + 1.6f), std::max(b.edist, 0.5f)));
@@ -3667,7 +3827,10 @@ static void BotBrain(Bot& b, uint32_t in) {
   }
   // Facing the enemy or the next point (the aim's convention is half a turn
   // from atan2(dx, dz)).
-  float want = b.enemy ? std::atan2(b.ex - x, b.ez - z) : std::atan2(px - x, pz - z);
+  // (Holding a crate, standing: where enemies usually come from, Threat.)
+  float want = b.enemy ? std::atan2(b.ex - x, b.ez - z)
+               : arrived && guard && b.threat && now >= b.detour_until ? b.threat_yaw
+                                                                       : std::atan2(px - x, pz - z);
   b.want_heading = want + 3.14159265f, b.steer = b.aim_obj != 0;
   b.face = want, b.facing = !b.in_vehicle;
   // Looking up or down: at the enemy's chest from the eye, else level.
@@ -3802,7 +3965,8 @@ extern "C" PPC_FUNC(__imp__sub_822C4F48);
 extern "C" PPC_FUNC(__imp__sub_822D1AA0);
 extern "C" PPC_FUNC(__imp__sub_823458B0);
 extern "C" PPC_FUNC(__imp__sub_82341670);
-static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, float amount, uint32_t attacker);
+static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, float amount, uint32_t attacker,
+                          bool shot = true);
 PPC_FUNC(sub_821BF2A8) {
   uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32;
   if (IsCommitted(r4) && Ld32(r4) == 0x8200DC48) {
@@ -3840,12 +4004,19 @@ PPC_FUNC(sub_821BF2A8) {
           if ((t != 1 && t != 2) || t == b.team) continue;
           float d = std::hypot(LdF(o + 0x200) - b.grenade_pos[0], LdF(o + 0x208) - b.grenade_pos[2]);
           if (d < 6.0f && std::fabs(LdF(o + 0x204) - b.grenade_pos[1]) < 3.0f)
-            DamageSoldier(ctx, base, o, 60.0f * (1.0f - d / 6.0f) + 10.0f, b.spawner);
+            DamageSoldier(ctx, base, o, 60.0f * (1.0f - d / 6.0f) + 10.0f, b.spawner, false);
         }
       }
       if (uint32_t ie = b.use_entity) {
         b.use_entity = 0;
         b.used.insert(ie);
+        // Self-play tuning (bot_tuning.h): a crate armed or defused is Bad
+        // Company's flag taken, for the bot and its teammates within 25 m.
+        if (b.team == 1 ? CanArmNow(ie) : CanDefuseNow(ie))
+          for (const Bot& o : g_bots)
+            if (o.team == b.team && o.soldier && IsCommitted(o.soldier + 0x20C) && Ld32(o.soldier) == 0x820118D0 &&
+                std::hypot(LdF(o.soldier + 0x200) - LdF(ie + 0xD0), LdF(o.soldier + 0x208) - LdF(ie + 0xD8)) < 25.0f)
+              tuning::Capture(o.index);
         PPCContext c = ctx;
         c.r3.u64 = ie, c.r4.u64 = b.soldier, c.r5.u64 = 0, c.r6.u64 = 0;
         __imp__sub_822C4F48(c, base);
@@ -3965,7 +4136,53 @@ static uint32_t BotKit(Bot& b, uint32_t host_kit) {
 // (zero here); the giver: a pointer to a word pointing at the attacking
 // player + 0xC4 (82328920), the player being its spawn object (vtable
 // 82019490: BF_BOT_DAMAGE_TRACE on a crate's blast), so the kill is the bot's.
-static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, float amount, uint32_t attacker) {
+// What a hit on a soldier means for the bots, as bf1943's damage hook: made
+// before 822D1AA0 runs, Done after. A bot's shot that hurt an enemy marks its
+// shot in the training replay as a hit (NoteShot). A kill: where the soldier
+// fell (learning, bot_knowledge.h: a bot's death counts 0.3), where its killer
+// stood (an enemy's kill), the bots' deaths and kills (self-play tuning,
+// bot_tuning.h) and the replay's mark. The giver (r5): a word pointing at the
+// attacking player + 0xC4, the player a spawn object (vtable 82019490) with
+// its soldier at +104.
+struct DamageNote {
+  uint32_t victim = 0, player = 0, team = 0;
+  float before = 0, pos[3] = {0, 0, 0};
+  bool shot;
+  DamageNote(uint32_t soldier, uint32_t giver, bool is_shot) : shot(is_shot) {
+    if (!Ptr(soldier) || !IsCommitted(soldier + 0x400) || Ld32(soldier) != 0x820118D0) return;
+    victim = soldier, before = LdF(soldier + 0x3C), team = Ld32(soldier + 0x48);
+    for (int i = 0; i < 3; ++i) pos[i] = LdF(soldier + 0x200 + 4 * i);
+    uint32_t w = Ptr(giver) ? Ld32(giver) : 0, q = Ptr(w) ? Ld32(w) : 0;
+    if (q > 0xC4 && Ptr(q - 0xC4) && IsCommitted(q - 0xC4 + 0x108) && Ld32(q - 0xC4) == 0x82019490) player = q - 0xC4;
+  }
+  void Done() {
+    if (!victim || before <= 0) return;
+    float after = LdF(victim + 0x3C);
+    Bot* by = player ? BotWithSpawner(player) : nullptr;
+    if (by && shot && after < before && by->team != team) {
+      by->hit_at = int64_t(GetTickCount64());
+      by->hit_pos[0] = pos[0], by->hit_pos[1] = pos[1] + 1.2f, by->hit_pos[2] = pos[2];
+    }
+    if (after > 0) return;
+    Bot* dead = BotWithSoldier(victim);
+    knowledge::Add(knowledge::kDeaths, int(team), pos[0], pos[2], dead ? 0.3f : 1.0f);
+    if (dead) tuning::Death(dead->index);
+    uint32_t killer = by && by->soldier ? by->soldier : player ? Ld32(player + 0x104) : 0;
+    bool enemy = false;
+    if (killer != victim && Ptr(killer) && IsCommitted(killer + 0x400) && Ld32(killer) == 0x820118D0) {
+      uint32_t kteam = Ld32(killer + 0x48);
+      enemy = (kteam == 1 || kteam == 2) && kteam != team;
+      if (enemy)
+        knowledge::Add(knowledge::kKills, int(kteam), LdF(killer + 0x200), LdF(killer + 0x208), by ? 0.3f : 1.0f);
+    } else if (by) {
+      enemy = by->team != team;  // (its soldier gone since: a grenade's)
+    }
+    if (by && enemy) tuning::Kill(by->index);
+    botllm::Killed(pos[0], pos[2], int(team), by && enemy ? by->index : -1);
+  }
+};
+static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, float amount, uint32_t attacker,
+                          bool shot) {
   if (!IsCommitted(soldier + 0x400) || Ld32(soldier) != 0x820118D0 || LdF(soldier + 0x3C) <= 0) return;
   static uint32_t record = 0, giver = 0;
   if (!record) record = g_system_heap->Alloc(0x100, 16), giver = g_system_heap->Alloc(0x10, 16);
@@ -3981,7 +4198,9 @@ static void DamageSoldier(PPCContext& ctx, uint8_t* base, uint32_t soldier, floa
     for (uint32_t k = 0; k < 0x200; k += 4) was.push_back(Ld32(attacker + k));
   PPCContext c = ctx;
   c.r3.u64 = soldier, c.r4.u64 = record, c.r5.u64 = giver;
+  DamageNote note(soldier, giver, shot);
   __imp__sub_822D1AA0(c, base);
+  note.Done();
   if (!was.empty()) {
     std::string d;
     for (uint32_t k = 0; k < 0x200; k += 4)
@@ -4010,6 +4229,27 @@ PPC_FUNC(sub_823D1DD0) {
   int64_t now = int64_t(GetTickCount64());
   if (now - last_check < 1000) return;
   last_check = now;
+  // The bots' learning, once a second (as bf1943's director): the map's
+  // knowledge and tuning taken up; where the real players go (not the bots:
+  // what they do is what is being improved; BF_BOT_LEARN_FROM_BOTS=1, testing:
+  // theirs too), saved each minute; the self-play tuning's round judged when
+  // due (the game's time).
+  UseMapLearning();
+  if (!g_host_map.empty()) {
+    static const bool from_bots = getenv("BF_BOT_LEARN_FROM_BOTS") != nullptr;
+    for (uint32_t o : QuickScan(0x820118D0)) {
+      if (!IsCommitted(o + 0x20C) || Ld32(o) != 0x820118D0 || LdF(o + 0x3C) <= 0) continue;
+      if (BotWithSoldier(o) && !from_bots) continue;
+      uint32_t team = Ld32(o + 0x48);
+      if (team == 1 || team == 2) knowledge::Add(knowledge::kVisits, int(team), LdF(o + 0x200), LdF(o + 0x208));
+    }
+    static int64_t next_save = 0;
+    if (now >= next_save) {
+      if (next_save) knowledge::Save();
+      next_save = now + 60000;
+    }
+    tuning::Update(double(now) / 1000.0, int(g_bots.size()));
+  }
   // The host's soldier in the level (a dedicated server has none: the level
   // loaded is enough).
   if (!host_seen_ms) {
@@ -4556,7 +4796,9 @@ PPC_FUNC(sub_822D1AA0) {
               player, Ld32(player), TypeName(player).c_str(), soldiers.c_str());
     }
   }
+  DamageNote note(ctx.r3.u32, ctx.r5.u32, true);
   __imp__sub_822D1AA0(ctx, base);
+  note.Done();
 }
 
 // BF_BOT_GRENADE_TRACE=1 (testing): ServerGrenadeEntity's constructor (it

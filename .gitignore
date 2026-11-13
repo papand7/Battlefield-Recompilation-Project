@@ -37,3 +37,5 @@ node_modules/
 **/server/arcadia360/obj/
 .git-upstream/
 __pycache__/
+# Bad Company's nav notes written while it plays (where routes failed): play data
+bfbc1-recomp/nav/

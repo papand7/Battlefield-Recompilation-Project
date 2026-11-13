@@ -678,6 +678,24 @@ std::vector<uint8_t> Draw(const MapView& m, int n = kSize) {
       if (std::isfinite(top[i]) && (!std::isfinite(h[i]) || top[i] > h[i] + 1.0f)) ++heights[int(std::lround(top[i] * 2))];
     auto most = std::max_element(heights.begin(), heights.end(), [](auto& a, auto& b) { return a.second < b.second; });
     if (most != heights.end() && most->second > int(top.size() / 10)) water = most->first / 2.0f, sea = water;
+    // Less of the picture (a 200th) for a river, lake or harbour (Bad
+    // Company's levels): the lowest such level, no higher than 1.5 m over the
+    // lowest ground walked on (its banks).
+    else if (n >= 1024 && sea > -1e8f)
+      for (auto& [level, count] : heights)
+        if (count > int(top.size() / 200) && level / 2.0f <= sea + 1.5f) {
+          water = level / 2.0f, sea = water;
+          break;
+        }
+    if (n >= 1024) {  // (the whole level's: what it found)
+      std::vector<std::pair<int, int>> by(heights.begin(), heights.end());
+      std::sort(by.begin(), by.end(), [](auto& a, auto& b) { return a.second > b.second; });
+      std::string common;
+      for (size_t i = 0; i < by.size() && i < 4; ++i)
+        common += " " + std::to_string(by[i].first / 2.0f).substr(0, 6) + " m (" + std::to_string(by[i].second) + ")";
+      RT_INFO("bot llm: the level's map: water %s; the commonest levels over the ground:%s",
+              std::isfinite(water) ? std::to_string(water).substr(0, 6).c_str() : "none", common.c_str());
+    }
   }
   auto is_water = [&](size_t i) { return std::isfinite(water) && std::isfinite(top[i]) && std::fabs(top[i] - water) < 0.6f; };
   for (int y = 0; y < n; ++y)
@@ -964,6 +982,44 @@ bool Answer(int bot, int* place, std::string* why, int64_t* case_id) {
   if (why) *why = b.why;
   if (case_id) *case_id = b.id;
   return true;
+}
+
+void TopsOfTriangles(const std::vector<std::array<float, 9>>& tris, float x0, float z0, float mpp, int n,
+                     std::vector<float>& top) {
+  top.assign(size_t(n) * n, NAN);
+  auto put = [&](int x, int y, float h) {
+    if (x < 0 || y < 0 || x >= n || y >= n) return;
+    float& t = top[size_t(y) * n + x];
+    if (!(t >= h)) t = h;
+  };
+  for (const auto& t : tris) {
+    float px[3], py[3], h[3];
+    for (int k = 0; k < 3; ++k) px[k] = (t[3 * k] - x0) / mpp, py[k] = (z0 - t[3 * k + 2]) / mpp, h[k] = t[3 * k + 1];
+    float lx = std::min({px[0], px[1], px[2]}), hx = std::max({px[0], px[1], px[2]});
+    float ly = std::min({py[0], py[1], py[2]}), hy = std::max({py[0], py[1], py[2]});
+    if (hx < 0 || hy < 0 || lx >= n || ly >= n) continue;
+    // The edges (every half pixel).
+    for (int e = 0; e < 3; ++e) {
+      int a = e, b = (e + 1) % 3;
+      int steps = int(std::hypot(px[b] - px[a], py[b] - py[a]) * 2) + 1;
+      for (int s = 0; s <= steps; ++s) {
+        float f = float(s) / steps;
+        put(int(px[a] + (px[b] - px[a]) * f), int(py[a] + (py[b] - py[a]) * f), h[a] + (h[b] - h[a]) * f);
+      }
+    }
+    // The face: the pixels whose centres are inside, at its height there.
+    float area = (px[1] - px[0]) * (py[2] - py[0]) - (px[2] - px[0]) * (py[1] - py[0]);
+    if (std::fabs(area) < 0.25f) continue;
+    for (int y = std::max(0, int(ly)); y <= std::min(n - 1, int(hy)); ++y)
+      for (int x = std::max(0, int(lx)); x <= std::min(n - 1, int(hx)); ++x) {
+        float cx = x + 0.5f, cy = y + 0.5f;
+        float w0 = ((px[1] - cx) * (py[2] - cy) - (px[2] - cx) * (py[1] - cy)) / area;
+        float w1 = ((px[2] - cx) * (py[0] - cy) - (px[0] - cx) * (py[2] - cy)) / area;
+        float w2 = 1.0f - w0 - w1;
+        if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+        put(x, y, w0 * h[0] + w1 * h[1] + w2 * h[2]);
+      }
+  }
 }
 
 void SetLevelMap(const std::string& map, const MapView& level) {

@@ -13,6 +13,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <vector>
 
 #include "bots/bot_api.h"
 #include "kernel.h"
@@ -42,6 +43,8 @@ std::mutex g_mutex;
 std::string g_map;
 bool g_training = false;
 Settings g_champion, g_candidate;
+Settings g_defaults;  // the game's (UseMap)
+uint32_t g_used = ~0u;
 int g_generation = 0, g_tried = 0, g_taken = 0;
 std::array<Score, botapi::kMaxBots> g_score;
 double g_round_start = -1;
@@ -51,11 +54,7 @@ std::mt19937 g_rng{std::random_device{}()};
 // 6-7, ... are one bot of each).
 bool OnCandidate(int slot) { return g_training && (slot / 2) % 2 == 1; }
 
-Settings Defaults() {
-  Settings s;
-  for (int i = 0; i < kTuneCount; ++i) s[i] = kTuneInfo[i].def;
-  return s;
-}
+Settings Defaults() { return g_defaults; }
 
 FILE* Open(const std::filesystem::path& p, const wchar_t* wmode, const char* mode) {
 #ifdef _WIN32
@@ -120,12 +119,16 @@ void SaveLocked() {
 }
 
 // The champion with two or three settings moved (each by about an eighth of
-// its range, either way).
+// its range, either way), of those the game's bots use.
 Settings Mutate(const Settings& from) {
   Settings s = from;
+  std::vector<int> used;
+  for (int i = 0; i < kTuneCount; ++i)
+    if (g_used >> i & 1) used.push_back(i);
+  if (used.empty()) return s;
   int n = 2 + int(g_rng() % 2);
   for (int k = 0; k < n; ++k) {
-    int i = int(g_rng() % kTuneCount);
+    int i = used[g_rng() % used.size()];
     const auto& t = kTuneInfo[i];
     std::normal_distribution<float> step(0.0f, 0.125f * (t.hi - t.lo));
     s[i] = std::clamp(s[i] + step(g_rng), t.lo, t.hi);
@@ -155,10 +158,13 @@ void NewRound(double now) {
 
 }  // namespace
 
-void UseMap(const std::string& map, bool training) {
+void UseMap(const std::string& map, bool training, const float* defaults, uint32_t used) {
   std::lock_guard l(g_mutex);
   if (map == g_map) return;
   g_map = map, g_training = training;
+  for (int i = 0; i < kTuneCount; ++i)
+    g_defaults[i] = std::clamp(defaults ? defaults[i] : kTuneInfo[i].def, kTuneInfo[i].lo, kTuneInfo[i].hi);
+  g_used = used;
   g_champion = Defaults(), g_generation = g_tried = g_taken = 0;
   const char* from = "the defaults";
   if (Load(LearnedPath(map), g_champion, g_generation)) from = "learned here";

@@ -10,7 +10,9 @@ exe), so every copy of the next version starts from what all of them learned.
       first scales what is shipped by F (0.5: the old matches count half), so
       recent play weighs more. --clear empties the merged learned files after
       (they are in the shipped data now; merging them again would count them twice;
-      stop those servers first, or they save theirs again). --to DIR: into DIR instead.
+      stop those servers first, or they save theirs again). --to DIR: into DIR instead
+      (Bad Company's maps: --to ../bfbc1-recomp/data/bot_knowledge; its teams 1 and 2
+      are the attackers and defenders).
       The bots' tuned behaviour (<map>.tune, runtime/bot_tuning.h: what
       training servers found plays best) goes in too: of all given and the
       shipped one, the furthest tuned (highest generation) per map.

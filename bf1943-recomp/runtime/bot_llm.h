@@ -6,6 +6,7 @@
 // takes the answer when it comes (a few seconds on a GPU, longer on a CPU).
 // Both games use it (BC: bc_bots.cpp; BF1943: bots.cpp for the brain).
 #pragma once
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -46,6 +47,11 @@ struct MapView {
   // going south, NAN where none; false when not known.
   std::function<bool(float x0, float z0, float mpp, int n, std::vector<float>& top)> tops;
 };
+// For tops: a level's collision triangles (x, y up, z for each corner) drawn
+// from above, each one filled and its edges drawn too (walls stand edge-on
+// from above); the highest wins. Both games' sight grids keep theirs.
+void TopsOfTriangles(const std::vector<std::array<float, 9>>& tris, float x0, float z0, float mpp, int n,
+                     std::vector<float>& top);
 
 // Asks for bot `bot` (one question at a time each; not again within
 // `cooldown_ms` of the last). The map is drawn here (call it on the thread that
