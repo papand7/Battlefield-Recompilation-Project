@@ -7,12 +7,29 @@ The work folder holds data made from the game files. Keep it outside this reposi
 
 ## Setup
 
-- Python 3 with `numpy` and `Pillow`.
-- [Real-ESRGAN ncnn Vulkan](https://github.com/xinntao/Real-ESRGAN/releases)
-  (`realesrgan-ncnn-vulkan-20220424-windows.zip`), unpacked to
-  `../tools/realesrgan/` next to the repo folder, or passed with `--esrgan`.
+Python 3 is all it needs, on Windows, Linux or macOS. The rest comes by itself:
+
+- `numpy` and `Pillow`: installed with pip when missing. Where the system's Python
+  refuses that (Ubuntu, Debian, Fedora...), into a Python of texpack's own in
+  `~/.cache/bf1943-texpack/venv`, with no root needed.
+- [Real-ESRGAN ncnn Vulkan](https://github.com/xinntao/Real-ESRGAN/releases) 0.2.5.0
+  (MIT, runs on any Vulkan GPU): the build for your system, fetched into
+  `<work>/realesrgan` and checked against its SHA-256. One unpacked in
+  `../realesrgan/` or `../../../tools/realesrgan/` is used instead, or pass `--esrgan`.
 
 ## Use
+
+All of it in one go (what the launcher runs): stopped runs carry on where they were.
+
+```
+python texpack.py make --game ../../original/v106 --work "../../../texpack_work"
+```
+
+Then start the game with `--textures "../../../texpack_work/install"`. It prints
+`progress <step> <done> <total>` lines (steps: `fetch`, `extract`, `build`,
+`install`). A whole pack can take hours.
+
+The steps one at a time:
 
 ```
 python texpack.py extract --game ../../original/v106 --out "../../../texpack_work"

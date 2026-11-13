@@ -14,6 +14,15 @@
       Writes the textures the game can use (albedo, normal and the upscaled
       non-material textures) as <dir>/rtex/*.rtex and <dir>/replacements.txt,
       for bf1943 --textures <dir>.
+  python texpack.py make --game <original/v106> --work <work> [--out <dir>]
+      All three in one (the launcher's button): what is already done is
+      skipped, so a stopped run carries on. Fetches Real-ESRGAN for this
+      system (Windows, Linux or macOS) into <work>/realesrgan when there is
+      none, and numpy and Pillow with pip when they are missing. Prints
+      "progress <step> <done> <total>" lines for the launcher. --out defaults
+      to <work>/install.
+  python texpack.py fetch --to <dir>
+      Only fetches Real-ESRGAN (realesrgan-ncnn-vulkan, MIT, any Vulkan GPU).
 
 The work folder holds game-derived data: keep it outside the public repository.
 """
@@ -28,15 +37,136 @@ import subprocess
 import sys
 import tempfile
 
-import numpy as np
-from PIL import Image
+import zipfile
 
-import xtexture as xt
+
+def _need(modules):
+    """numpy and Pillow when missing: with pip for this user, or, where the
+    system's Python refuses that (PEP 668: Ubuntu, Debian, Fedora...), in a
+    Python of texpack's own (a venv in the user's cache folder) that this
+    script then runs again in."""
+    missing = []
+    for mod, pkg in modules:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    if not missing:
+        return
+    pip = ['-m', 'pip', 'install', '--disable-pip-version-check', '-q']
+    managed = os.name != 'nt' and sys.prefix == sys.base_prefix and any(
+        os.path.isfile(os.path.join(d, 'EXTERNALLY-MANAGED'))
+        for d in {os.path.dirname(os.__file__), os.path.join(sys.base_prefix, 'lib', 'python%d.%d' % sys.version_info[:2])})
+    if not managed:
+        print('installing', ' '.join(missing), 'with pip', flush=True)
+        if subprocess.run([sys.executable] + pip + ['--user'] + missing).returncode == 0:
+            return
+    if sys.prefix != sys.base_prefix:  # in a venv already (ours or the user's)
+        subprocess.run([sys.executable] + pip + missing, check=True)
+        return
+    cache = os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache')
+    venv = os.path.join(cache, 'bf1943-texpack', 'venv')
+    py = os.path.join(venv, 'Scripts' if os.name == 'nt' else 'bin', 'python' + ('.exe' if os.name == 'nt' else ''))
+    if not os.path.isfile(py):
+        print('making a Python for texpack in', venv, flush=True)
+        if subprocess.run([sys.executable, '-m', 'venv', venv], stderr=subprocess.DEVNULL).returncode != 0:
+            # (Ubuntu and Debian leave pip out of the venv module, python3-venv:
+            # a venv without it, and pip fetched into it, needs no root)
+            import urllib.request
+            ok = subprocess.run([sys.executable, '-m', 'venv', '--without-pip', '--clear', venv]).returncode == 0
+            if ok:
+                get_pip = os.path.join(cache, 'bf1943-texpack', 'get-pip.py')
+                try:
+                    urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', get_pip)
+                    ok = subprocess.run([py, get_pip, '-q', '--disable-pip-version-check']).returncode == 0
+                except OSError:
+                    ok = False
+            if not ok:
+                sys.exit('Could not make a Python for texpack: install the venv module '
+                         '(Ubuntu and Debian: sudo apt install python3-venv), then try again.')
+    print('installing', ' '.join(missing), 'into it', flush=True)
+    subprocess.run([py] + pip + missing, check=True)
+    os.execv(py, [py, os.path.abspath(__file__)] + sys.argv[1:])
+
+
+_need([('numpy', 'numpy'), ('PIL', 'Pillow')])
+import numpy as np  # noqa: E402
+from PIL import Image  # noqa: E402
+
+import xtexture as xt  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_ESRGAN = os.path.normpath(os.path.join(HERE, '..', '..', '..', 'tools', 'realesrgan',
-                                               'realesrgan-ncnn-vulkan.exe'))
+ESRGAN_EXE = 'realesrgan-ncnn-vulkan' + ('.exe' if os.name == 'nt' else '')
+# Real-ESRGAN ncnn Vulkan 0.2.5.0 (MIT), per system: the zip, its SHA-256 and size.
+ESRGAN_URL = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-%s.zip'
+ESRGAN_ZIPS = {
+    'windows': ('abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d', 45474481),
+    'ubuntu': ('e5aa6eb131234b87c0c51f82b89390f5e3e642b7b70f2b9bbe95b6a285a40c96', 46931474),
+    'macos': ('e0ad05580abfeb25f8d8fb55aaf7bedf552c375b5b4d9bd3c8d59764d2cc333a', 51817124),
+}
+# Where an unpacked Real-ESRGAN is looked for (else --esrgan, else fetched).
+ESRGAN_PLACES = [os.path.join(HERE, '..', 'realesrgan'), os.path.join(HERE, '..', '..', '..', 'tools', 'realesrgan')]
+DEFAULT_ESRGAN = os.path.normpath(os.path.join(ESRGAN_PLACES[-1], ESRGAN_EXE))
 PAD = 16  # wrap padding (source pixels) so tiling textures stay seamless
+
+
+# ---------------------------------------------------------------- Real-ESRGAN
+
+def esrgan_system():
+    if sys.platform.startswith('win'):
+        return 'windows'
+    if sys.platform == 'darwin':
+        return 'macos'
+    return 'ubuntu'  # (the Linux build: it runs on any distribution with a Vulkan driver)
+
+
+def find_esrgan(extra=()):
+    for d in list(extra) + ESRGAN_PLACES:
+        exe = os.path.normpath(os.path.join(d, ESRGAN_EXE))
+        if os.path.isfile(exe):
+            return exe
+    return None
+
+
+def fetch_esrgan(to):
+    """Downloads and unpacks this system's Real-ESRGAN into `to`; returns the program."""
+    import hashlib as _h
+    import urllib.request
+    system = esrgan_system()
+    sha, size = ESRGAN_ZIPS[system]
+    os.makedirs(to, exist_ok=True)
+    zpath = os.path.join(to, 'realesrgan-%s.zip' % system)
+    if not (os.path.isfile(zpath) and os.path.getsize(zpath) == size):
+        print('fetching Real-ESRGAN for', system, '(%d MB)' % (size >> 20), flush=True)
+        part = zpath + '.part'
+        with urllib.request.urlopen(ESRGAN_URL % system, timeout=60) as resp, open(part, 'wb') as f:
+            got = 0
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                print('progress fetch %d %d' % (got, size), flush=True)
+        os.replace(part, zpath)
+    digest = _h.sha256(open(zpath, 'rb').read()).hexdigest()
+    if digest != sha:
+        os.remove(zpath)
+        sys.exit('Real-ESRGAN download is not the expected file (SHA-256 %s): try again' % digest)
+    with zipfile.ZipFile(zpath) as z:
+        for info in z.infolist():
+            if info.filename.startswith(('models/', 'realesrgan-ncnn-vulkan', 'vcomp')) or info.filename.endswith('.dylib'):
+                z.extract(info, to)
+    exe = os.path.join(to, ESRGAN_EXE)
+    if os.name != 'nt':
+        os.chmod(exe, 0o755)  # (a zip keeps no execute bit)
+    os.remove(zpath)
+    print('Real-ESRGAN ready:', exe, flush=True)
+    return exe
+
+
+def cmd_fetch(args):
+    fetch_esrgan(args.to)
 
 
 # ---------------------------------------------------------------- extract
@@ -400,9 +530,9 @@ def cmd_build(args):
         print(len(other), 'packed data textures')
     if args.limit:
         mat_keys, other = mat_keys[:args.limit], other[:args.limit]
-    esr = args.esrgan
-    if not os.path.isfile(esr):
-        sys.exit('Real-ESRGAN not found: ' + esr)
+    esr = args.esrgan if args.esrgan else find_esrgan([os.path.join(work, 'realesrgan')])
+    if not esr or not os.path.isfile(esr):
+        sys.exit('Real-ESRGAN not found (--esrgan, or texpack.py fetch): ' + str(esr))
     pack = os.path.join(work, 'pack')
     manifest_path = os.path.join(pack, 'manifest.json')
     manifest = json.load(open(manifest_path)) if os.path.isfile(manifest_path) else {}
@@ -412,6 +542,8 @@ def cmd_build(args):
         print('resume:', len(mat_keys), 'materials and', len(other), 'textures left')
 
     batch = max(1, args.batch)
+    total, done_n = len(mat_keys) + len(other), 0
+    print('progress build 0 %d' % total, flush=True)
     for i in range(0, len(mat_keys), batch):
         keys = mat_keys[i:i + batch]
         srcs = {}
@@ -439,6 +571,8 @@ def cmd_build(args):
             }
             print('material', m['stem'], up[(k, 'color')].shape[1], 'x', up[(k, 'color')].shape[0])
         save_manifest(manifest_path, manifest)
+        done_n += len(keys)
+        print('progress build %d %d' % (done_n, total), flush=True)
 
     for i in range(0, len(other), batch):
         names = other[i:i + batch]
@@ -458,6 +592,8 @@ def cmd_build(args):
                            'sha1': index[n]['sha1'], 'width': index[n]['width'], 'height': index[n]['height']}
             print('texture', n)
         save_manifest(manifest_path, manifest)
+        done_n += len(names)
+        print('progress build %d %d' % (done_n, total), flush=True)
     save_manifest(manifest_path, manifest)
     print('done:', len(mat_keys), 'materials,', len(other), 'textures ->', pack)
 
@@ -629,6 +765,26 @@ def cmd_install(args):
     print('installed', len(lines), 'textures to', out)
 
 
+# ---------------------------------------------------------------- make (all of it)
+
+def cmd_make(args):
+    work = args.work
+    out = args.out or os.path.join(work, 'install')
+    os.makedirs(work, exist_ok=True)
+    esr = args.esrgan or find_esrgan([os.path.join(work, 'realesrgan')]) or fetch_esrgan(os.path.join(work, 'realesrgan'))
+    if not os.path.isfile(os.path.join(work, 'source', 'index.json')):
+        print('progress extract 0 1', flush=True)
+        cmd_extract(argparse.Namespace(game=args.game, out=work))
+    print('progress extract 1 1', flush=True)
+    cmd_build(argparse.Namespace(work=work, filter=args.filter, limit=args.limit, resume=True, batch=args.batch,
+                                 materials_only=False, packed_only=False, esrgan=esr))
+    print('progress install 0 1', flush=True)
+    cmd_install(argparse.Namespace(work=work, game=args.game, out=out, filter=None, ui=False, normals=True,
+                                   pbr=not args.no_pbr))
+    print('progress install 1 1', flush=True)
+    print('pack ready:', out, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -644,7 +800,7 @@ def main():
     b.add_argument('--materials-only', action='store_true')
     b.add_argument('--packed-only', action='store_true',
                    help='only the data textures upscaled one channel at a time')
-    b.add_argument('--esrgan', default=DEFAULT_ESRGAN, help='realesrgan-ncnn-vulkan.exe')
+    b.add_argument('--esrgan', help='the realesrgan-ncnn-vulkan program (default: found or fetched)')
     i = sub.add_parser('install')
     i.add_argument('--work', required=True)
     i.add_argument('--game', required=True, help='game folder (contains dist/xenon)')
@@ -654,8 +810,20 @@ def main():
     i.add_argument('--no-normals', dest='normals', action='store_false')
     i.add_argument('--no-pbr', dest='pbr', action='store_false',
                    help='leave roughness/metallic out of the normal maps')
+    m = sub.add_parser('make')
+    m.add_argument('--game', required=True, help='game folder (contains dist/xenon)')
+    m.add_argument('--work', required=True, help='work folder (outside the repo)')
+    m.add_argument('--out', help='folder for bf1943 --textures (default <work>/install)')
+    m.add_argument('--batch', type=int, default=16, help='textures per upscaler run')
+    m.add_argument('--filter', help='only names containing this text (testing)')
+    m.add_argument('--limit', type=int, default=0, help='at most this many to build (testing)')
+    m.add_argument('--esrgan', help='the realesrgan-ncnn-vulkan program (default: found or fetched)')
+    m.add_argument('--no-pbr', action='store_true', help='leave roughness/metallic out of the normal maps')
+    f = sub.add_parser('fetch')
+    f.add_argument('--to', required=True, help='folder for Real-ESRGAN')
     args = ap.parse_args()
-    {'extract': cmd_extract, 'build': cmd_build, 'install': cmd_install}[args.cmd](args)
+    {'extract': cmd_extract, 'build': cmd_build, 'install': cmd_install, 'make': cmd_make,
+     'fetch': cmd_fetch}[args.cmd](args)
 
 
 if __name__ == '__main__':
