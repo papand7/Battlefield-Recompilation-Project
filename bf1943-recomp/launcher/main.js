@@ -87,8 +87,10 @@ const launcherDir = installRoot ? path.join(installRoot, 'Launcher')
 // The HD texture pack, made on this PC from the player's own game files
 // (tools/texpack/texpack.py make: Real-ESRGAN, fetched for this system, and
 // the PBR maps; a stopped run carries on). Battlefield 1943's only.
-const texWork = installRoot ? path.join(installRoot, 'texpack') : path.resolve(__dirname, '..', '..', 'texpack_work');
-const texScript = installRoot ? path.join(installRoot, 'src', 'tools', 'texpack', 'texpack.py')
+// (A release, installed or a folder: <root>/Launcher next to <root>/src.)
+const releaseRoot = (installRoot || app.isPackaged) ? path.dirname(launcherDir) : null;
+const texWork = releaseRoot ? path.join(releaseRoot, 'texpack') : path.resolve(__dirname, '..', '..', 'texpack_work');
+const texScript = releaseRoot ? path.join(releaseRoot, 'src', 'tools', 'texpack', 'texpack.py')
   : path.resolve(__dirname, '..', 'tools', 'texpack', 'texpack.py');
 let texJob = null;
 ipcMain.handle('textures-make', () => {
@@ -98,18 +100,34 @@ ipcMain.handle('textures-make', () => {
   const python = process.platform === 'win32' ? setup.findTools().python : 'python3';
   if (!python) return { error: 'Python is needed: set up the game first (it installs Python).' };
   if (!fs.existsSync(texScript)) return { error: 'texpack.py not found.' };
-  texJob = spawn(python, [texScript, 'make', '--game', g.data, '--work', texWork], { windowsHide: true });
+  const job = spawn(python, [texScript, 'make', '--game', g.data, '--work', texWork], { windowsHide: true });
+  texJob = job;
   const send = (ev) => { if (win) win.webContents.send('textures-event', ev); };
-  for (const stream of [texJob.stdout, texJob.stderr])
+  let lastError = '', ended = false;
+  for (const stream of [job.stdout, job.stderr])
     readline.createInterface({ input: stream }).on('line', (line) => {
       const m = /^progress (\w+) (\d+) (\d+)/.exec(line);
+      if (!m && line.trim() && (stream === job.stderr || /^(Could not|Real-ESRGAN download)/.test(line))) lastError = line.trim();
       send(m ? { step: m[1], done: +m[2], total: +m[3] } : { line });
     });
-  texJob.on('exit', (code) => { texJob = null; send({ finished: true, code }); });
-  texJob.on('error', (e) => { texJob = null; send({ finished: true, code: -1, line: e.message }); });
+  // 'close': after the last output line (an 'exit' can come before it).
+  const end = (code, error) => {
+    if (ended) return;
+    ended = true;
+    if (texJob === job) texJob = null;
+    send({ finished: true, code, stopped: job.stopped, error: code === 0 ? '' : error || lastError });
+  };
+  job.on('close', (code) => end(code));
+  job.on('error', (e) => end(-1, e.message));
   return { ok: true };
 });
-ipcMain.handle('textures-cancel', () => { if (texJob) texJob.kill(); });
+ipcMain.handle('textures-cancel', () => {
+  if (!texJob) return;
+  texJob.stopped = true;
+  // Windows: the upscaler it runs too (a kill ends only python).
+  if (process.platform === 'win32') spawn('taskkill', ['/PID', String(texJob.pid), '/T', '/F'], { windowsHide: true });
+  else texJob.kill();
+});
 
 function problem(g) {
   return !g.exe ? `${g.title}: exe not found next to the launcher.`

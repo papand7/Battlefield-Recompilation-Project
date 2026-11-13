@@ -212,7 +212,7 @@ int main(int argc, char** argv) {
     else if (a == "--online-server" && i + 1 < argc) g_online_server = argv[++i];
     else if (a == "--lan-ip" && i + 1 < argc) inet_pton(AF_INET, argv[++i], &g_lan_ip);
     else if (a == "--host") g_lan_host = true;
-    else if (a == "--bots" && i + 1 < argc) g_bot_count = std::clamp(atoi(argv[++i]), 0, 31);
+    else if (a == "--bots" && i + 1 < argc) g_bot_count = std::clamp(atoi(argv[++i]), 0, 16);  // (botapi::kMaxBots)
     else if (a == "--host-map" && i + 1 < argc) g_host_map = argv[++i];
     else if (a == "--log-ui") g_log_ui = true;
     else if (a == "--log-settings" && i + 1 < argc) g_log_settings = argv[++i];

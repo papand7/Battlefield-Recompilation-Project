@@ -178,7 +178,12 @@ bool Memory::HandleWriteFault(void* host_address) {
     return VirtualQuery(a, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE));
 #else
-    return true;
+    // (No page query here: retried, unless the same write keeps faulting,
+    // a page never committed: then the crash handler's, not a silent spin.)
+    thread_local uint8_t* last = nullptr;
+    thread_local int repeats = 0;
+    repeats = a == last ? repeats + 1 : 0, last = a;
+    return repeats < 64;
 #endif
   }
   // Let every listener drop its copy; each returns the range it is fine to unwatch.

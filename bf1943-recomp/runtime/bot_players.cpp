@@ -224,6 +224,7 @@ struct BotPlayer {
   int64_t died_ms = 0;
   uint32_t move_msg = 0;  // its own move message (a copy of a real one)
   uint32_t mover = 0;     // its move receiver (823B2C80's r3)
+  bool mover_from_np = false;  // (the mover is its network object's +2FC: kept up to date)
   uint32_t ghost_id = 0;  // its soldier's network id in the host's table (0: not found yet)
   // The brain's pad (SetBotPlayerInput), applied in its soldier's step.
   float lx = 0, ly = 0, rx = 0, ry = 0;
@@ -278,7 +279,7 @@ std::deque<BotPlayer> g_players;
 // How many bot players: --bots N, or BF_BOT_FAKE=N. Read once the arguments
 // are (the first join).
 int FakeCount() {
-  static const int n = getenv("BF_BOT_FAKE") ? std::clamp(atoi(getenv("BF_BOT_FAKE")), 1, 31) : std::clamp(g_bot_count, 0, 31);
+  static const int n = getenv("BF_BOT_FAKE") ? std::clamp(atoi(getenv("BF_BOT_FAKE")), 1, 16) : std::clamp(g_bot_count, 0, 16);  // (botapi::kMaxBots)
   return n;
 }
 #define g_fake_count FakeCount()
@@ -705,7 +706,7 @@ void EnsureThreadAllocator(PPCContext& ctx, uint8_t* base) {
 }
 GAME_PATCH(82414430) {
   __imp__sub_82414430(ctx, base);
-  EnsureThreadAllocator(ctx, base);
+  if (!g_players.empty()) EnsureThreadAllocator(ctx, base);  // (for the bots' objects only)
   ApplyHits(ctx, base);
   // BF_BOT_TICK_TRACE: server updates a second (every 5 s).
   if (getenv("BF_BOT_TICK_TRACE")) {
@@ -762,9 +763,11 @@ GAME_PATCH(82414430) {
       for (uint32_t o : nps)
         if (Ld32(o + 0x28) == b.conn) now_np = o;
       uint32_t rcv = now_np ? Ld32(now_np + 0x2FC) : 0;
-      if (rcv != b.mover) {
+      // (None there: a mover found another way stays.)
+      if (rcv != b.mover && (rcv || b.mover_from_np)) {
         RT_INFO("bot %d: its move receiver is now %08X (was %08X)", b.index, rcv, b.mover);
         b.mover = rcv;  // (0: found again below, or no moves)
+        b.mover_from_np = rcv != 0;
       }
     }
   }
@@ -775,6 +778,7 @@ GAME_PATCH(82414430) {
       if (!b.mover) {
         // Its network object's +2FC (made with the join).
         if (uint32_t np = FindNetPlayer(b.conn)) b.mover = Ld32(np + 0x2FC);
+        b.mover_from_np = b.mover != 0;
         if (b.mover)
           RT_INFO("bot %d: move receiver %08X from its network object:%s", b.index, b.mover,
                   Around(b.mover, 0, 0x40).c_str());

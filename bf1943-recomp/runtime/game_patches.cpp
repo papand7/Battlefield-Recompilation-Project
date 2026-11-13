@@ -12,6 +12,7 @@
 #ifdef _WIN32
 #include <excpt.h>
 #endif
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,6 +22,7 @@ uint32_t g_max_fps = 120;  // --max-fps (0 = no limit), applied in VdSwap
 bool g_lan_host = false;   // --host
 bool g_vsync = false;      // --vsync
 std::string g_host_map;    // --host-map: host this level from the main menu
+std::mutex g_host_map_mutex;  // (taken to change it in a level's run: the bots' director reads it)
 bool g_log_ui = false;     // --log-ui: log the menus' callbacks to the game
 std::string g_ui_call;     // --ui-call name:args: fire this menu callback instead
 std::string g_log_settings;  // --log-settings Table.Member,...
@@ -180,6 +182,7 @@ static void HostFromMainLoop(PPCContext& ctx, uint8_t* base) {
       if (!g_map_rotation.empty()) {
         size_t i = 0;
         while (i < g_map_rotation.size() && g_map_rotation[i] != g_host_map) ++i;
+        std::lock_guard lock(g_host_map_mutex);  // (the bots' director reads it)
         g_host_map = g_map_rotation[(i + 1) % g_map_rotation.size()];
       }
       RT_INFO("dedicated server: round over, hosting %s", g_host_map.c_str());

@@ -10,7 +10,9 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <string>
 #include <mutex>
 #include <unordered_map>
 
@@ -37,7 +39,18 @@ struct Layer {
 std::mutex g_mutex;
 std::string g_map;
 Layer g_shipped, g_learned;
+Layer g_base;  // g_learned as last read or written: what this server added is the rest
 bool g_dirty = false;
+
+FILE* Open(const std::filesystem::path& p, const wchar_t* wmode, const char* mode) {
+#ifdef _WIN32
+  (void)mode;
+  return _wfopen(p.c_str(), wmode);
+#else
+  (void)wmode;
+  return fopen(p.c_str(), mode);
+#endif
+}
 
 uint64_t Key(int ix, int iz) { return uint64_t(uint32_t(ix)) << 32 | uint32_t(iz); }
 
@@ -57,7 +70,7 @@ std::filesystem::path LearnedPath(const std::string& map) { return g_user_root /
 
 size_t Load(Layer& l, const std::filesystem::path& p) {
   l.cells.clear();
-  FILE* f = fopen(p.string().c_str(), "r");
+  FILE* f = Open(p, L"r", "r");
   if (!f) return 0;
   char line[256];
   while (fgets(line, sizeof(line), f)) {
@@ -75,16 +88,35 @@ void SaveLocked() {
   std::filesystem::path p = LearnedPath(g_map);
   std::error_code ec;
   std::filesystem::create_directories(p.parent_path(), ec);
+  // Servers sharing a user folder: the file as it is now, plus what this one
+  // added since it last read or wrote it.
+  Layer merged;
+  Load(merged, p);
+  for (auto& [k, c] : g_learned.cells) {
+    auto base = g_base.cells.find(k);
+    Cell& m = merged.cells[k];
+    for (size_t i = 0; i < c.size(); ++i) m[i] += c[i] - (base != g_base.cells.end() ? base->second[i] : 0.0f);
+  }
   std::filesystem::path tmp = p;
-  tmp += ".tmp";
-  FILE* f = fopen(tmp.string().c_str(), "w");
+#ifdef _WIN32
+  tmp += ".tmp" + std::to_string(GetCurrentProcessId());
+#else
+  tmp += ".tmp" + std::to_string(getpid());
+#endif
+  FILE* f = Open(tmp, L"w", "w");
   if (!f) return;
   fprintf(f, "# bot knowledge 1 %s\n", g_map.c_str());
-  for (auto& [k, c] : g_learned.cells)
+  for (auto& [k, c] : merged.cells)
     fprintf(f, "c %d %d %.2f %.2f %.2f %.2f %.2f %.2f\n", int32_t(k >> 32), int32_t(uint32_t(k)), c[0], c[1], c[2],
             c[3], c[4], c[5]);
-  fclose(f);
-  std::filesystem::rename(tmp, p, ec);
+  bool ok = !ferror(f);
+  ok = fclose(f) == 0 && ok;
+  if (ok) std::filesystem::rename(tmp, p, ec);
+  if (!ok || ec) {  // (still dirty: tried again at the next save)
+    std::filesystem::remove(tmp, ec);
+    return;
+  }
+  g_learned = merged, g_base = std::move(merged);
   g_dirty = false;
 }
 
@@ -97,6 +129,10 @@ void UseMap(const std::string& map) {
   g_map = map;
   size_t shipped = Load(g_shipped, ExeDir() / "bot_knowledge" / (map + ".txt"));
   size_t learned = Load(g_learned, LearnedPath(map));
+  g_base = g_learned;
+  // The last minute's too when the server stops.
+  static const bool at_exit = (std::atexit([] { Save(); }), true);
+  (void)at_exit;
   RT_INFO("bot knowledge: %s: %zu cells shipped, %zu learned here", map.c_str(), shipped, learned);
 }
 

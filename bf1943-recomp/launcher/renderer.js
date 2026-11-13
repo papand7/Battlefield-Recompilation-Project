@@ -43,6 +43,17 @@ function buildRows() {
   }
 }
 
+// The HD textures row: the switch, the hint and MAKE (UPDATE once there is a
+// pack: carries on an unfinished one and installs it again).
+function showTextures(key) {
+  const g = games[key];
+  $('textures').checked = settings.textures && g.hasTextures;
+  $('textures').disabled = !g.hasTextures;
+  if (!texBusy) $('texhint').textContent = g.hasTextures ? 'AI-upscaled texture pack' : 'Texture pack not found';
+  $('texmake').hidden = key !== 'bf1943';  // (Bad Company's pack isn't made here yet)
+  $('texmake').textContent = texBusy ? 'STOP' : g.hasTextures ? 'UPDATE' : 'MAKE';
+}
+
 // Shows the chosen game's tab, logo and options.
 function selectGame(key) {
   const g = games[key];
@@ -56,11 +67,7 @@ function selectGame(key) {
   $('year').textContent = key === 'bfbc1' ? 'BAD COMPANY' : '1943';
   $('year').classList.toggle('long', key === 'bfbc1');
   $('bloodrow').hidden = key === 'bfbc1';  // BF1943 only
-  $('textures').checked = settings.textures && g.hasTextures;
-  $('textures').disabled = !g.hasTextures;
-  if (!texBusy) $('texhint').textContent = g.hasTextures ? 'AI-upscaled texture pack' : 'Texture pack not found';
-  $('texmake').hidden = key !== 'bf1943';  // (Bad Company's pack isn't made here yet)
-  $('texmake').textContent = texBusy ? 'STOP' : g.hasTextures ? 'REMAKE' : 'MAKE';
+  showTextures(key);
   document.title = g.title;
   setStatus(g.error || '', !!g.error);
   $('play').disabled = !!g.error;
@@ -207,11 +214,12 @@ const texSteps = { fetch: 'Getting the upscaler', extract: 'Reading the game\'s 
   install: 'Installing the pack' };
 $('texmake').onclick = async () => {
   if (texBusy) { await window.launcher.texturesCancel(); return; }
-  const r = await window.launcher.texturesMake();
-  if (r.error) { $('texhint').textContent = r.error; return; }
+  // Busy before asking: a job that fails at once can finish before the answer.
   texBusy = true;
   $('texmake').textContent = 'STOP';
   $('texhint').textContent = 'Starting…';
+  const r = await window.launcher.texturesMake();
+  if (r.error) { texBusy = false; showTextures(settings.game); $('texhint').textContent = r.error; }
 };
 window.launcher.onTexturesEvent(async (ev) => {
   if (ev.step) {
@@ -221,8 +229,9 @@ window.launcher.onTexturesEvent(async (ev) => {
     texBusy = false;
     const s = await window.launcher.state();
     games = s.games;
-    selectGame(settings.game);
-    $('texhint').textContent = ev.code === 0 ? 'Texture pack made' : 'Texture pack stopped: MAKE carries on';
+    showTextures(settings.game);  // (not selectGame: it would undo unsaved choices)
+    $('texhint').textContent = ev.code === 0 ? 'Texture pack made'
+      : ev.stopped ? 'Texture pack stopped: MAKE carries on' : `Texture pack failed: ${ev.error || `exit code ${ev.code}`}`;
   } else if (ev.line && /^(Could not|Real-ESRGAN|Python|texpack)/.test(ev.line)) {
     $('texhint').textContent = ev.line;
   }

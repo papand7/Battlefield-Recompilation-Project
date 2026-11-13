@@ -14,7 +14,7 @@
 namespace xe::ui {
 
 namespace {
-std::function<void(const SDL_Event&)> g_event_hook;
+void (*g_event_hook)(const SDL_Event&) = nullptr;  // (constant-initialised: no constructor to run after it is set)
 }
 
 // ---- the XCB surface's size (upstream's surface_gnulinux.cc) ----------------
@@ -31,12 +31,15 @@ bool XcbWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) co
 SdlWindowedAppContext::SdlWindowedAppContext() = default;
 SdlWindowedAppContext::~SdlWindowedAppContext() { SDL_Quit(); }
 
-void SdlWindowedAppContext::SetEventHook(std::function<void(const SDL_Event&)> hook) { g_event_hook = std::move(hook); }
+void SdlWindowedAppContext::SetEventHook(void (*hook)(const SDL_Event&)) { g_event_hook = hook; }
 
 bool SdlWindowedAppContext::Initialize() {
   // The presenter draws to an X11 window (XCB): SDL's x11 driver, which
   // Wayland desktops run through XWayland.
-  SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
+  SDL_SetHintWithPriority(SDL_HINT_VIDEO_DRIVER, "x11", SDL_HINT_OVERRIDE);  // (over SDL_VIDEO_DRIVER too)
+  // (Sound here too: SDL's start-up isn't for two threads at once; the game's
+  // sound waits for it, apu_bridge.cc.)
+  SDL_InitSubSystem(SDL_INIT_AUDIO);
   if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
     fprintf(stderr, "[xgpu] SDL: %s\n", SDL_GetError());
     return false;

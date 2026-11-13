@@ -10,4 +10,5 @@ rem your router must pass UDP ports 1003 and 19430 to this PC.
 set PUBLISH=0
 set EXTRA=
 if "%PUBLISH%"=="1" set EXTRA=--publish
+cd /d "%~dp0"
 build\game\bf1943.exe --game "%GAME%" --user server_data --dedicated --name "%NAME%" --maps %MAPS% --bots %BOTS% %EXTRA%

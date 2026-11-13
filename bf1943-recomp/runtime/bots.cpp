@@ -63,6 +63,8 @@ inline BOOL ReadProcessMemory(HANDLE, const void* addr, void* buf, size_t n, siz
 
 namespace rt {
 
+extern std::mutex g_host_map_mutex;  // game_patches.cpp
+
 namespace {
 
 using botapi::Pad;
@@ -517,10 +519,15 @@ void StartBotDirector() {
           for (botapi::BotIO& b : d.bots) b.mem_tag = 0;
       }
       if (g_in_menus) continue;
+      std::string map;
+      {
+        std::lock_guard lock(g_host_map_mutex);  // (the dedicated server's rotation changes it)
+        map = g_host_map;
+      }
       bool rescan = d.now - last_scan > 2.0;
       if (rescan) last_scan = d.now;
       // Bot players (bot_players.cpp): an entry each, their soldier as it is.
-      while (int(d.bots.size()) < std::min(BotPlayerCount(), kMaxBots - 1)) {
+      while (int(d.bots.size()) < std::min(BotPlayerCount(), kMaxBots)) {
         botapi::BotIO io{};
         io.slot = int(d.bots.size());
         d.bots.push_back(io);
@@ -540,9 +547,9 @@ void StartBotDirector() {
       w.scenario = scenario;
       w.result = result;
       w.log = BrainLog;
-      static const std::string nav = (g_user_root / ("bot_nav_" + g_host_map + ".txt")).string();
+      const std::string nav = (g_user_root / ("bot_nav_" + map + ".txt")).string();
       w.nav_path = nav.c_str();
-      bool have_mesh = nav::Ready(g_host_map);  // (loads a new map's once)
+      bool have_mesh = nav::Ready(map);  // (loads a new map's once)
       if (have_mesh) {  // its main piece: the one the flags are on
         std::vector<float> flags;
         for (const Point& p : d.points) flags.insert(flags.end(), {p.pos.x, p.pos.y, p.pos.z});
@@ -550,13 +557,13 @@ void StartBotDirector() {
       }
       w.route = have_mesh ? BrainRoute : nullptr;
       w.block = have_mesh ? BrainBlock : nullptr;
-      SightForMap(g_host_map);
+      SightForMap(map);
       w.sight = BrainSight;
       w.ground = BrainGround;
       w.learned = BrainLearned;
       // Learning (bot_knowledge.h): where the real players go, once a second
       // (not the bots: what they do is what is being improved); saved each minute.
-      knowledge::UseMap(g_host_map);
+      knowledge::UseMap(map);
       static double next_visit = 0, next_save = 0;
       if (d.now >= next_visit) {
         next_visit = d.now + 1.0;

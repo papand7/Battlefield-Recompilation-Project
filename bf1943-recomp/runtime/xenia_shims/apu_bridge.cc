@@ -191,7 +191,10 @@ int OpenClient() {
     cl.driver = std::make_unique<xe::apu::xaudio2::XAudio2AudioDriver>(cl.semaphore.get());
     if (!cl.driver->Initialize()) {
 #elif defined(BF1943_CLIENT)
-    SDL_InitSubSystem(SDL_INIT_AUDIO);
+    // SDL's sound is started by the window's thread (window_sdl.cc); without
+    // a window after 5 s, here.
+    for (int i = 0; i < 500 && !SDL_WasInit(SDL_INIT_AUDIO); ++i) SDL_Delay(10);
+    if (!SDL_WasInit(SDL_INIT_AUDIO)) SDL_InitSubSystem(SDL_INIT_AUDIO);
     SDL_AudioSpec spec{SDL_AUDIO_F32, 6, 48000};
     SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (stream) {

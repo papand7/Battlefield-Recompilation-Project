@@ -67,9 +67,11 @@ def _need(modules):
     cache = os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache')
     venv = os.path.join(cache, 'bf1943-texpack', 'venv')
     py = os.path.join(venv, 'Scripts' if os.name == 'nt' else 'bin', 'python' + ('.exe' if os.name == 'nt' else ''))
-    if not os.path.isfile(py):
+    # (a venv left without pip by a stopped or failed run: made again)
+    if not os.path.isfile(py) or subprocess.run([py, '-m', 'pip', '--version'], stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL).returncode != 0:
         print('making a Python for texpack in', venv, flush=True)
-        if subprocess.run([sys.executable, '-m', 'venv', venv], stderr=subprocess.DEVNULL).returncode != 0:
+        if subprocess.run([sys.executable, '-m', 'venv', '--clear', venv], stderr=subprocess.DEVNULL).returncode != 0:
             # (Ubuntu and Debian leave pip out of the venv module, python3-venv:
             # a venv without it, and pip fetched into it, needs no root)
             import urllib.request
@@ -128,6 +130,17 @@ def find_esrgan(extra=()):
     return None
 
 
+READY = 'texpack-ready'
+
+
+def write_json(path, value):
+    """Whole or not at all: a run stopped while writing leaves the old file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + '.tmp', 'w') as f:
+        json.dump(value, f, indent=1, sort_keys=True)
+    os.replace(path + '.tmp', path)
+
+
 def fetch_esrgan(to):
     """Downloads and unpacks this system's Real-ESRGAN into `to`; returns the program."""
     import hashlib as _h
@@ -161,6 +174,7 @@ def fetch_esrgan(to):
     if os.name != 'nt':
         os.chmod(exe, 0o755)  # (a zip keeps no execute bit)
     os.remove(zpath)
+    open(os.path.join(to, READY), 'w').close()  # all unpacked (a stopped unzip is fetched again)
     print('Real-ESRGAN ready:', exe, flush=True)
     return exe
 
@@ -212,8 +226,7 @@ def cmd_extract(args):
                     'mips': tex.mips, 'sha1': hashlib.sha1(data).hexdigest(),
                 }
             print('%-48s %5d textures so far' % (fn, len(index)))
-    with open(os.path.join(out, 'index.json'), 'w') as f:
-        json.dump(index, f, indent=1, sort_keys=True)
+    write_json(os.path.join(out, 'index.json'), index)
     print('extracted', len(index), 'textures to', out)
 
 
@@ -510,9 +523,7 @@ def upscale_channels(imgs, esr):
 
 
 def save_manifest(path, manifest):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(manifest, f, indent=1, sort_keys=True)
+    write_json(path, manifest)
 
 
 def cmd_build(args):
@@ -771,7 +782,9 @@ def cmd_make(args):
     work = args.work
     out = args.out or os.path.join(work, 'install')
     os.makedirs(work, exist_ok=True)
-    esr = args.esrgan or find_esrgan([os.path.join(work, 'realesrgan')]) or fetch_esrgan(os.path.join(work, 'realesrgan'))
+    ours = os.path.join(work, 'realesrgan')
+    esr = (args.esrgan or find_esrgan()
+           or (os.path.isfile(os.path.join(ours, READY)) and find_esrgan([ours])) or fetch_esrgan(ours))
     if not os.path.isfile(os.path.join(work, 'source', 'index.json')):
         print('progress extract 0 1', flush=True)
         cmd_extract(argparse.Namespace(game=args.game, out=work))

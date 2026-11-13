@@ -156,6 +156,7 @@ struct Shore {
     if (!p || path == p) return;
     path = p;
     exits.clear();
+    sea = 1e9f;  // (another map)
     if (FILE* f = fopen(p, "r")) {
       char line[160];
       while (fgets(line, sizeof(line), f)) {
@@ -985,7 +986,7 @@ struct Brain {
       if (Dist2D(me->pos, flag) < 60 && (b.spot_point != b.target_point || w.now - b.spot_t > 30)) {
         b.spot_point = b.target_point, b.spot_t = w.now;
         Vec off;
-        if (LearnedSpot(flag, me->team, off)) {
+        if (w.points[b.target_point].owner == me->team && LearnedSpot(flag, me->team, off)) {
           b.target_offset = off;
           if (getenv("BF_BOT_LEARN_TRACE"))
             Log("learned: bot%d holds %.0f,%.0f off flag %d", io.slot + 1, off.x, off.z, b.target_point);

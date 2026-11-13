@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <mutex>
 
 #include "kernel.h"
@@ -20,7 +21,7 @@ std::atomic<bool> g_keys[256];
 std::atomic<bool> g_focus{false};
 std::atomic<SDL_Window*> g_window{nullptr};
 std::mutex g_mouse_mutex;
-long g_dx = 0, g_dy = 0, g_wheel = 0;
+double g_dx = 0, g_dy = 0, g_wheel = 0;  // (fractions kept: whole counts handed out)
 std::atomic<long> g_cursor_x{0}, g_cursor_y{0}, g_width{1280}, g_height{720};
 std::atomic<int> g_capture_want{0};
 bool g_captured = false;  // (UI thread)
@@ -128,13 +129,14 @@ void OnEvent(const SDL_Event& e) {
       break;
     case SDL_EVENT_MOUSE_MOTION: {
       std::lock_guard l(g_mouse_mutex);
-      g_dx += long(e.motion.xrel), g_dy += long(e.motion.yrel);
+      // Movement only for the window in front (as Windows' raw input).
+      if (g_focus) g_dx += e.motion.xrel, g_dy += e.motion.yrel;
       g_cursor_x = long(e.motion.x), g_cursor_y = long(e.motion.y);
       break;
     }
     case SDL_EVENT_MOUSE_WHEEL: {
       std::lock_guard l(g_mouse_mutex);
-      g_wheel += long(e.wheel.y * WHEEL_DELTA);
+      if (g_focus) g_wheel += e.wheel.y * WHEEL_DELTA;
       break;
     }
     case SDL_EVENT_WINDOW_SHOWN:
@@ -206,8 +208,8 @@ void CaptureMouse(bool capture) {
 }
 void TakeMouse(long& dx, long& dy, long& wheel) {
   std::lock_guard l(g_mouse_mutex);
-  dx = g_dx, dy = g_dy, wheel = g_wheel;
-  g_dx = g_dy = g_wheel = 0;
+  dx = long(g_dx), dy = long(g_dy), wheel = long(g_wheel);
+  g_dx -= double(dx), g_dy -= double(dy), g_wheel -= double(wheel);
 }
 }  // namespace rt::linput
 
@@ -216,7 +218,7 @@ DWORD XInputGetState(DWORD user, XINPUT_STATE* state) {
   std::lock_guard l(g_pad_mutex);
   SDL_Gamepad* pad = user < 4 ? g_pads[user] : nullptr;
   if (!pad) return 1167;  // ERROR_DEVICE_NOT_CONNECTED
-  static DWORD packet = 0;
+  static DWORD packet[4] = {1, 1, 1, 1};
   XINPUT_GAMEPAD& g = state->Gamepad;
   g = {};
   struct Map { SDL_GamepadButton b; WORD w; };
@@ -239,7 +241,11 @@ DWORD XInputGetState(DWORD user, XINPUT_STATE* state) {
   g.sThumbRX = axis(SDL_GAMEPAD_AXIS_RIGHTX), g.sThumbRY = flip(axis(SDL_GAMEPAD_AXIS_RIGHTY));
   g.bLeftTrigger = BYTE(std::max(0, int(axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER))) * 255 / 32767);
   g.bRightTrigger = BYTE(std::max(0, int(axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER))) * 255 / 32767);
-  state->dwPacketNumber = ++packet;
+  // A new number only when something changed (as XInput: the game takes a
+  // new one with a button held as another press).
+  static XINPUT_GAMEPAD last[4];
+  if (std::memcmp(&last[user], &g, sizeof(g)) != 0) last[user] = g, ++packet[user];
+  state->dwPacketNumber = packet[user];
   return 0;
 }
 
@@ -247,7 +253,7 @@ DWORD XInputSetState(DWORD user, XINPUT_VIBRATION* v) {
   std::lock_guard l(g_pad_mutex);
   SDL_Gamepad* pad = user < 4 ? g_pads[user] : nullptr;
   if (!pad) return 1167;
-  SDL_RumbleGamepad(pad, v->wLeftMotorSpeed, v->wRightMotorSpeed, 1000);  // (until the game changes it)
+  SDL_RumbleGamepad(pad, v->wLeftMotorSpeed, v->wRightMotorSpeed, SDL_MAX_UINT32);  // (until the game changes it)
   return 0;
 }
 

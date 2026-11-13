@@ -25,7 +25,9 @@ class SdlWindowedAppContext final : public WindowedAppContext {
   bool Initialize();
   int RunMainMessageLoop();
   // Every SDL event, before the windows get theirs (the game's input).
-  static void SetEventHook(std::function<void(const SDL_Event&)> hook);
+  // (A plain function: set from another file's static initialiser, which may
+  // run before this file's.)
+  static void SetEventHook(void (*hook)(const SDL_Event&));
 
  protected:
   void NotifyUILoopOfPendingFunctions() override;

@@ -11,4 +11,5 @@ BOTS=0
 PUBLISH=0
 EXTRA=
 [ "$PUBLISH" = "1" ] && EXTRA=--publish
+cd "$(dirname "$0")" || exit 1
 exec build/linux/bf1943_server --game "$GAME" --user server_data --dedicated --name "$NAME" --maps "$MAPS" --bots "$BOTS" $EXTRA
