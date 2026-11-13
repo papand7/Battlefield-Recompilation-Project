@@ -25,7 +25,9 @@
 # XenonRecomp into generated/ppc, compile Xenia's shaders (build/xenia_shaders,
 # with glslangValidator / spirv-opt), configure and build with clang, then put
 # the exe and the files it needs in <out>/game (Bad Company: and its main
-# menu's PC SETTINGS row in <out>/userdata, tools/bc_menu_patch.py).
+# menu's PC SETTINGS row in <out>/userdata, tools/bc_menu_patch.py), with the
+# bots' navigation tool (tools/navgen; tools/make_navs.py makes the maps'
+# meshes with it, into <out>/game/nav).
 #
 # Output for a launcher: "progress <step> <done> <total>" lines (steps: check
 # game tools config recompile shaders configure build install, and "all" for the
@@ -355,6 +357,16 @@ if [ $BC = 1 ] && [ $SERVER = 0 ] &&
    [ ! -f "$OUT/userdata/override/dist/xenon/menu/main/mainmenu-00.fbrb" ]; then
   run_log "$LOGS/menu_patch.log" python3 -I "$GTREE/tools/bc_menu_patch.py" --game "$GAME_DIR" --user "$OUT/userdata" ||
     echo "warning: the PC SETTINGS menu patch failed (see $LOGS/menu_patch.log): the game has the stock main menu"
+fi
+# The bots' navigation tool (tools/navgen), next to the exe: tools/make_navs.py
+# makes each map's meshes with it on this PC (the game files' own, never shipped).
+if run_log "$LOGS/navgen_configure.log" cmake -S "$TREE/tools/navgen" -B "$OUT/navgen" -G Ninja \
+     -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ &&
+   run_log "$LOGS/navgen_build.log" cmake --build "$OUT/navgen" &&
+   cp -f "$OUT/navgen/navgen" "$DEST/navgen"; then
+  echo "navgen (the bots' navigation tool): $DEST/navgen"
+else
+  echo "warning: the bots' navigation tool (navgen) did not build (see $LOGS/navgen_*.log): the bots play without routes"
 fi
 printf 'tree %s\ncommit %s\ngame %s\n' "$GTREE" \
   "$(git -C "$GTREE" rev-parse --short HEAD 2>/dev/null || echo unknown)" "$GAME_DIR" > "$DEST/.build-info"

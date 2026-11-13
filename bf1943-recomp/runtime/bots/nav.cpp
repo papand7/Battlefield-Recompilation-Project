@@ -2,7 +2,8 @@
 // bc_bots.cpp): nav/<map>.nav made by tools/navgen from the level's terrain and
 // collision ("BFNV", version 2: dtNavMeshParams, the tile count, then each
 // tile's x, y, size, Detour data), routed with Detour. Looked for next to the
-// exe, then in the working folder. Polygons a bot couldn't get onto are off
+// exe, then in the working folder; made on this PC by tools/make_navs.py (the
+// launcher, or a hosting server without one: nav_autogen.h). Polygons a bot couldn't get onto are off
 // for a minute (as Bad Company's: a soldier in the way looks the same, and
 // blocks kept for good cut routes off); BF_BOT_NAV_KEEP_BLOCKS=1 keeps them in
 // <user>/nav/<map>.blocked for later matches, as before.
@@ -23,6 +24,7 @@
 #include <vector>
 
 #include "kernel.h"  // (before windows.h, as the rest of the runtime)
+#include "nav_autogen.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -157,10 +159,18 @@ void Unload() {
   g_main_chosen = false;
 }
 
+// A map without its mesh: looked for again every 15 s (tools/make_navs.py,
+// started by nav_autogen or the launcher, puts it there when it is made).
+std::chrono::steady_clock::time_point g_look_again{};
+bool g_missing = false;
+
 bool Load(const std::string& map) {
-  if (map == g_map) return g_navquery != nullptr;
+  if (map == g_map && (g_navquery || !g_missing || std::chrono::steady_clock::now() < g_look_again))
+    return g_navquery != nullptr;
+  const bool again = map == g_map;
   Unload();
   g_map = map;
+  g_missing = false;
   g_blocked_path = g_user_root / "nav" / (map + ".blocked");
   std::filesystem::path path;
   for (const std::filesystem::path& dir : {ExeDir() / "nav", std::filesystem::path("nav")}) {
@@ -171,7 +181,10 @@ bool Load(const std::string& map) {
     }
   }
   if (path.empty()) {
-    RT_INFO("bot nav: no navigation mesh for %s (nav/%s.nav)", map.c_str(), map.c_str());
+    if (!again) RT_INFO("bot nav: no navigation mesh for %s (nav/%s.nav)", map.c_str(), map.c_str());
+    g_missing = true;
+    g_look_again = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    navauto::Request("bf1943", map);
     return false;
   }
   FILE* f = Open(path, "rb");
@@ -347,6 +360,12 @@ int Route(const float a[3], const float b[3], float* corners, int max, Memory* m
   for (int i = 0; i < n; ++i) out.push_back({c[3 * i], c[3 * i + 1], c[3 * i + 2]});
   int k = std::min(int(out.size()), max);
   for (int i = 0; i < k; ++i) memcpy(corners + 3 * i, out[size_t(i)].data(), 12);
+  static std::string routed;  // (the map the first route was logged for)
+  if (k > 0 && routed != g_map) {
+    routed = g_map;
+    RT_INFO("bot nav: routing on %s's mesh (the first route: %d corners, %.0f m straight)", g_map.c_str(), k,
+            dtVdist(a, b));
+  }
   return k;
 }
 

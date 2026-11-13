@@ -8,7 +8,9 @@
 //   2. the build tools, through winget where missing: LLVM (clang), CMake,
 //      Ninja, Python, the Visual Studio C++ build tools, the Vulkan SDK;
 //   3. XenonRecomp turns default.xex into C++ (<tree>/generated/ppc);
-//   4. CMake + Ninja build the exe, copied to its folder under <root>.
+//   4. CMake + Ninja build the exe, copied to its folder under <root>, and the
+//      bots' navigation tool (tools/navgen: <src>/build/navgen and next to the exe;
+//      tools/make_navs.py makes the maps' meshes with it).
 // Layout (release): <root>/Launcher/BF1943Launcher.exe, <root>/src (bf1943-recomp,
 // also the code both games share), <root>/src-bfbc1 (bfbc1-recomp).
 const { spawn, execFileSync } = require('child_process');
@@ -353,7 +355,33 @@ async function setup(launcherDir, game, gamePath, send) {
       if (fs.existsSync(path.join(built, f))) fs.copyFileSync(path.join(built, f), path.join(p.gameDir, f));
     }
     if (fs.existsSync(path.join(built, 'fonts'))) fs.cpSync(path.join(built, 'fonts'), path.join(p.gameDir, 'fonts'), { recursive: true });
+    // The bots' navigation tool (tools/navgen, in the shared tree's build/navgen,
+    // also put next to the exe): tools/make_navs.py makes each map's meshes with
+    // it on this PC. Without it the game still runs (its bots without routes).
+    try {
+      await buildNavgen(p, tools, log);
+      fs.copyFileSync(path.join(p.src, 'build', 'navgen', 'navgen.exe'), path.join(p.gameDir, 'navgen.exe'));
+    } catch (e) {
+      log(`The bots' navigation tool (navgen) did not build: ${e.message}`);
+    }
   });
+}
+
+// tools/navgen with the same compiler (a small program: seconds).
+async function buildNavgen(p, tools, log) {
+  const bat = path.join(p.src, 'build', 'launcher_navgen.bat');
+  fs.mkdirSync(path.dirname(bat), { recursive: true });
+  const clang = tools.clang.replace(/\\/g, '/');
+  fs.writeFileSync(bat, [
+    '@echo off',
+    `call "${tools.vs}" >nul 2>&1 || exit /b 1`,
+    `set "PATH=${path.dirname(tools.ninja)};${path.dirname(tools.cmake)};%PATH%"`,
+    `cd /d "${p.src}"`,
+    `cmake -S tools\\navgen -B build\\navgen -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CXX_COMPILER=${clang}" || exit /b 1`,
+    'cmake --build build\\navgen || exit /b 1',
+  ].join('\r\n'));
+  log('Building the bots\' navigation tool (navgen)…');
+  await run('cmd.exe', ['/d', '/c', bat], {}, (line) => { if (/error/i.test(line)) log(line); });
 }
 
 // Bad Company's main menu with the PC SETTINGS row (tools/bc_menu_patch.py,
@@ -373,4 +401,4 @@ function patchMenu(launcherDir, gameData, userDir) {
   });
 }
 
-module.exports = { paths, findGameFiles, status, setup, patchMenu, findTools, kToolNames, kGames };
+module.exports = { paths, findGameFiles, status, setup, patchMenu, findTools, buildNavgen, kToolNames, kGames };

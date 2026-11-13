@@ -390,16 +390,18 @@ int main(int argc, char** argv) {
   g_auto_start = g_dedicated;
   if (!join_address.empty() && !rt::lan::PrepareJoin(join_address, g_host_map.empty() ? "Wake_island_s" : g_host_map))
     RT_WARN("--join: not an IPv4 address: %s", join_address.c_str());
+  // A run of tools/make_navs.py (reading the level's collision): in nobody's server browser either.
+  const bool nav_run = getenv("BF_MAKE_NAVS_CHILD") != nullptr;
   if (g_dedicated) {
     if (g_host_map.empty()) g_host_map = g_map_rotation.empty() ? "Wake_island_s" : g_map_rotation[0];
     if (g_gamertag.empty() || g_gamertag == "Player") g_gamertag = "Dedicated";
-    if (!g_training) rt::lan::StartBeacon();  // (training: in nobody's server browser)
+    if (!g_training && !nav_run) rt::lan::StartBeacon();  // (training: in nobody's server browser)
     RT_INFO("dedicated server '%s': hosting %s on UDP %d (browsers: UDP 19430)%s", g_gamertag.c_str(),
             g_host_map.c_str(), 1003 + g_port_offset, g_bot_count ? ", with bots" : "");
   }
-  if (g_lan_host && join_address.empty() && !g_training) rt::lan::StartBeacon();  // --host: shown in server browsers
+  if (g_lan_host && join_address.empty() && !g_training && !nav_run) rt::lan::StartBeacon();  // --host: shown in server browsers
   // --publish: on the master server's list once the level runs.
-  if ((g_dedicated || g_lan_host) && join_address.empty() && !g_training) rt::lan::StartPublishing();
+  if ((g_dedicated || g_lan_host) && join_address.empty() && !g_training && !nav_run) rt::lan::StartPublishing();
   // A dedicated server plays no sound: the game's sound system off (its mixer
   // still runs, silent). At --speed the sound kept real time and crashed.
   if (g_dedicated && g_guest_args.find("IsSoundEnabled") == std::string::npos)

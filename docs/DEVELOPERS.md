@@ -194,7 +194,25 @@ piece is the one the flags are on (on island maps the biggest is the sea floor).
 A mesh is made on the player's PC from their own copy (private, never in the repo), with
 Bad Company's collision tool, which reads every Havok rigid body of the running level
 (`runtime/bot_collision.cpp`; BF1943's hkRigidBody vtable 820B07CC, hkWorld 820B0748,
-found through their RTTI with `BF_FIND_VTABLE=hkRigidBody,hkWorld`):
+found through their RTTI with `BF_FIND_VTABLE=hkRigidBody,hkWorld`).
+
+`tools/make_navs.py` does it all, for both games (Windows and Linux): it hosts each map
+briefly as a dedicated server (`BF_BOT_DUMP_COLLISION`, a temporary `--user`, no bots,
+`BF_MAKE_NAVS_CHILD=1`), stops that process when the play area is logged, adds the
+terrain and runs `navgen` (built by the launcher's setup and `build_linux.sh`, next to
+the exe and in `build/navgen`). It makes only the files missing (Bad Company: `.nav`,
+`.vnav`, `.hf`), about a minute and a half per map:
+
+```
+python tools/make_navs.py --title bf1943 --game original/v106 --exe build/game/bf1943.exe ^
+  --nav-dir build/game/nav [--maps Wake_island_s,Iwo_Jima_s] [--work DIR] [--force]
+```
+
+Both games read `<exe dir>/nav` first, then `nav/` in the working folder. A hosting
+server whose map has none starts the tool itself, once, in the background
+(`runtime/nav_autogen.cpp`; its output in `<user>/make_navs_<map>.log`; off with
+`BF_NO_NAV_AUTOGEN=1`); its bots play without routes and load the files when they
+appear (looked for every 15 s). By hand, as the tool does it:
 
 ```
 set BF_BOT_DUMP_COLLISION=C:/path/live.obj

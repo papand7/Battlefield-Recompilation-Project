@@ -33,6 +33,7 @@
 #include "bot_llm.h"
 #include "bot_tuning.h"
 #include "bots/bot_api.h"
+#include "nav_autogen.h"
 #include "DetourNavMesh.h"
 #include "DetourNavMeshQuery.h"
 #include "DetourCommon.h"
@@ -1891,8 +1892,8 @@ static bool NearestMain(const float p[3], const float ext[3], const dtQueryFilte
 // A .nav file (navgen's): version 1 one tile (its data's size, the data);
 // version 2 tiles: dtNavMeshParams, the tile count, then each tile's x, y,
 // size, data. Null if it isn't there or Detour can't read it.
-static dtNavMesh* ReadNav(const std::string& path, int* bytes, int* tile_count) {
-  FILE* f = fopen(path.c_str(), "rb");
+static dtNavMesh* ReadNav(const std::filesystem::path& path, int* bytes, int* tile_count) {
+  FILE* f = navauto::Open(path, "rb");
   if (!f) return nullptr;
   char magic[4];
   int version = 0;
@@ -1922,25 +1923,53 @@ static dtNavMesh* ReadNav(const std::string& path, int* bytes, int* tile_count) 
   }
   fclose(f);
   if (!ok) {
-    RT_WARN("bot nav: %s isn't a navigation mesh Detour can read", path.c_str());
+    RT_WARN("bot nav: %s isn't a navigation mesh Detour can read", navauto::Utf8(path).c_str());
     dtFreeNavMesh(mesh);
     return nullptr;
   }
   *bytes = size, *tile_count = tiles;
   return mesh;
 }
+// The map's navigation files (nav/<map>.nav, .vnav and .hf, made on this PC by
+// tools/make_navs.py): in <exe dir>/nav first, then nav/ in the working folder.
+// One missing on a hosting server: the tool is started for the map (once, in
+// the background, nav_autogen.h), and the loaders look again every 15 s.
+static std::filesystem::path NavFile(const char* ext) {
+  std::filesystem::path p = navauto::Find(g_host_map + ext);
+  if (p.empty()) navauto::Request("bfbc1", g_host_map);
+  return p;
+}
+// Whether a missing file is looked for again now (every 15 s; *next per file).
+static bool LookAgain(int64_t* next) {
+  int64_t now = int64_t(GetTickCount64());
+  if (now < *next) return false;
+  *next = now + 15000;
+  return true;
+}
 static bool LoadNavMesh() {
-  static bool tried = false;
-  if (tried) return g_navquery != nullptr;
-  tried = true;
-  std::string path = "nav/" + g_host_map + ".nav";
+  static std::mutex m;
+  static int64_t next = 0;
+  static bool bad = false;  // (there but unreadable: not again)
+  if (g_navquery) return true;
+  std::lock_guard<std::mutex> lock(m);
+  if (g_navquery) return true;
+  if (bad || !LookAgain(&next)) return false;
+  static bool said = false;
+  std::filesystem::path path = NavFile(".nav");
+  if (path.empty()) {
+    if (!said) RT_INFO("bot nav: no navigation mesh for %s (nav/%s.nav)", g_host_map.c_str(), g_host_map.c_str());
+    said = true;
+    return false;
+  }
   int size = 0, tiles = 0;
-  g_navmesh = ReadNav(path, &size, &tiles);
-  if (!g_navmesh) return false;
-  g_navquery = dtAllocNavMeshQuery();
-  g_navquery->init(g_navmesh, 4096);
-  RT_INFO("bot nav: navigation mesh %s (%d bytes, %d tiles)", path.c_str(), size, tiles);
+  dtNavMesh* mesh = ReadNav(path, &size, &tiles);
+  if (!mesh) return !(bad = true);
+  g_navmesh = mesh;
   FindPieces();
+  dtNavMeshQuery* query = dtAllocNavMeshQuery();
+  query->init(g_navmesh, 4096);
+  RT_INFO("bot nav: navigation mesh %s (%d bytes, %d tiles)", navauto::Utf8(path).c_str(), size, tiles);
+  g_navquery = query;  // (last: the rest reads the mesh once this is set)
   return true;
 }
 // The vehicles' mesh (nav/<map>.vnav: navgen with a vehicle's size, 2 m radius,
@@ -1951,15 +1980,20 @@ static dtNavMesh* g_vnavmesh = nullptr;
 static dtNavMeshQuery* g_vnavquery = nullptr;
 static std::vector<std::array<float, 3>> RouteVehicle(const float a[3], const float b[3]) {
   std::vector<std::array<float, 3>> out;
-  static bool tried = false;
-  if (!tried) {
-    tried = true;
+  static int64_t next = 0;
+  static bool bad = false;
+  if (!g_vnavquery && !bad && LookAgain(&next)) {
+    std::filesystem::path path = NavFile(".vnav");
     int size = 0, tiles = 0;
-    g_vnavmesh = ReadNav("nav/" + g_host_map + ".vnav", &size, &tiles);
+    if (!path.empty()) {
+      g_vnavmesh = ReadNav(path, &size, &tiles);
+      bad = !g_vnavmesh;
+    }
     if (g_vnavmesh) {
-      g_vnavquery = dtAllocNavMeshQuery();
-      g_vnavquery->init(g_vnavmesh, 4096);
-      RT_INFO("bot nav: vehicles' navigation mesh (%d bytes, %d tiles)", size, tiles);
+      dtNavMeshQuery* query = dtAllocNavMeshQuery();
+      query->init(g_vnavmesh, 4096);
+      g_vnavquery = query;
+      RT_INFO("bot nav: vehicles' navigation mesh %s (%d bytes, %d tiles)", navauto::Utf8(path).c_str(), size, tiles);
     }
   }
   if (!g_vnavquery) return out;
@@ -2468,8 +2502,8 @@ struct Terrain {
   std::vector<uint16_t> h;
 };
 static Terrain* LoadTerrain() {
-  std::string path = "nav/" + g_host_map + ".hf";
-  FILE* f = fopen(path.c_str(), "rb");
+  std::filesystem::path path = NavFile(".hf");
+  FILE* f = path.empty() ? nullptr : navauto::Open(path, "rb");
   if (!f) return nullptr;
   auto* tt = new Terrain;
   char magic[4];
@@ -2482,23 +2516,26 @@ static Terrain* LoadTerrain() {
   }
   fclose(f);
   if (!ok) {
-    RT_WARN("bot nav: %s isn't a terrain file", path.c_str());
+    RT_WARN("bot nav: %s isn't a terrain file", navauto::Utf8(path).c_str());
     delete tt;
     return nullptr;
   }
   tt->x0 = box[0], tt->y0 = box[1], tt->z0 = box[2], tt->x1 = box[3], tt->y1 = box[4], tt->z1 = box[5];
   tt->cell = (tt->x1 - tt->x0) / float(tt->n);
-  RT_INFO("bot nav: terrain %s (%u x %u, %.1f m)", path.c_str(), tt->n, tt->n, tt->cell);
+  RT_INFO("bot nav: terrain %s (%u x %u, %.1f m)", navauto::Utf8(path).c_str(), tt->n, tt->n, tt->cell);
   return tt;
 }
 // The hosted map's (loaded again when the map changes; the old one kept, as
-// another thread can still be reading it).
+// another thread can still be reading it; looked for again every 15 s while
+// it isn't there).
 static Terrain* TerrainOfMap() {
   static std::mutex m;
   static std::string map;
   static Terrain* t = nullptr;
+  static int64_t next = 0;
   std::lock_guard<std::mutex> lock(m);
-  if (map != g_host_map) map = g_host_map, t = LoadTerrain();
+  if (map != g_host_map) map = g_host_map, next = 0, t = nullptr;
+  if (!t && LookAgain(&next)) t = LoadTerrain();
   return t;
 }
 // The ground's height at x, z (between the four samples around); NAN off it.
