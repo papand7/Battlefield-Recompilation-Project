@@ -4,6 +4,7 @@ games goes in: no game files, no recompiled code.
 
   python tools/make_release.py [out_dir]                 one exe (default)
   python tools/make_release.py [out_dir] --folder [--zip]  a folder
+  python3 tools/make_release.py [out_dir] --appimage     Linux: one AppImage (run on Linux)
 
 One exe (default out_dir build/release): BattlefieldLauncher-<version>.exe,
 electron-builder's portable target (npm run dist in launcher/) with src/ and
@@ -28,7 +29,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 # Left out of src/ (relative to the repo, '/' separated, prefixes).
 SKIP = [
-    'original/', 'generated/ppc/', 'generated/analysis/', 'build/', 'research/', 'userdata/',
+    'original/', 'generated/ppc/', 'generated/analysis/', 'build/', 'research/',
+    'userdata',  # (every userdata* folder: saves and overrides made from the game's files)
     'frames/', 'shader_cache/', 'launcher/node_modules/', 'launcher/dist/',
     'server/arcadia360/bin/', 'server/arcadia360/obj/', 'tests/',
 ]
@@ -41,7 +43,7 @@ KEEP = [
 ]
 # Bad Company's tree: its sources and recompiler config only.
 BC_ROOT = os.path.join(ROOT, '..', 'bfbc1-recomp')
-BC_SKIP = ['original/', 'generated/', 'build/', 'userdata/', 'userdata2/']
+BC_SKIP = ['original/', 'generated/', 'build/', 'userdata']  # (userdata, userdata2, userdata_perf, …)
 BC_KEEP = [
     'generated/bfbc1_config.toml',
     'generated/analysis/bfbc1_switch_tables_all.toml',
@@ -78,12 +80,17 @@ def stage(out):
     for k in BC_KEEP:
         os.makedirs(os.path.dirname(os.path.join(bc, k)), exist_ok=True)
         shutil.copy2(os.path.join(BC_ROOT, k), os.path.join(bc, k))
+    # (The Linux release: build_linux.sh builds the shaders and XenonRecomp
+    # when they aren't there.)
     shaders = os.path.join(ROOT, 'build', 'xenia_shaders')
-    if not os.path.isdir(shaders):
+    if os.path.isdir(shaders):
+        shutil.copytree(shaders, os.path.join(src, 'build', 'xenia_shaders'))
+    elif os.name == 'nt':
         sys.exit('build/xenia_shaders missing: run tools/build_xenia_shaders.py first')
-    shutil.copytree(shaders, os.path.join(src, 'build', 'xenia_shaders'))
     recomp = os.path.join(ROOT, 'build', 'xenonrecomp-clang', 'XenonRecomp', 'XenonRecomp.exe')
     if not os.path.isfile(recomp):
+        if os.name != 'nt':
+            return
         sys.exit('XenonRecomp.exe missing: build thirdparty/XenonRecomp first (see the README)')
     os.makedirs(os.path.join(src, 'tools', 'bin'), exist_ok=True)
     shutil.copy2(recomp, os.path.join(src, 'tools', 'bin', 'XenonRecomp.exe'))
@@ -92,6 +99,22 @@ def stage(out):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     launcher = os.path.join(ROOT, 'launcher')
+    if '--appimage' in sys.argv:
+        # Linux (run there): BattlefieldLauncher-<version>-x86_64.AppImage, the
+        # same build trees inside; it installs in a BattlefieldRecomp folder
+        # next to itself and builds with build_linux.sh (launcher/setup_linux.js).
+        out = os.path.abspath(args[0] if args else os.path.join(ROOT, 'build', 'release'))
+        stage(os.path.join(ROOT, 'build', 'release_sources'))
+        print('launcher -> AppImage')
+        dist = os.path.join(os.environ.get('TMPDIR', '/tmp'), 'bf_launcher_dist_linux')
+        shutil.rmtree(dist, ignore_errors=True)
+        subprocess.run(['npm', 'run', 'dist:linux', '--', '--config.directories.output=' + dist], cwd=launcher, check=True)
+        os.makedirs(out, exist_ok=True)
+        for f in os.listdir(dist):
+            if f.endswith('.AppImage'):
+                shutil.copy2(os.path.join(dist, f), os.path.join(out, f))
+                print('done:', os.path.join(out, f))
+        return
     if '--folder' not in sys.argv:
         out = os.path.abspath(args[0] if args else os.path.join(ROOT, 'build', 'release'))
         stage(os.path.join(ROOT, 'build', 'release_sources'))  # launcher/package.json extraResources

@@ -1,6 +1,7 @@
 // Electron main process: finds the game, keeps the settings and starts bf1943.exe.
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
-const setup = require('./setup');
+// (Linux: its own first-run setup, build_linux.sh; the game files found as on Windows.)
+const setup = require(process.platform === 'linux' ? './setup_linux' : './setup');
 const { spawn } = require('child_process');
 const readline = require('readline');
 const fs = require('fs');
@@ -8,7 +9,7 @@ const path = require('path');
 
 const settingsFile = path.join(app.getPath('appData'), 'BF1943Launcher', 'settings.json');
 const defaults = {
-  name: process.env.USERNAME || 'Player',
+  name: process.env.USERNAME || process.env.USER || 'Player',
   resolution: '2',      // --res-scale
   upscaling: 'fsr',     // --sharpen
   frameRate: '120',     // --max-fps (0 = no limit)
@@ -22,7 +23,9 @@ const defaults = {
 
 // The folder the player put the launcher (and their game files) in: the
 // single-exe release (electron-builder portable) runs from a temporary copy.
-const playerDir = process.env.PORTABLE_EXECUTABLE_DIR || (app.isPackaged ? path.dirname(process.execPath) : null);
+// (Linux: the AppImage runs mounted elsewhere; $APPIMAGE is the file itself.)
+const playerDir = process.env.PORTABLE_EXECUTABLE_DIR || (process.env.APPIMAGE && path.dirname(process.env.APPIMAGE))
+  || (app.isPackaged ? path.dirname(process.execPath) : null);
 // That exe has the build trees inside (resources/source): the games are built
 // and installed in <its folder>/BattlefieldRecomp, where the build trees are
 // copied when a new version first starts.
@@ -66,7 +69,8 @@ const findDir = (...markers) => { const f = find(...markers); return f && path.d
 const scanGames = () => ({
   bf1943: {
     title: 'Battlefield 1943',
-    exe: find('bf1943.exe', 'build/game/bf1943.exe', 'game/bf1943.exe'),
+    exe: process.platform === 'win32' ? find('bf1943.exe', 'build/game/bf1943.exe', 'game/bf1943.exe')
+      : find('game/bf1943', 'build/linux-client/game/bf1943'),  // (build_linux.sh's)
     data: findDir('original/v106/default.xex'),
     textures: findDir('texpack/install/replacements.txt', 'texpack_work/install/replacements.txt',
       'texpack/replacements.txt'),

@@ -8,7 +8,8 @@
   "scripts": {
     "start": "electron .",
     "pack": "electron-packager . BF1943Launcher --platform=win32 --arch=x64 --out=dist --overwrite --asar --ignore=^/dist",
-    "dist": "electron-builder --win portable"
+    "dist": "electron-builder --win portable",
+    "dist:linux": "electron-builder --linux AppImage"
   },
   "devDependencies": {
     "@electron/packager": "^18.3.6",
@@ -28,6 +29,8 @@
       "main.js",
       "preload.js",
       "setup.js",
+      "setup_linux.js",
+      "update.js",
       "renderer.js",
       "index.html",
       "styles.css",
@@ -46,6 +49,16 @@
     },
     "portable": {
       "artifactName": "BattlefieldLauncher-${version}.exe"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Game",
+      "executableName": "battlefield-launcher"
+    },
+    "appImage": {
+      "artifactName": "BattlefieldLauncher-${version}-x86_64.AppImage"
     }
   }
 }

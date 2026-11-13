@@ -352,4 +352,4 @@ async function setup(launcherDir, game, gamePath, send) {
   });
 }
 
-module.exports = { status, setup, findTools, kToolNames, kGames };
+module.exports = { paths, findGameFiles, status, setup, findTools, kToolNames, kGames };

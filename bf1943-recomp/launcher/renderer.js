@@ -83,6 +83,10 @@ const setupText = {
     + 'The game files take about 5 GB.'],
 };
 const foundHint = ' Put them next to the launcher and they are found by themselves.';
+// Linux: build_linux.sh, with the distribution's own packages (installed after asking for the password).
+if (window.launcher.platform === 'linux')
+  document.querySelector('.steps li[data-step="tools"]').lastChild.textContent =
+    'Build tools (your distribution\'s packages: clang, CMake, Vulkan)';
 let gamePath = null;
 let setupGame = null;
 let setupState = null;
