@@ -33,6 +33,7 @@ target_include_directories(xenia_gpu PUBLIC
 target_compile_definitions(xenia_gpu PUBLIC
   NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS
   FMT_HEADER_ONLY XXH_INLINE_ALL VK_NO_PROTOTYPES XE_PLATFORM_WIN32=1
+  XE_PRESENTER_NO_DXGI  # no DirectX: the presenter's UI ticks from a timer (presenter.h)
   _mm_cvtsi64x_si128=_mm_cvtsi64_si128)  # MSVC-only spelling
 target_compile_options(xenia_gpu PRIVATE -march=x86-64-v3 -Wno-everything /EHsc)
 target_link_libraries(xenia_gpu PUBLIC bf1943_ffmpeg

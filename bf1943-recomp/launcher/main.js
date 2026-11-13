@@ -87,7 +87,7 @@ const scanGames = () => ({
     data: findDir('original/v106/default.xex'),
     textures: findDir('texpack/install/replacements.txt', 'texpack_work/install/replacements.txt',
       'texpack/replacements.txt'),
-    dataHint: 'original\v106',
+    dataHint: path.join('original', 'v106'),
   },
   bfbc1: {
     title: 'Battlefield: Bad Company',
@@ -95,7 +95,7 @@ const scanGames = () => ({
       : find('game-bfbc1/bfbc1', 'build/linux-bfbc1/game/bfbc1'),  // (build_linux.sh --bfbc1's)
     data: findDir('original/bfbc1/default.xex', 'bfbc1/extracted/default.xex'),
     textures: findDir('texpack_bfbc1/install/replacements.txt'),
-    dataHint: 'bfbc1\extracted',
+    dataHint: path.join('bfbc1', 'extracted'),
   },
 });
 let games = scanGames();

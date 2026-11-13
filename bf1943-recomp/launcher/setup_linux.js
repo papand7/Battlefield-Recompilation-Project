@@ -7,6 +7,7 @@
 // the password), then the build runs again. Both games: Bad Company is
 // build_linux.sh --bfbc1 (its tree, src-bfbc1, with the shared code from src).
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const base = require('./setup');
@@ -107,7 +108,12 @@ async function setup(launcherDir, game, gamePath, send) {
         if (code !== 0) throw new Error(`Unpacking the game failed (exit ${code}).`);
       }
     }
-    if (!fs.existsSync(path.join(p.data, 'default.xex'))) throw new Error('No default.xex found in the game files.');
+    const xex = path.join(p.data, 'default.xex');
+    if (!fs.existsSync(xex)) throw new Error('No default.xex found in the game files.');
+    // The one build each game's recompiler config is for (as setup.js).
+    const h = crypto.createHash('sha1').update(fs.readFileSync(xex)).digest('hex');
+    if (p.game.wrongSha1[h]) throw new Error(p.game.wrongSha1[h]);
+    if (h !== p.game.sha1) throw new Error(`This default.xex is not ${p.game.expected} (SHA-1 ${h}).`);
   } catch (e) {
     send({ step: 'game', state: 'fail', text: e.message });
     throw e;

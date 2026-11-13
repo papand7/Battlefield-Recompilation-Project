@@ -82,7 +82,7 @@ Presenter::~Presenter() {
   // it if needed.
   assert_false(is_executing_ui_drawers_);
 
-#if XE_PLATFORM_WIN32
+#if XE_PRESENTER_DXGI
   if (dxgi_ui_tick_thread_.joinable()) {
     {
       std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
@@ -586,7 +586,7 @@ void Presenter::RequestUIPaintFromUIThread() {
 
 bool Presenter::InitializeCommonSurfaceIndependent() {
   // Initialize UI frame rate limiting.
-#if XE_PLATFORM_WIN32
+#if XE_PRESENTER_DXGI
   dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
 #endif  // XE_PLATFORM
 
@@ -1219,6 +1219,22 @@ void Presenter::UpdateSurfaceMonitorFromUIThread(
   if (old_monitor_potentially_disconnected ||
       surface_win32_monitor_ != surface_new_win32_monitor) {
     surface_win32_monitor_ = surface_new_win32_monitor;
+#if !XE_PRESENTER_DXGI
+    // The UI ticks at this monitor's refresh rate (60 Hz when not known).
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    unsigned hz = 60;
+    if (surface_new_win32_monitor && GetMonitorInfoW(surface_new_win32_monitor, &info) &&
+        EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+      hz = mode.dmDisplayFrequency;
+    {
+      std::scoped_lock<std::mutex> lock(timer_ui_tick_mutex_);
+      timer_ui_tick_period_ = std::chrono::nanoseconds(1000000000 / hz);
+    }
+  }
+#else
     if (dxgi_ui_tick_factory_ && !dxgi_ui_tick_factory_->IsCurrent()) {
       // If a monitor has been newly connected, it won't appear in the old
       // factory, need to recreate it.
@@ -1257,6 +1273,7 @@ void Presenter::UpdateSurfaceMonitorFromUIThread(
       dxgi_ui_tick_control_condition_.notify_all();
     }
   }
+#endif  // XE_PRESENTER_DXGI
 #endif  // XE_PLATFORM
 }
 
@@ -1339,7 +1356,7 @@ void Presenter::HandleUIDrawersChangeFromUIThread(bool drawers_were_empty) {
 }
 
 void Presenter::UpdateUITicksNeededFromUIThread() {
-#if XE_PLATFORM_WIN32
+#if XE_PRESENTER_DXGI
   bool new_needed = AreUITicksNeededFromUIThread();
   if (dxgi_ui_ticks_needed_ == new_needed) {
     return;
@@ -1357,7 +1374,18 @@ void Presenter::UpdateUITicksNeededFromUIThread() {
 }
 
 void Presenter::WaitForUITickFromUIThread() {
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 && !XE_PRESENTER_DXGI
+  if (!AreUITicksNeededFromUIThread()) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(timer_ui_tick_mutex_);
+  auto next = timer_ui_tick_last_ + timer_ui_tick_period_;
+  timer_ui_tick_condition_.wait_until(lock, next, [this] { return timer_ui_tick_force_requested_; });
+  timer_ui_tick_force_requested_ = false;
+  auto now = std::chrono::steady_clock::now();
+  // (behind by more than a tick: from now on, not catching up)
+  timer_ui_tick_last_ = now - next > timer_ui_tick_period_ ? now : std::max(next, timer_ui_tick_last_);
+#elif XE_PRESENTER_DXGI
   if (!AreUITicksNeededFromUIThread()) {
     return;
   }
@@ -1386,13 +1414,19 @@ void Presenter::WaitForUITickFromUIThread() {
 }
 
 void Presenter::ForceUIThreadPaintTick() {
-#if XE_PLATFORM_WIN32
+#if XE_PLATFORM_WIN32 && !XE_PRESENTER_DXGI
+  {
+    std::scoped_lock<std::mutex> lock(timer_ui_tick_mutex_);
+    timer_ui_tick_force_requested_ = true;
+  }
+  timer_ui_tick_condition_.notify_all();
+#elif XE_PRESENTER_DXGI
   std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   dxgi_ui_tick_force_requested_ = true;
 #endif  // XE_PLATFORM
 }
 
-#if XE_PLATFORM_WIN32
+#if XE_PRESENTER_DXGI
 Microsoft::WRL::ComPtr<IDXGIOutput> Presenter::GetDXGIOutputForMonitor(
     IDXGIFactory1* factory, HMONITOR monitor) {
   Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;

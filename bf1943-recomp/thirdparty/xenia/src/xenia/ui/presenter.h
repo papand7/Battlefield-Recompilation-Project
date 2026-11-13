@@ -15,6 +15,7 @@
 #include <atomic>
 #include <climits>
 #include <cmath>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -34,15 +35,24 @@
 #include "xenia/ui/surface.h"
 #include "xenia/ui/ui_drawer.h"
 
+// bf1943: XE_PRESENTER_NO_DXGI (the game's builds): no DXGI (DirectX) on
+// Windows; the UI ticks come from a timer at the monitor's refresh rate.
+#if XE_PLATFORM_WIN32 && !defined(XE_PRESENTER_NO_DXGI)
+#define XE_PRESENTER_DXGI 1
+#else
+#define XE_PRESENTER_DXGI 0
+#endif
+
 #if XE_PLATFORM_WIN32
 // Must be included before DXGI for things like NOMINMAX, and also needed for
 // Windows handle types.
 #include "xenia/base/platform_win.h"
-
+#endif  // XE_PLATFORM
+#if XE_PRESENTER_DXGI
 #include "xenia/ui/dxgi_include_win.h"
 
 #include <wrl/client.h>
-#endif  // XE_PLATFORM
+#endif
 
 // For implementation use.
 DECLARE_bool(present_render_pass_clear);
@@ -987,6 +997,21 @@ class Presenter {
   // On Android and GTK, this is not needed, the frame rate of draw events is
   // limited to the display refresh rate internally.
 #if XE_PLATFORM_WIN32
+  // Accessible only from the UI thread, to avoid updating monitor-dependent
+  // information such as the DXGI output if the monitor hasn't actually been
+  // changed in the current state change (such as window positioning changes).
+  HMONITOR surface_win32_monitor_ = nullptr;
+#endif
+#if XE_PLATFORM_WIN32 && !XE_PRESENTER_DXGI
+  // The timer's ticks: the next one at the monitor's refresh rate, or at once
+  // when guest output asks (ForceUIThreadPaintTick).
+  std::mutex timer_ui_tick_mutex_;
+  std::condition_variable timer_ui_tick_condition_;
+  bool timer_ui_tick_force_requested_ = false;
+  std::chrono::steady_clock::time_point timer_ui_tick_last_{};
+  std::chrono::nanoseconds timer_ui_tick_period_{16666667};
+#endif
+#if XE_PRESENTER_DXGI
   static Microsoft::WRL::ComPtr<IDXGIOutput> GetDXGIOutputForMonitor(
       IDXGIFactory1* factory, HMONITOR monitor);
   bool AreDXGIUITicksWaitable(
@@ -995,11 +1020,6 @@ class Presenter {
            dxgi_ui_tick_output_;
   }
   void DXGIUITickThread();
-
-  // Accessible only from the UI thread, to avoid updating monitor-dependent
-  // information such as the DXGI output if the monitor hasn't actually been
-  // changed in the current state change (such as window positioning changes).
-  HMONITOR surface_win32_monitor_ = nullptr;
 
   // Requiring the lowest version of DXGI for IDXGIOutput::WaitForVBlank, which
   // is available even on Windows Vista, but for IDXGIFactory1::IsCurrent,

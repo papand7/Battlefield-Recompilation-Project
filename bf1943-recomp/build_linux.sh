@@ -15,7 +15,8 @@
 #   --jobs N     parallel compile jobs (default: from cores and free memory)
 #   --recompile  run XenonRecomp again even if generated/ppc is there
 #   --bfbc1      Battlefield: Bad Company instead (bfbc1 / bfbc1_server; the
-#                game files: its folder, default.xex or the disc image .iso)
+#                game files: its folder, default.xex or the disc image .iso,
+#                unpacked into <out>/gamefiles); also --title bfbc1
 #   --bc-tree    Bad Company's tree (default: ../src-bfbc1 or ../bfbc1-recomp)
 #
 # Steps: check the packages (prints the install command, never runs sudo),
@@ -23,7 +24,8 @@
 # recompiler config if the tree has none (tools/make_recomp_config.py), run
 # XenonRecomp into generated/ppc, compile Xenia's shaders (build/xenia_shaders,
 # with glslangValidator / spirv-opt), configure and build with clang, then put
-# the exe and the files it needs in <out>/game.
+# the exe and the files it needs in <out>/game (Bad Company: and its main
+# menu's PC SETTINGS row in <out>/userdata, tools/bc_menu_patch.py).
 #
 # Output for a launcher: "progress <step> <done> <total>" lines (steps: check
 # game tools config recompile shaders configure build install, and "all" for the
@@ -37,7 +39,7 @@ XEX_SHA1=b5aaa325ff358d66a116000931b7204da3f14534    # default.xex v1.06
 XEX_SHA1_105=1c1f22606fa1eff15bf0409214279118dc805c28 # v1.05
 
 GAME= OUT= SERVER=0 JOBS= RECOMPILE=0 BC=0 BC_TREE=
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { printf 'error: %s\n' "$*"; exit 1; }
 need_arg() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"; }
 while [ $# -gt 0 ]; do
@@ -48,6 +50,9 @@ while [ $# -gt 0 ]; do
     --jobs) need_arg "$@"; JOBS=$2; shift 2 ;;
     --recompile) RECOMPILE=1; shift ;;
     --bfbc1) BC=1; shift ;;
+    --title) need_arg "$@"
+      case $2 in bfbc1) BC=1 ;; bf1943) BC=0 ;; *) die "--title: bf1943 or bfbc1, not $2" ;; esac
+      shift 2 ;;
     --bc-tree) need_arg "$@"; BC_TREE=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "unknown option: $1" ;;
@@ -258,12 +263,10 @@ if [ -f "$CFG" ]; then
   tables=$(sed -n 's/^switch_table_file_path *= *"\([^"]*\)".*/\1/p' "$CFG")
   [ -z "$tables" ] || [ -f "$GEN/$tables" ] || die "$CFG names $tables, which is missing in $GEN"
   echo "using $CFG"
-elif [ $BC = 1 ]; then
-  die "$CFG is missing (Bad Company's recompiler config comes with its tree)"
 else
   # A fresh clone has none (generated/ is not in the repo): made from default.xex.
   echo "making $CFG from your default.xex (tools/make_recomp_config.py)"
-  python3 -I "$TREE/tools/make_recomp_config.py" --xex "$XEX" --gen "$GEN" --analyse "$XENONANALYSE" \
+  python3 -I "$TREE/tools/make_recomp_config.py" --title $NAME --xex "$XEX" --gen "$GEN" --analyse "$XENONANALYSE" \
     --recomp "$XENONRECOMP" --xex-dump "$XEXDUMP" --ppc-context "$PPC_CONTEXT" 2>&1 |
     tee "$LOGS/config.log" | grep --line-buffered -E '^(progress|pass|config|helpers)'
   [ "${PIPESTATUS[0]}" = 0 ] || { rm -f "$CFG"; fail "$LOGS/config.log" "making the recompiler config failed"; }
@@ -344,6 +347,14 @@ fi
 if [ $SERVER = 0 ]; then
   rm -rf "$DEST/fonts" && cp -R "$TREE/data/fonts" "$DEST/" || die "cannot copy data/fonts"
   cp -f "$GTREE/data/pbr_shaders.txt" "$DEST/" || die "cannot copy data/pbr_shaders.txt"
+fi
+# Bad Company: its main menu's PC SETTINGS row, made from the player's game
+# files into the --user folder of the command below (the launcher makes its
+# own; without it the game has the stock menu).
+if [ $BC = 1 ] && [ $SERVER = 0 ] &&
+   [ ! -f "$OUT/userdata/override/dist/xenon/menu/main/mainmenu-00.fbrb" ]; then
+  run_log "$LOGS/menu_patch.log" python3 -I "$GTREE/tools/bc_menu_patch.py" --game "$GAME_DIR" --user "$OUT/userdata" ||
+    echo "warning: the PC SETTINGS menu patch failed (see $LOGS/menu_patch.log): the game has the stock main menu"
 fi
 printf 'tree %s\ncommit %s\ngame %s\n' "$GTREE" \
   "$(git -C "$GTREE" rev-parse --short HEAD 2>/dev/null || echo unknown)" "$GAME_DIR" > "$DEST/.build-info"

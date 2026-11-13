@@ -1,22 +1,24 @@
-"""Makes the XenonRecomp config for Battlefield 1943 (v1.06) from the player's own
+"""Makes the XenonRecomp config for Battlefield 1943 (v1.06) or, with --title
+bfbc1, Battlefield: Bad Company (the US disc) from the player's own
 default.xex, for a build from a fresh clone (build_linux.sh): the repo keeps no
 config, switch tables or other game-derived data (generated/ is not tracked).
 
   python3 -I tools/make_recomp_config.py --xex <default.xex> --gen <generated dir>
       --analyse <XenonAnalyse> --recomp <XenonRecomp> --xex-dump <xex_dump>
-      --ppc-context <thirdparty/XenonRecomp/XenonUtils/ppc_context.h>
+      --ppc-context <thirdparty/XenonRecomp/XenonUtils/ppc_context.h> [--title bfbc1]
 
-The same steps the hand-made config went through (docs/ARCHITECTURE.md):
-  1. xex_dump: the flat memory image (analysis/default_v106_image.bin);
-  2. XenonAnalyse: jump tables (analysis/bf1943_switch_tables.toml), plus the
+The same steps the hand-made configs went through (docs/ARCHITECTURE.md):
+  1. xex_dump: the flat memory image (analysis/default_v106_image.bin,
+     Bad Company's analysis/bfbc1_image.bin);
+  2. XenonAnalyse: jump tables (analysis/<title>_switch_tables.toml), plus the
      ones it misses (tools/find_offset_switches.py), together in
-     analysis/bf1943_switch_tables_all.toml;
+     analysis/<title>_switch_tables_all.toml;
   3. the register save/restore helpers and setjmp/longjmp, by their code
      (the patterns of tools/find_xenon_helpers.py);
   4. XenonRecomp, then tools/fix_truncated_functions.py extends the functions
      cut short (`// ERROR` targets) in the config's `functions` list; repeated
      until no `// ERROR` is left.
-Writes <gen>/bf1943_config.toml and leaves <gen>/ppc as the last run made it.
+Writes <gen>/<title>_config.toml and leaves <gen>/ppc as the last run made it.
 Prints "progress config <done> <total>" lines.
 """
 import argparse
@@ -36,14 +38,22 @@ BASE = 0x82000000
 MAX_PASSES = 12
 STEPS = 4 + MAX_PASSES
 
-HEADER = '''# Battlefield 1943 (XBLA, title 5841097E) -- XenonRecomp config, v1.0.6 XEX.
+# Per game: the header's first line and the memory image's name.
+TITLES = {
+    'bf1943': ('Battlefield 1943 (XBLA, title 5841097E) -- XenonRecomp config, v1.0.6 XEX.',
+               'default_v106_image.bin'),
+    'bfbc1': ('Battlefield: Bad Company (Xbox 360, title 454107F9) -- XenonRecomp config, US disc XEX.',
+              'bfbc1_image.bin'),
+}
+
+HEADER = '''# {title}
 # Made by tools/make_recomp_config.py from your own default.xex.
 # Paths are relative to this file (generated/).
 
 [main]
 file_path = "{xex}"
 out_directory_path = "ppc"
-switch_table_file_path = "analysis/bf1943_switch_tables_all.toml"  # XenonAnalyse + tools/find_offset_switches.py
+switch_table_file_path = "analysis/{name}_switch_tables_all.toml"  # XenonAnalyse + tools/find_offset_switches.py
 
 skip_lr = true
 skip_msr = true
@@ -81,7 +91,7 @@ def find_helpers(img, text):
     for name, pat in PATTERNS.items():
         hits = [addr(i) for i in range(n - len(pat)) if words[i] == pat[0] and list(words[i:i + len(pat)]) == pat]
         if len(hits) != 1:
-            sys.exit(f'{name}: {len(hits)} matches in the code (one expected): is this the v1.06 default.xex?')
+            sys.exit(f'{name}: {len(hits)} matches in the code (one expected): is this the right default.xex?')
         out[name] = hits[0]
 
     def seq(opbase):
@@ -124,9 +134,9 @@ def find_helpers(img, text):
     return out
 
 
-def write_config(path, xex, helpers, funcs):
+def write_config(path, name, xex, helpers, funcs):
     h = helpers
-    body = HEADER.format(xex=xex.replace('\\', '/'))
+    body = HEADER.format(title=TITLES[name][0], name=name, xex=xex.replace('\\', '/'))
     for k in ('restgprlr_14', 'savegprlr_14', 'restfpr_14', 'savefpr_14',
               'restvmx_14', 'savevmx_14', 'restvmx_64', 'savevmx_64'):
         body += f'{k}_address = 0x{h[k]:08X}\n'
@@ -141,7 +151,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     for a in ('--xex', '--gen', '--analyse', '--recomp', '--xex-dump', '--ppc-context'):
         ap.add_argument(a, required=True)
+    ap.add_argument('--title', choices=sorted(TITLES), default='bf1943')
     a = ap.parse_args()
+    name = a.title
     xex = os.path.abspath(a.xex)
     gen = pathlib.Path(a.gen).resolve()
     ana = gen / 'analysis'
@@ -149,7 +161,7 @@ def main():
     progress(0)
 
     # 1. The memory image and the .text range.
-    img_path = ana / 'default_v106_image.bin'
+    img_path = ana / TITLES[name][1]
     out = run([a.xex_dump, xex, img_path, ana / 'xex_symbols.txt'])
     m = re.search(r'section \.text\s+0x([0-9A-F]+) size 0x([0-9A-F]+)', out)
     if not m:
@@ -159,11 +171,11 @@ def main():
     progress(1)
 
     # 2. Jump tables.
-    tables = ana / 'bf1943_switch_tables.toml'
+    tables = ana / f'{name}_switch_tables.toml'
     run([a.analyse, xex, tables], log=ana / 'xenonanalyse_stdout.txt')
     extra = run([sys.executable, '-I', TOOLS / 'find_offset_switches.py', img_path, tables])
-    (ana / 'bf1943_offset_switches.toml').write_text(extra)
-    (ana / 'bf1943_switch_tables_all.toml').write_text(tables.read_text() + extra)
+    (ana / f'{name}_offset_switches.toml').write_text(extra)
+    (ana / f'{name}_switch_tables_all.toml').write_text(tables.read_text() + extra)
     progress(2)
 
     # 3. Helpers.
@@ -172,12 +184,12 @@ def main():
     progress(3)
 
     # 4. XenonRecomp until no function is cut short.
-    cfg = gen / 'bf1943_config.toml'
+    cfg = gen / f'{name}_config.toml'
     ppc = gen / 'ppc'
     funcs = {}
     nested = set()
     for n in range(1, MAX_PASSES + 1):
-        write_config(cfg, xex, helpers, funcs)
+        write_config(cfg, name, xex, helpers, funcs)
         if ppc.exists():
             shutil.rmtree(ppc)
         ppc.mkdir()

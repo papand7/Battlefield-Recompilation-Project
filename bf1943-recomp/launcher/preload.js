@@ -15,7 +15,6 @@ contextBridge.exposeInMainWorld('launcher', {
   updateRun: () => ipcRenderer.invoke('update-run'),
   onUpdateEvent: (fn) => ipcRenderer.on('update-event', (_, ev) => fn(ev)),
   platform: process.platform,
-  platform: process.platform,
   texturesMake: () => ipcRenderer.invoke('textures-make'),
   texturesCancel: () => ipcRenderer.invoke('textures-cancel'),
   onTexturesEvent: (fn) => ipcRenderer.on('textures-event', (_, ev) => fn(ev)),
