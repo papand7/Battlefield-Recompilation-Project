@@ -1534,6 +1534,43 @@ TRACE_AI(8235FD08, "player obj caller 2")
 // (1, 0x800, 0x1E), as the player's deploy message does (8235FBD0).
 extern "C" PPC_FUNC(__imp__sub_82332350);
 extern "C" PPC_FUNC(__imp__sub_823D1DD0);
+
+// The game's per-thread allocator (as bf1943's bot_players.cpp; Bad Company's
+// own functions): the thread-local slot at 82E5F068 holds the thread's
+// allocator, which game objects are made with. The game's job threads get
+// one at start (824EAAA0, 82A60C10: 829A2130(object, memory at 82E5F06C, 16)
+// then 829AB508(object), which installs it); a thread without one, as the
+// dedicated server's worker that runs this update, read a null allocator
+// (829A25E0, +34) as soon as a bot's soldier was made. True when it has one.
+extern "C" PPC_FUNC(__imp__sub_829A2130);
+extern "C" PPC_FUNC(__imp__sub_829AB508);
+namespace rt {
+uint32_t SetCurrentTls(uint32_t slot, uint32_t value);  // threads.cpp
+}
+bool EnsureThreadAllocator(PPCContext& ctx, uint8_t* base) {
+  thread_local bool done = false;
+  if (done) return true;
+  uint32_t slot = Ld32(0x82E5F068), memory = Ld32(0x82E5F06C);
+  if (slot >= 64) return true;  // (not set up: nothing to do)
+  uint32_t mine = rt::SetCurrentTls(slot, 0);
+  rt::SetCurrentTls(slot, mine);
+  if (mine) return done = true;
+  if (!Ptr(memory) || !IsCommitted(memory)) return false;  // (the game's memory isn't up yet: again later)
+  uint32_t obj = g_system_heap->Alloc(1024, 16);  // (the game keeps it on the thread's stack: under 900 bytes)
+  if (!obj) return false;
+  memset(G<uint8_t>(obj), 0, 1024);
+  PPCContext c = ctx;
+  c.r3.u64 = obj, c.r4.u64 = memory, c.r5.u64 = 16;
+  __imp__sub_829A2130(c, base);
+  c = ctx;
+  c.r3.u64 = obj;
+  __imp__sub_829AB508(c, base);
+  uint32_t now_tls = rt::SetCurrentTls(slot, 0);
+  rt::SetCurrentTls(slot, now_tls);
+  RT_INFO("bots: this thread got an allocator of its own (%08X, memory %08X; slot %u now %08X)", obj, memory, slot,
+          now_tls);
+  return done = now_tls != 0;
+}
 // The bots (BF_BOT_FAKE=N, 1 to 16): fake players joined on the server (no
 // client, no traffic), each with its connection, spawn object, soldier, the
 // soldier's input state (vtable 82010C98, the soldier at +4) and its brain.
@@ -4318,6 +4355,9 @@ PPC_FUNC(sub_823D1DD0) {
     uint32_t so = b.soldier;
     bool alive = so && IsCommitted(so + 0x400) && Ld32(so) == 0x820118D0 && LdF(so + 0x3C) > 0;
     if (alive) continue;
+    // A soldier is made here, on the thread running this update: one without
+    // an allocator of its own (a dedicated server's worker) crashed in it.
+    if (!EnsureThreadAllocator(ctx, base)) continue;
     if (so) {
       RT_INFO("bot %d: its soldier %08X is dead", b.index, so);
       b.soldier = b.input = b.aim_obj = b.aim_for = 0, b.steer = false, b.enemy = 0, b.crouched = false;

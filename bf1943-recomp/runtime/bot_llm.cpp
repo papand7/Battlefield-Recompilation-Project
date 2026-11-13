@@ -671,33 +671,43 @@ std::vector<uint8_t> Draw(const MapView& m, int n = kSize) {
   // the ground (over a tenth of the picture). Its level is the sea's.
   std::vector<float> top;
   const bool structures = m.tops && m.tops(m.cx - m.half, m.cz + m.half, mpp, n, top);
-  float water = NAN;
+  std::vector<float> waters;  // the water surfaces' levels
   if (structures) {
     std::map<int, int> heights;  // (half metres)
     for (size_t i = 0; i < top.size(); ++i)
       if (std::isfinite(top[i]) && (!std::isfinite(h[i]) || top[i] > h[i] + 1.0f)) ++heights[int(std::lround(top[i] * 2))];
     auto most = std::max_element(heights.begin(), heights.end(), [](auto& a, auto& b) { return a.second < b.second; });
-    if (most != heights.end() && most->second > int(top.size() / 10)) water = most->first / 2.0f, sea = water;
-    // Less of the picture (a 200th) for a river, lake or harbour (Bad
-    // Company's levels): the lowest such level, no higher than 1.5 m over the
-    // lowest ground walked on (its banks).
-    else if (n >= 1024 && sea > -1e8f)
-      for (auto& [level, count] : heights)
-        if (count > int(top.size() / 200) && level / 2.0f <= sea + 1.5f) {
-          water = level / 2.0f, sea = water;
-          break;
-        }
+    if (most != heights.end() && most->second > int(top.size() / 10)) waters.push_back(most->first / 2.0f);
+    // Less of the picture (a 200th each) for rivers, lakes and harbours (Bad
+    // Company's levels; Valley Run has two: the reservoir above its dam, the
+    // river below), up to three: no roof is that large and flat.
+    else if (n >= 1024) {
+      std::vector<std::pair<int, int>> by(heights.begin(), heights.end());
+      std::sort(by.begin(), by.end(), [](auto& a, auto& b) { return a.second > b.second; });
+      for (size_t i = 0; i < by.size() && waters.size() < 3; ++i)
+        if (by[i].second > int(top.size() / 200)) waters.push_back(by[i].first / 2.0f);
+    }
+    if (!waters.empty()) sea = *std::min_element(waters.begin(), waters.end());
     if (n >= 1024) {  // (the whole level's: what it found)
       std::vector<std::pair<int, int>> by(heights.begin(), heights.end());
       std::sort(by.begin(), by.end(), [](auto& a, auto& b) { return a.second > b.second; });
       std::string common;
       for (size_t i = 0; i < by.size() && i < 4; ++i)
         common += " " + std::to_string(by[i].first / 2.0f).substr(0, 6) + " m (" + std::to_string(by[i].second) + ")";
-      RT_INFO("bot llm: the level's map: water %s; the commonest levels over the ground:%s",
-              std::isfinite(water) ? std::to_string(water).substr(0, 6).c_str() : "none", common.c_str());
+      std::string found;
+      for (float w : waters) found += " " + std::to_string(w).substr(0, 6) + " m";
+      RT_INFO("bot llm: the level's map: water%s; the commonest levels over the ground:%s",
+              found.empty() ? " none" : found.c_str(), common.c_str());
     }
   }
-  auto is_water = [&](size_t i) { return std::isfinite(water) && std::isfinite(top[i]) && std::fabs(top[i] - water) < 0.6f; };
+  // The water surface at pixel i (its level), or NAN.
+  auto water_at = [&](size_t i) {
+    if (std::isfinite(top[i]))
+      for (float w : waters)
+        if (std::fabs(top[i] - w) < 0.6f) return w;
+    return NAN;
+  };
+  auto is_water = [&](size_t i) { return std::isfinite(water_at(i)); };
   for (int y = 0; y < n; ++y)
     for (int x = 0; x < n; ++x) {
       float v = h[y * n + x];
@@ -705,8 +715,11 @@ std::vector<uint8_t> Draw(const MapView& m, int n = kSize) {
         cv.Put(x, y, 0x5A6E78);
         continue;
       }
-      if (v < sea - 0.3f || (is_water(size_t(y) * n + x) && v < water)) {  // water: lighter in the shallows
-        float d = std::clamp((sea - v) / 15.0f, 0.0f, 1.0f);
+      // Water: under a water surface, or (no surfaces found) below the sea's
+      // level; lighter in the shallows.
+      const float w = structures ? water_at(size_t(y) * n + x) : NAN;
+      if ((std::isfinite(w) && v < w) || (waters.empty() && v < sea - 0.3f)) {
+        float d = std::clamp(((std::isfinite(w) ? w : sea) - v) / 15.0f, 0.0f, 1.0f);
         cv.Put(x, y, uint32_t(70 - 40 * d) << 16 | uint32_t(140 - 70 * d) << 8 | uint32_t(170 - 60 * d));
         continue;
       }

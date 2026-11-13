@@ -60,11 +60,31 @@ static void ReportGuestFault(uint8_t* addr, bool write) {
       }
     }
 }
+// The console's physical memory (0xA0000000 up, both its views) is all
+// there: a stale pointer into memory freed and reused reads junk on it, and
+// the game goes on. Here a page no allocation ever reached faulted and ended
+// the game (Bad Company's collision jobs, a destroyed building's mesh). Such
+// a page is mapped (zero) on its first touch instead.
+static bool MapPhysicalOnDemand(uint8_t* addr) {
+  if (addr < g_base + 0xA0000000ull || addr >= g_base + 0x100000000ull) return false;
+  uint32_t guest = uint32_t(addr - g_base);
+  if (IsCommitted(guest)) return false;  // (a protected page: the write watches' own)
+  Commit(guest & ~0xFFFu, 0x1000);
+  static std::atomic<int> said{0};
+  if (said++ < 20)
+    RT_WARN("guest touched physical memory nothing had allocated (%08X, thread %u): mapped, zero, as the console's",
+            guest, CurrentThreadId());
+  return true;
+}
+
 #ifdef _WIN32
 static LONG WINAPI GuestFaultReporter(EXCEPTION_POINTERS* ep) {
   auto* rec = ep->ExceptionRecord;
-  if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
-    ReportGuestFault(reinterpret_cast<uint8_t*>(rec->ExceptionInformation[1]), rec->ExceptionInformation[0] != 0);
+  if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+    auto* addr = reinterpret_cast<uint8_t*>(rec->ExceptionInformation[1]);
+    if (MapPhysicalOnDemand(addr)) return EXCEPTION_CONTINUE_EXECUTION;
+    ReportGuestFault(addr, rec->ExceptionInformation[0] != 0);
+  }
   return EXCEPTION_CONTINUE_SEARCH;
 }
 #else
@@ -73,6 +93,7 @@ static LONG WINAPI GuestFaultReporter(EXCEPTION_POINTERS* ep) {
 thread_local sigjmp_buf* rt::g_fault_guard = nullptr;
 static void GuestFaultSignal(int sig, siginfo_t* info, void*) {
   if (rt::g_fault_guard) siglongjmp(*rt::g_fault_guard, 1);
+  if (MapPhysicalOnDemand(static_cast<uint8_t*>(info->si_addr))) return;
   ReportGuestFault(static_cast<uint8_t*>(info->si_addr), false);
   bf_crash_diag::PrintStack(nullptr);
   signal(sig, SIG_DFL);
