@@ -22,8 +22,14 @@ XESL_WRAPPER = ('#version 460\n'
 VARIANTS = {"scene_fx.cs.glsl": [("scene_fx_rt_cs", ["-DSCENE_FX_RT=1", "--target-env", "vulkan1.2"])]}
 
 src_root, out_root = map(pathlib.Path, sys.argv[1:3])
-sdk_bin = pathlib.Path(os.environ["VULKAN_SDK"]) / "Bin"
-glslang, spirv_opt = sdk_bin / "glslangValidator.exe", sdk_bin / "spirv-opt.exe"
+if os.name == "nt":
+    sdk_bin = pathlib.Path(os.environ["VULKAN_SDK"]) / "Bin"
+    glslang, spirv_opt = sdk_bin / "glslangValidator.exe", sdk_bin / "spirv-opt.exe"
+else:  # Linux: the distribution's glslang and SPIRV-Tools (build_linux.sh)
+    glslang, spirv_opt = os.environ.get("GLSLANG", "glslangValidator"), os.environ.get("SPIRV_OPT", "spirv-opt")
+# (Only renumbers the IDs; older SPIRV-Tools, as in distributions, lack it.)
+canon = ["--canonicalize-ids"] if "--canonicalize-ids" in subprocess.run(
+    [str(spirv_opt), "--help"], capture_output=True, text=True).stdout else []
 
 built = failed = 0
 for src in sorted(src_root.glob("xenia/*/shaders/*")):
@@ -49,7 +55,7 @@ for src in sorted(src_root.glob("xenia/*/shaders/*")):
             r = subprocess.run(args, input=XESL_WRAPPER.format(name) if xesl else None, text=True,
                                capture_output=True)
             if r.returncode == 0:
-                r = subprocess.run([str(spirv_opt), "-O", "-O", "--canonicalize-ids", str(raw), "-o", str(opt)],
+                r = subprocess.run([str(spirv_opt), "-O", "-O", *canon, str(raw), "-o", str(opt)],
                                    capture_output=True, text=True)
             if r.returncode != 0:
                 print(f"FAILED {src}\n{r.stdout}{r.stderr}")
