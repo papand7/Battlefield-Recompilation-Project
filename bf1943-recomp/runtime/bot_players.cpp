@@ -176,14 +176,18 @@ bool LeadsToJapanese(uint32_t kit) {
   return weapon == 2;
 }
 
-// Every live object with this vtable in the heaps.
+// Every live object with this vtable in the heaps. (Raw words against the
+// vtable in guest order, as Bad Company's scan: no swap per word, and the
+// compiler vectorises the page loop; it runs on the server's update thread.)
 std::vector<uint32_t> Scan(uint32_t vtable) {
   std::vector<uint32_t> out;
+  const uint32_t want = __builtin_bswap32(vtable);
   for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
     if (page >= 0x80000000 && page < 0xA0000000) continue;
     if (!IsCommitted(uint32_t(page))) continue;
-    for (uint32_t i = 0; i < 0x1000; i += 4)
-      if (Ld32(uint32_t(page) + i) == vtable) out.push_back(uint32_t(page) + i);
+    const uint32_t* p = reinterpret_cast<const uint32_t*>(g_base + page);
+    for (uint32_t i = 0; i < 1024; ++i)
+      if (p[i] == want) out.push_back(uint32_t(page) + i * 4);
   }
   return out;
 }
