@@ -22,6 +22,7 @@ out/
 frames/
 research/
 userdata*/
+server_data*/
 shader_cache/
 # NVIDIA's DLSS SDK: its licence keeps it out of an open repo (tools/fetch_dlss.py)
 bf1943-recomp/thirdparty/dlss/
