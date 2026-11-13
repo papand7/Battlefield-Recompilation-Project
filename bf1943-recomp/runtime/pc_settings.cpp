@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <list>
 #include <map>
@@ -62,6 +63,7 @@ struct Setting {
   int button = 0;                    // kButton: what it does (Button)
   std::string address, map;          // kButton on the join page: the server
   bool touched = false;              // changed on the page this run (only those go to the launcher)
+  bool from_launcher = false;        // its value came from the launcher's settings (else pc_settings.ini's)
 };
 enum Button { kHostStart = 1, kJoinServer, kJoinAddress, kRefresh };
 
@@ -183,6 +185,13 @@ void Build() {
                      {"0", "1"}, 1, true));
   v.push_back(Choice(kGraphics, "blood", L"BLOOD", L"Blood on hits, bodies torn apart by explosions.",
                      kOffOn, {"0", "1"}, 0, true, "blood"));
+  // The sun's shadow map: its size and how far it reaches (--shadowmap,
+  // --shadow-distance; the launcher passes them). 1600 is the most the
+  // console's EDRAM holds in one pass.
+  v.push_back(Choice(kGraphics, "shadow_detail", L"SHADOW DETAIL",
+                     L"The sun's shadows: their sharpness and how far they reach (next start).",
+                     {L"LOW", L"MEDIUM", L"HIGH", L"ULTRA"}, {"low", "medium", "high", "ultra"}, 2, true,
+                     "shadowDetail"));
   // Effects (the scene effects, live).
   v.push_back(Choice(kEffects, "quality", L"QUALITY PRESET",
                      L"Sets every effect below at once. LOW: the game's own look with a few extras; "
@@ -230,6 +239,10 @@ void Build() {
   v.push_back(Choice(kEffects, "flash", L"MUZZLE FLASH LIGHT",
                      L"On: a short, shadowed light at the gun. Off: the game's own.", kOffOn,
                      {"0", "1"}, 1));
+  // The effects are the launcher's too (its EFFECTS card): fx_<key> there.
+  static std::deque<std::string> fx_keys;
+  for (Setting& s : v)
+    if (s.category == kEffects && !s.launcher) s.launcher = fx_keys.emplace_back(std::string("fx_") + s.key).c_str();
   // Mouse.
   {
     std::vector<std::wstring> names;
@@ -1042,6 +1055,7 @@ void Load() {
       if (v == "false") v = "0";
       if (s.kind == Kind::kText) s.text = v;
       else Select(s, v);
+      s.from_launcher = true;
     }
   }
   std::ifstream ini(IniPath());
@@ -1051,7 +1065,9 @@ void Load() {
     if (line.empty() || line[0] == '#' || eq == std::string::npos) continue;
     std::string key = line.substr(0, eq), value = line.substr(eq + 1);
     Setting* s = Find(key.c_str());
-    if (!s || s->launcher) continue;  // the launcher's own are read from it
+    // (the launcher's own are read from it; one it hasn't set yet, as an
+    // effect set on this page before the launcher had them, from here)
+    if (!s || (s->launcher && s->from_launcher)) continue;
     if (s->kind == Kind::kKey) {
       if (int vk = std::atoi(value.c_str())) g_keys[s->action][0] = vk;
     } else if (s->kind == Kind::kChoice) {

@@ -59,7 +59,7 @@ The latest version of the launcher can be found in the [Releases](https://github
 - **Learning Bots** - Every server learns from its matches where players go, where they die and where they win fights, per map. Bots use it to hold good spots at a flag and to watch where enemies usually come from, and what servers learned can be merged into the next version (`tools/bot_knowledge.py`).
 
 ### Dedicated Server
-Edit and run `start_server.bat` (name, maps to rotate through, bots and `PUBLISH`), or:
+The launcher's **SERVER** page runs one for the game chosen at the top: its name, the maps it rotates through, bots, listing on the internet, the bot advisor and training runs, with START / STOP, the server's log and the newest training replay (`server_gui.bat` / `server_gui.sh` open the launcher on that page). Without a window, edit and run `start_server.bat` (name, maps to rotate through, bots and `PUBLISH`), or:
 ```
 bf1943.exe --game <your game files> --dedicated --name "My Server" --maps Wake_island_s,Iwo_Jima_s --bots 4 --publish
 ```

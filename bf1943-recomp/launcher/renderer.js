@@ -8,7 +8,71 @@ const rows = [
   ['upscaleQuality', 'Upscale quality', [['Off', 'off'], ['Quality', 'quality'], ['Balanced', 'balanced'], ['Performance', 'performance']]],
   ['preset', 'Look', [['Stock', 'stock'], ['Enhanced', 'enhanced'], ['Vivid', 'vivid'], ['Toon', 'toon'], ['Noir', 'noir'], ['WW2', 'ww2']]],
   ['frameRate', 'Frame rate', [['60', '60'], ['120', '120'], ['144', '144'], ['Max', '0']]],
+  ['shadowDetail', 'Shadow detail', [['Low', 'low'], ['Medium', 'medium'], ['High', 'high'], ['Ultra', 'ultra']]],
 ];
+
+// The EFFECTS card: the game's PC SETTINGS > EFFECTS, the same values (the
+// game reads fx_<key> from these settings; one not set here is the game's
+// own). [key, label, [[text, value], ...], the game's default]
+const offOn = [['Off', '0'], ['On', '1']];
+const fxRows = [
+  ['fx_quality', 'Quality preset', [['Low', 'low'], ['Medium', 'medium'], ['High', 'high'], ['Ultra', 'ultra'],
+    ['Custom', 'custom']], 'high'],
+  ['fx_rt', 'Ray-traced shadows', offOn, '1'],
+  ['fx_shadows', 'Screen shadows', [['Off', '0'], ['Low', '0.5'], ['Full', '1']], '1'],
+  ['fx_gi', 'Bounce light', [['Off', '0'], ['Low', '0.5'], ['Normal', '1'], ['High', '1.5']], '1'],
+  ['fx_ao', 'Ambient occlusion', [['Off', '0'], ['Low', '0.5'], ['Normal', '1'], ['High', '1.5']], '1'],
+  ['fx_clouds', 'Clouds', [['Off', '0'], ['Few', '0.3'], ['Normal', '0.45'], ['Many', '0.65']], '0.45'],
+  ['fx_cloud_shadows', 'Cloud shadows', [['Off', '0'], ['On', '0.85']], '0.85'],
+  ['fx_density', 'Fog', [['Light', '0.0009'], ['Normal', '0.0018'], ['Thick', '0.0036']], '0.0018'],
+  ['fx_shafts', 'Light shafts', [['Off', '0'], ['Normal', '0.6'], ['Strong', '0.9']], '0.6'],
+  ['fx_reflect', 'Sea reflections', offOn, '1'],
+  ['fx_gloss', 'Surface reflections', offOn, '1'],
+  ['fx_water_foam', 'Water foam', offOn, '1'],
+  ['fx_water_refract', 'Water refraction', offOn, '1'],
+  ['fx_water_shallow', 'Shallow water', offOn, '1'],
+  ['fx_detail', 'Surface detail', [['Off', '0'], ['On', '1'], ['Strong', '1.5']], '1'],
+  ['fx_particle_quality', 'Particle quality', [['Game', '0'], ['High', '1']], '1'],
+  ['fx_soft_particles', 'Soft particles', offOn, '1'],
+  ['fx_explosion_smoke', 'Explosion smoke', offOn, '0'],
+  ['fx_flash', 'Muzzle flash light', offOn, '1'],
+];
+// The quality presets' effect values (pc_settings.cpp kPresets: low, medium, high, ultra).
+const fxPresets = {
+  rt: ['0', '0', '1', '1'], shadows: ['0', '1', '1', '1'], gi: ['0', '0', '1', '1'], ao: ['0', '0.5', '1', '1'],
+  clouds: ['0.3', '0.45', '0.45', '0.45'], cloud_shadows: ['0', '0.85', '0.85', '0.85'], shafts: ['0', '0.6', '0.6', '0.6'],
+  reflect: ['0', '1', '1', '1'], gloss: ['0', '0', '1', '1'], water_foam: ['0', '0', '1', '1'],
+  water_refract: ['0', '1', '1', '1'], water_shallow: ['0', '1', '1', '1'], detail: ['0', '1', '1', '1.5'],
+  particle_quality: ['0', '1', '1', '1'], soft_particles: ['0', '1', '1', '1'], explosion_smoke: ['0', '0', '0', '1'],
+};
+function buildFxRows() {
+  $('fxrows').textContent = '';
+  const value = (key, def) => (settings[key] !== undefined ? String(settings[key]) : def);
+  for (const [key, label, options, def] of fxRows) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<div class="label">${label}</div><div class="seg"></div>`;
+    const seg = row.querySelector('.seg');
+    for (const [text, v] of options) {
+      const b = document.createElement('button');
+      b.textContent = text;
+      b.classList.toggle('on', value(key, def) === v);
+      b.onclick = () => {
+        if (key === 'fx_quality') {
+          if (v === 'custom') return;  // (shown, not picked: changing an effect makes it custom)
+          const i = ['low', 'medium', 'high', 'ultra'].indexOf(v);
+          for (const [k, vals] of Object.entries(fxPresets)) settings['fx_' + k] = vals[i];
+        } else {
+          settings.fx_quality = 'custom';
+        }
+        settings[key] = v;
+        buildFxRows();
+      };
+      seg.append(b);
+    }
+    $('fxrows').append(row);
+  }
+}
 
 const $ = (id) => document.getElementById(id);
 let settings = {};
@@ -49,11 +113,14 @@ function buildRows() {
 // pack: carries on an unfinished one and installs it again).
 function showTextures(key) {
   const g = games[key];
+  const mine = texBusy && texGame === key;  // (one pack at a time: the other game's tab waits)
   $('textures').checked = settings.textures && g.hasTextures;
   $('textures').disabled = !g.hasTextures;
-  if (!texBusy) $('texhint').textContent = g.hasTextures ? 'AI-upscaled texture pack' : 'Texture pack not found';
-  $('texmake').hidden = key !== 'bf1943';  // (Bad Company's pack isn't made here yet)
-  $('texmake').textContent = texBusy ? 'STOP' : g.hasTextures ? 'UPDATE' : 'MAKE';
+  if (!mine) $('texhint').textContent = texBusy ? `Making the ${games[texGame].title} pack first…`
+    : g.hasTextures ? 'AI-upscaled texture pack' : 'Texture pack not found';
+  $('texmake').hidden = false;
+  $('texmake').disabled = texBusy && !mine;
+  $('texmake').textContent = mine ? 'STOP' : g.hasTextures ? 'UPDATE' : 'MAKE';
 }
 
 // Shows the chosen game's tab, logo and options.
@@ -65,6 +132,7 @@ function selectGame(key) {
   settings.game = key;
   settings.resolution = (settings.scale && settings.scale[key]) || gameScale[key];
   buildRows();
+  buildFxRows();
   document.querySelectorAll('.game').forEach((t) => t.classList.toggle('on', t.dataset.game === key));
   $('year').textContent = key === 'bfbc1' ? 'BAD COMPANY' : '1943';
   $('year').classList.toggle('long', key === 'bfbc1');
@@ -73,6 +141,7 @@ function selectGame(key) {
   setStatus(g.error || '', !!g.error);
   $('play').disabled = !!g.error;
   showSetup(key, !!g.error);
+  showServer(key);
 }
 
 // ---- first-run setup: the game built here from the player's own copy ----------
@@ -199,7 +268,9 @@ async function init() {
     if (badge) badge.hidden = !g.error;
     tab.onclick = () => selectGame(tab.dataset.game);
   }
+  serverStatus(await window.launcher.serverStatus());
   selectGame(games[settings.game] && !games[settings.game].error ? settings.game : 'bf1943');
+  return state;
 }
 
 $('play').onclick = async () => {
@@ -218,19 +289,20 @@ $('play').onclick = async () => {
 window.launcher.onGameExited(() => { setStatus(''); $('play').disabled = false; });
 
 // The HD texture pack, made here (texpack.py make, through the main process).
-let texBusy = false;
+let texBusy = false, texGame = null;  // (the game whose pack is being made)
 const texSteps = { fetch: 'Getting the upscaler', extract: 'Reading the game\'s textures', build: 'Upscaling',
   install: 'Installing the pack' };
 $('texmake').onclick = async () => {
-  if (texBusy) { await window.launcher.texturesCancel(); return; }
+  if (texBusy) { if (texGame === settings.game) await window.launcher.texturesCancel(); return; }
   // Busy before asking: a job that fails at once can finish before the answer.
-  texBusy = true;
+  texBusy = true, texGame = settings.game;
   $('texmake').textContent = 'STOP';
   $('texhint').textContent = 'Starting…';
-  const r = await window.launcher.texturesMake();
+  const r = await window.launcher.texturesMake(texGame);
   if (r.error) { texBusy = false; showTextures(settings.game); $('texhint').textContent = r.error; }
 };
 window.launcher.onTexturesEvent(async (ev) => {
+  if ((ev.step || (ev.line && !ev.finished)) && settings.game !== texGame) return;  // (another tab: shown there)
   if (ev.step) {
     const pct = ev.total ? ` ${Math.floor((100 * ev.done) / ev.total)}%` : '';
     $('texhint').textContent = `${texSteps[ev.step] || ev.step}${pct}`;
@@ -239,6 +311,7 @@ window.launcher.onTexturesEvent(async (ev) => {
     const s = await window.launcher.state();
     games = s.games;
     showTextures(settings.game);  // (not selectGame: it would undo unsaved choices)
+    if (ev.game && ev.game !== settings.game) return;  // (the other game's tab is shown)
     $('texhint').textContent = ev.code === 0 ? 'Texture pack made'
       : ev.stopped ? 'Texture pack stopped: MAKE carries on' : `Texture pack failed: ${ev.error || `exit code ${ev.code}`}`;
   } else if (ev.line && /^(Could not|Real-ESRGAN|Python|texpack)/.test(ev.line)) {
@@ -249,13 +322,255 @@ window.launcher.onTexturesEvent(async (ev) => {
 window.addEventListener('focus', () => {
   if (!$('setupcard').hidden && setupGame) showSetup(setupGame, true);
 });
-// The side menu: its pages (home, settings).
+// The side menu: its pages (home, server, settings).
 document.querySelectorAll('#nav > button[data-page]').forEach((b) => {
   b.onclick = () => {
     document.querySelectorAll('#nav > button[data-page]').forEach((x) => x.classList.toggle('active', x === b));
     document.querySelectorAll('.page').forEach((p) => p.classList.toggle('active', p.id === 'page-' + b.dataset.page));
   };
 });
+const showPage = (name) => document.querySelector(`#nav > button[data-page="${name}"]`).click();
+
+// ---- the dedicated server (SERVER page) ---------------------------------------
+// The game chosen at the top; its choices kept in settings.server.<game> (saved
+// as they change). START runs it through the main process: the bots' advisor
+// installed the first time, the maps' missing nav meshes made, then the server.
+const serverMaps = {
+  bf1943: [['Wake_island_s', 'Wake Island'], ['Iwo_Jima_s', 'Iwo Jima'], ['Guadal_Canal', 'Guadalcanal'],
+    ['Coral_sea', 'Coral Sea (air)']],
+  bfbc1: [['mp_harbour_day1', 'Valley Run'], ['mp_harbour_day2', 'Deconstruction'],
+    ['mp_ignition_day1', 'Oasis'], ['mp_ignition_day2', 'Final Ignition'],
+    ['mp_monastery_day1', 'End of the Line'], ['mp_monastery_day2', 'Ascension'],
+    ['mp_beachhead_day1', 'Harvest Day'], ['mp_beachhead_day2', 'Over and Out']],
+};
+const serverDefaults = (key) => ({ name: 'My Server', maps: serverMaps[key].map(([m]) => m), bots: 8, publish: false,
+  llm: false, train: false, trainMinutes: 30, exe: '', game: '' });
+let srv = null;          // the choices on the page: { key, c }
+let srvInfo = {};        // what the main process found: exe, data, advisor
+let srvRunning = null;   // the game whose server runs
+let srvPhase = '';       // advisor | navs | server
+const kSrvLogLines = 2000;
+
+function showServer(key) {
+  if (srvRunning) key = srvRunning;  // (the running server stays on the page)
+  if (srv && srv.key === key) return;
+  srv = { key, c: { ...serverDefaults(key), ...(settings.server && settings.server[key]) } };
+  srvInfo = {};
+  const c = srv.c;
+  c.maps = c.maps.filter((m) => serverMaps[key].some(([k]) => k === m));
+  $('srvgame').textContent = `${games[key].title} · dedicated server`;
+  $('srvname').value = c.name;
+  $('srvmaps').textContent = '';
+  for (const [map, label] of serverMaps[key]) {
+    const b = document.createElement('button');
+    b.className = 'chip';
+    b.dataset.map = map;
+    b.innerHTML = '<span><b></b><small></small></span>';
+    b.querySelector('b').textContent = label;
+    b.querySelector('small').textContent = map;
+    b.classList.toggle('on', c.maps.includes(map));
+    b.onclick = () => {
+      // (in the game's own order)
+      const on = !c.maps.includes(map);
+      c.maps = serverMaps[key].map(([m]) => m).filter((m) => (m === map ? on : c.maps.includes(m)));
+      b.classList.toggle('on', on);
+      serverChanged();
+    };
+    $('srvmaps').append(b);
+  }
+  $('srvpublish').checked = !!c.publish;
+  $('srvllm').checked = !!c.llm;
+  $('srvtrain').checked = !!c.train;
+  serverControls();
+  refreshServerInfo();
+}
+
+// Training minutes: finer steps for short runs.
+const minuteStep = (m, up) => (up ? (m < 60 ? 5 : m < 180 ? 15 : 60) : (m <= 60 ? 5 : m <= 180 ? 15 : 60));
+const minuteText = (m) => (m < 60 ? `${m} min` : `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60}` : ''}`);
+
+// The controls from the choices (and locked while a server runs).
+function serverControls() {
+  const c = srv.c, busy = !!srvRunning;
+  $('bots').textContent = c.bots;
+  $('botsdown').disabled = busy || c.bots <= 0;
+  $('botsup').disabled = busy || c.bots >= 16;
+  $('botshint').textContent = c.train ? 'A training run plays with 16' : 'Computer players, half on each team';
+  $('minutes').textContent = minuteText(c.trainMinutes);
+  // (the length can be set before the run is turned on)
+  $('mindown').disabled = busy || c.trainMinutes <= 5;
+  $('minup').disabled = busy || c.trainMinutes >= 1440;
+  $('minutesbox').classList.toggle('dim', !c.train);
+  $('srvlocknote').hidden = !busy;
+  $('srvpublish').disabled = busy || c.train;
+  $('publishrow').classList.toggle('off', c.train);
+  $('publishhint').textContent = c.train ? 'Not with a training run: nobody joins it'
+    : 'Your router must pass the game\'s UDP ports (1003, 19430) to this PC';
+  $('mapcount').textContent = `${c.maps.length} of ${serverMaps[srv.key].length} in the rotation`;
+  for (const id of ['srvname', 'srvllm', 'srvtrain', 'srvexepick', 'srvdatapick', 'srvauto']) $(id).disabled = busy;
+  $('srvmaps').querySelectorAll('.chip').forEach((b) => (b.disabled = busy));
+  $('srvchoices').classList.toggle('locked', busy);
+  $('srvstart').disabled = busy || !srvInfo.exe || !srvInfo.data || !c.maps.length;
+  $('srvstop').disabled = !busy;
+}
+
+let srvSaveTimer = null;
+function serverChanged() {
+  settings.server = { ...settings.server, [srv.key]: srv.c };
+  serverControls();
+  clearTimeout(srvSaveTimer);
+  srvSaveTimer = setTimeout(() => window.launcher.saveSettings({ server: settings.server }), 500);
+}
+
+async function refreshServerInfo() {
+  const key = srv.key;
+  const info = await window.launcher.serverInfo(key, { exe: srv.c.exe, game: srv.c.game });
+  if (!srv || srv.key !== key) return;
+  srvInfo = info;
+  const show = (id, p, missing) => {
+    $(id).textContent = p || missing;
+    $(id).title = p || '';
+    $(id).classList.toggle('missing', !p);
+  };
+  show('srvexe', info.exe, 'Not found: set up the game (BATTLE), or choose it');
+  show('srvdata', info.data, 'Not found: choose the folder with default.xex');
+  $('srvauto').hidden = !srv.c.exe && !srv.c.game;
+  $('llmhint').textContent = 'A small AI model on this PC tells stuck or losing bots where to go'
+    + (info.advisor ? ' (installed)' : ' (installed the first time, about 3.5 GB)');
+  if (!srvRunning) {
+    const missing = !info.exe ? 'The game program was not found (Program, below).'
+      : !info.data ? 'The game files were not found (Program, below).' : '';
+    serverStateText(missing || 'Stopped', !!missing);
+  }
+  serverControls();
+}
+
+function serverStateText(text, error = false, ok = false) {
+  $('srvstate').textContent = text;
+  $('srvstate').title = text;
+  $('srvstate').classList.toggle('error', error);
+  $('srvstate').classList.toggle('ok', ok);
+}
+function serverBadge() {
+  const b = $('srvbadge');
+  b.className = 'srv-badge' + (!srvRunning ? '' : srvPhase === 'server' ? ' run' : ' busy');
+  b.textContent = !srvRunning ? 'STOPPED' : srvPhase === 'advisor' ? 'INSTALLING' : srvPhase === 'navs' ? 'NAV MESHES'
+    : srvPhase === 'server' ? 'RUNNING' : 'STARTING';
+  $('navsrvdot').hidden = !srvRunning;
+}
+
+// The log: the last lines, coloured (the launcher's own lines, warnings), kept
+// at the bottom unless scrolled up (also while the page is hidden).
+let srvFollow = true;
+$('srvlog').addEventListener('scroll', () => {
+  const log = $('srvlog');
+  if (log.clientHeight) srvFollow = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+});
+const followLog = () => { if (srvFollow) $('srvlog').scrollTop = $('srvlog').scrollHeight; };
+document.querySelector('#nav > button[data-page="server"]').addEventListener('click', followLog);
+function addServerLines(lines) {
+  const log = $('srvlog');
+  const frag = document.createDocumentFragment();
+  for (const line of lines) {
+    const s = document.createElement('span');
+    s.textContent = line + '\n';
+    if (/^== /.test(line)) s.className = /^== (Warning|Error|Could not|The advisor could not)/.test(line) ? 'warn' : 'note';
+    else if (/\b(error|failed|fatal)\b/i.test(line)) s.className = 'warn';
+    frag.append(s);
+  }
+  log.append(frag);
+  while (log.childElementCount > kSrvLogLines) log.firstChild.remove();
+  followLog();
+}
+
+// The main process's state (the launcher's page loaded again, or at the start).
+function serverStatus(st) {
+  srvRunning = st.running ? st.game : null;
+  srvPhase = (st.running && st.phase) || '';
+  $('srvlog').textContent = '';
+  addServerLines(st.log || []);
+  if (srvRunning) {
+    srv = null;
+    showServer(srvRunning);
+    serverStateText(st.state || (srvPhase === 'server' ? 'Running' : 'Starting…'), false, !!st.state);
+  }
+  serverBadge();
+}
+
+window.launcher.onServerEvent((ev) => {
+  if (ev.started) {
+    srvRunning = ev.started;
+    srvPhase = '';
+    $('srvlog').textContent = '';
+    srvFollow = true;
+    serverStateText('Starting…');
+    serverControls();
+  }
+  if (ev.lines) addServerLines(ev.lines);
+  if (ev.phase) {
+    srvPhase = ev.phase;
+    $('srvbar').hidden = ev.phase === 'server';
+    $('srvbarfill').style.width = '0%';
+    serverStateText(ev.phase === 'advisor' ? 'Installing the bot advisor…'
+      : ev.phase === 'navs' ? 'Making the nav meshes…' : 'Starting the server…');
+  }
+  if (ev.progress) {
+    const { what, done, total } = ev.progress;
+    $('srvbar').hidden = false;
+    $('srvbarfill').style.width = total ? `${Math.min(100, (100 * done) / total)}%` : '0%';
+    serverStateText(what === 'nav' ? `Making the nav meshes: ${done} of ${total}`
+      : `Downloading ${what}: ${(done / 1e9).toFixed(2)} of ${(total / 1e9).toFixed(2)} GB`);
+  }
+  if (ev.state) serverStateText(ev.state, false, true);
+  if (ev.finished) {
+    srvRunning = null;
+    srvPhase = '';
+    $('srvbar').hidden = true;
+    serverStateText('Stopped');
+    // Back to the game chosen at the top (another one may have been picked meanwhile).
+    srv = null;
+    showServer(settings.game);
+  }
+  serverBadge();
+  if (ev.started || ev.finished) serverControls();
+});
+
+$('srvname').addEventListener('input', () => { srv.c.name = $('srvname').value; serverChanged(); });
+$('srvname').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !$('srvstart').disabled) $('srvstart').click(); });
+$('botsdown').onclick = () => { srv.c.bots = Math.max(0, srv.c.bots - 1); serverChanged(); };
+$('botsup').onclick = () => { srv.c.bots = Math.min(16, srv.c.bots + 1); serverChanged(); };
+$('mindown').onclick = () => { srv.c.trainMinutes = Math.max(5, srv.c.trainMinutes - minuteStep(srv.c.trainMinutes, false)); serverChanged(); };
+$('minup').onclick = () => { srv.c.trainMinutes = Math.min(1440, srv.c.trainMinutes + minuteStep(srv.c.trainMinutes, true)); serverChanged(); };
+for (const [id, key] of [['srvpublish', 'publish'], ['srvllm', 'llm'], ['srvtrain', 'train']])
+  $(id).onchange = () => { srv.c[key] = $(id).checked; serverChanged(); };
+for (const [id, kind] of [['srvexepick', 'exe'], ['srvdatapick', 'game']])
+  $(id).onclick = async () => {
+    const p = await window.launcher.serverPick(kind);
+    if (!p) return;
+    srv.c[kind] = p;
+    serverChanged();
+    refreshServerInfo();
+  };
+$('srvauto').onclick = () => { srv.c.exe = srv.c.game = ''; serverChanged(); refreshServerInfo(); };
+$('srvstart').onclick = async () => {
+  srv.c.name = $('srvname').value.trim() || 'My Server';
+  $('srvname').value = srv.c.name;
+  serverChanged();
+  $('srvstart').disabled = true;
+  const r = await window.launcher.serverStart(srv.key, srv.c);
+  if (r.error) { serverStateText(r.error, true); serverControls(); return; }
+  $('srvlog').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+};
+$('srvstop').onclick = () => { $('srvstop').disabled = true; window.launcher.serverStop(); };
+$('srvreplay').onclick = async () => {
+  const r = await window.launcher.serverReplay(srv.key);
+  if (r.error && !srvRunning) serverStateText(r.error, true);
+  else if (r.error) addServerLines([`== ${r.error}`]);
+};
+$('srvfolder').onclick = async () => {
+  const r = await window.launcher.serverFolder(srv.key);
+  if (r.error) serverStateText(r.error, true);
+};
 $('min').onclick = () => window.launcher.minimize();
 $('close').onclick = () => window.launcher.close();
 $('name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('play').click(); });
@@ -290,7 +605,9 @@ $('autoupdate').onchange = () => {
   window.launcher.saveSettings(settings);
 };
 
-init().then(() => {
+init().then((state) => {
+  if (state.page === 'server' || state.page === 'settings') showPage(state.page);  // (--server, --page)
+  if (state.page === 'effects') showPage('settings'), $('effectscard').scrollIntoView();
   $('autoupdate').checked = settings.autoUpdate !== false;
   checkUpdate();
 });

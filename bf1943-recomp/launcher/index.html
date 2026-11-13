@@ -28,6 +28,7 @@
   <div id="shell">
     <nav id="nav">
       <button data-page="home" class="active"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><path d="M12 1v5M12 18v5M1 12h5M18 12h5"/></svg><span>Battle</span></button>
+      <button data-page="server"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><circle cx="7" cy="7.5" r="1"/><circle cx="7" cy="16.5" r="1"/><path d="M12 7.5h5M12 16.5h5"/></svg><span>Server</span><span class="nav-dot" id="navsrvdot" hidden></span></button>
       <button data-page="settings"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>Settings</span></button>
       <div class="nav-foot">
         <button id="updatebtn" class="btn ghost small" hidden>UPDATE</button>
@@ -84,6 +85,89 @@
         </div>
       </section>
 
+      <!-- SERVER: the dedicated server of the game chosen at the top (the one
+           running stays on the page until it stops) -->
+      <section id="page-server" class="page">
+        <div class="page-head">
+          <div>
+            <h2>Server</h2>
+            <div class="muted" id="srvgame">Battlefield 1943 · dedicated server</div>
+          </div>
+          <div class="srv-badge" id="srvbadge">STOPPED</div>
+        </div>
+
+        <div id="srvchoices">
+          <div class="lock-note" id="srvlocknote" hidden>The server is running: STOP it to change these choices.</div>
+          <div class="grid">
+            <div class="card">
+              <div class="card-head"><span class="num">01</span> Server</div>
+              <div class="card-body">
+                <label class="muted" for="srvname">Server name</label>
+                <input id="srvname" type="text" maxlength="31" spellcheck="false" autocomplete="off">
+                <div class="toggle-row">
+                  <div><div class="label">Bots</div><div class="muted" id="botshint">Computer players, half on each team</div></div>
+                  <div class="seg stepper"><button id="botsdown" aria-label="Fewer bots">−</button><span id="bots">8</span><button id="botsup" aria-label="More bots">+</button></div>
+                </div>
+                <div class="maps-head"><span class="label">Maps</span><span class="muted" id="mapcount"></span></div>
+                <div id="srvmaps" class="chips"></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head"><span class="num">02</span> Options</div>
+              <div class="card-body">
+                <div class="toggle-row" id="publishrow">
+                  <label for="srvpublish"><div class="label">List on the internet</div><div class="muted" id="publishhint">Your router must pass the game's UDP ports (1003, 19430) to this PC</div></label>
+                  <input type="checkbox" class="switch" id="srvpublish">
+                </div>
+                <div class="toggle-row">
+                  <label for="srvllm"><div class="label">Bot advisor</div><div class="muted" id="llmhint">A small AI model on this PC tells stuck or losing bots where to go</div></label>
+                  <input type="checkbox" class="switch" id="srvllm">
+                </div>
+                <div class="toggle-row">
+                  <label for="srvtrain"><div class="label">Training run</div><div class="muted">Nobody joins: 16 bots, twice as fast, tune how they play; a replay at the end</div></label>
+                  <div class="seg stepper" id="minutesbox" title="How long the run lasts (real time)"><button id="mindown" aria-label="Shorter">−</button><span id="minutes">30 min</span><button id="minup" aria-label="Longer">+</button></div>
+                  <input type="checkbox" class="switch" id="srvtrain">
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="srv-row">
+          <button id="srvstart" class="play small">START</button>
+          <button id="srvstop" class="btn ghost" disabled>STOP</button>
+          <div class="srv-side">
+            <div id="srvstate" class="muted status"></div>
+            <div class="bar" id="srvbar" hidden><span id="srvbarfill"></span></div>
+          </div>
+          <button id="srvreplay" class="btn ghost small" title="The newest training run's replay, in the browser">OPEN REPLAY</button>
+          <button id="srvfolder" class="btn ghost small" title="server_data: what the server learned, its replays">SERVER FOLDER</button>
+        </div>
+
+        <div class="card wide">
+          <div class="card-head"><span class="num">03</span> Server log</div>
+          <pre id="srvlog" class="log server"></pre>
+        </div>
+
+        <div class="card wide" id="srvpaths">
+          <div class="card-head"><span class="num">04</span> Program</div>
+          <div class="card-body">
+            <div class="path-row">
+              <div class="label">Game program</div>
+              <div id="srvexe" class="path"></div>
+              <button id="srvexepick" class="btn ghost small">Choose…</button>
+            </div>
+            <div class="path-row">
+              <div class="label">Game files</div>
+              <div id="srvdata" class="path"></div>
+              <button id="srvdatapick" class="btn ghost small">Choose…</button>
+            </div>
+            <div class="row"><button id="srvauto" class="btn ghost small" hidden>Use the ones found</button></div>
+          </div>
+        </div>
+      </section>
+
       <!-- SETTINGS: graphics and the launcher -->
       <section id="page-settings" class="page">
         <div class="page-head"><h2>Settings</h2></div>
@@ -108,6 +192,13 @@
               <div><div class="label">Automatic updates</div><div class="muted">Installs a new release from GitHub when the launcher starts</div></div>
               <input type="checkbox" class="switch" id="autoupdate">
             </div>
+          </div>
+        </div>
+        <div class="card" id="effectscard">
+          <div class="card-head"><span class="num">02</span> Effects</div>
+          <div class="card-body">
+            <div class="muted fxnote">The game's scene effects (the same as PC SETTINGS &rsaquo; EFFECTS in the game). The quality preset sets them all; changing one makes it custom.</div>
+            <div id="fxrows"></div>
           </div>
         </div>
       </section>

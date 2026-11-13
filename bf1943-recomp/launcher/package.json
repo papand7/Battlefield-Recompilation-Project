@@ -34,7 +34,9 @@
       "renderer.js",
       "index.html",
       "styles.css",
-      "package.json"
+      "package.json",
+      "icon.png",
+      "icon.ico"
     ],
     "extraResources": [
       {
@@ -45,7 +47,8 @@
     "win": {
       "target": [
         "portable"
-      ]
+      ],
+      "icon": "icon.ico"
     },
     "portable": {
       "artifactName": "BattlefieldLauncher-${version}.exe"
@@ -55,7 +58,8 @@
         "AppImage"
       ],
       "category": "Game",
-      "executableName": "battlefield-launcher"
+      "executableName": "battlefield-launcher",
+      "icon": "icon.png"
     },
     "appImage": {
       "artifactName": "BattlefieldLauncher-${version}-x86_64.AppImage"

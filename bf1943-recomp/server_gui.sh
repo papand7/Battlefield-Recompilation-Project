@@ -1,6 +1,14 @@
 #!/bin/sh
-# The dedicated server's window (tools/server_gui.py): name, maps, bots, internet,
-# the bots' advisor, training runs; START / STOP, its log, the training replay.
-# Needs python3 with tkinter (Debian/Ubuntu: sudo apt install python3-tk).
+# The dedicated server's window: the launcher, opened on its SERVER page (name, maps,
+# bots, internet, the bots' advisor, training runs; START / STOP, its log, the replay).
+# A server without a window: start_server.sh.
 cd "$(dirname "$0")" || exit 1
-exec python3 tools/server_gui.py "$@"
+# The AppImage next to BattlefieldRecomp/ (the newest), or a release folder's Launcher/.
+app=$(ls -t ../../BattlefieldLauncher-*.AppImage 2>/dev/null | head -n 1)
+[ -n "$app" ] && exec "$app" --server "$@"
+[ -x ../Launcher/battlefield-launcher ] && exec ../Launcher/battlefield-launcher --server "$@"
+# From the sources: Electron (npm install in launcher/ first).
+[ -x launcher/node_modules/electron/dist/electron ] && exec launcher/node_modules/electron/dist/electron launcher --server "$@"
+echo 'The launcher was not found: run "npm install" in launcher/ (from the sources), or use' >&2
+echo "the launcher's SERVER page. start_server.sh runs a server without a window." >&2
+exit 1

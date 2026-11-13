@@ -15,7 +15,16 @@ contextBridge.exposeInMainWorld('launcher', {
   updateRun: () => ipcRenderer.invoke('update-run'),
   onUpdateEvent: (fn) => ipcRenderer.on('update-event', (_, ev) => fn(ev)),
   platform: process.platform,
-  texturesMake: () => ipcRenderer.invoke('textures-make'),
+  texturesMake: (game) => ipcRenderer.invoke('textures-make', game),
   texturesCancel: () => ipcRenderer.invoke('textures-cancel'),
   onTexturesEvent: (fn) => ipcRenderer.on('textures-event', (_, ev) => fn(ev)),
+  // The dedicated server (the SERVER page).
+  serverInfo: (game, chosen) => ipcRenderer.invoke('server-info', game, chosen),
+  serverStatus: () => ipcRenderer.invoke('server-status'),
+  serverStart: (game, choices) => ipcRenderer.invoke('server-start', game, choices),
+  serverStop: () => ipcRenderer.invoke('server-stop'),
+  serverPick: (kind) => ipcRenderer.invoke('server-pick', kind),
+  serverFolder: (game) => ipcRenderer.invoke('server-folder', game),
+  serverReplay: (game) => ipcRenderer.invoke('server-replay', game),
+  onServerEvent: (fn) => ipcRenderer.on('server-event', (_, ev) => fn(ev)),
 });
