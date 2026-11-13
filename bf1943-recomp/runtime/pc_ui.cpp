@@ -5,10 +5,14 @@
 #include "kernel.h"
 #include "xenia_bridge.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <Xinput.h>
+#else
+#include "posix_gdiplus.h"  // (Linux: GDI's text calls, XInput)
+#endif
 
 #include <algorithm>
 #include <cmath>

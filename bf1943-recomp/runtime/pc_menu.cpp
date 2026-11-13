@@ -6,17 +6,23 @@
 #include "pc_menu.h"
 #include "xenia_bridge.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <objidl.h>
+#else
+#include "posix_gdiplus.h"  // (Linux: GDI+)
+#endif
 
 #include <algorithm>
 namespace Gdiplus {
 using std::max;
 using std::min;
 }  // namespace Gdiplus
+#ifdef _WIN32
 #include <gdiplus.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -28,7 +34,9 @@ using std::min;
 #include <mutex>
 #include <thread>
 
+#ifdef _WIN32
 #pragma comment(lib, "gdiplus.lib")
+#endif
 
 namespace rt::pcmenu {
 

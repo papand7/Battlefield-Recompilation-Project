@@ -42,8 +42,9 @@ target_include_directories(bf1943_xexload PUBLIC ${XU} ${XT}/simde
 # The runtime minus what needs Windows (window, Vulkan presenter, XAudio2,
 # GDI menus).
 file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS ${ROOT}/runtime/*.cpp)
-list(REMOVE_ITEM RUNTIME_SOURCES  # (Windows GDI / GDI+: linux_client.cpp has their stand-ins)
-  ${ROOT}/runtime/pc_settings.cpp ${ROOT}/runtime/pc_menu.cpp ${ROOT}/runtime/pc_ui.cpp ${ROOT}/runtime/fps_overlay.cpp)
+set(PC_UI_SOURCES  # (GDI / GDI+: the server has stand-ins, the game posix_gdiplus.cpp)
+  ${ROOT}/runtime/pc_settings.cpp ${ROOT}/runtime/pc_menu.cpp ${ROOT}/runtime/pc_ui.cpp)
+list(REMOVE_ITEM RUNTIME_SOURCES ${PC_UI_SOURCES} ${ROOT}/runtime/fps_overlay.cpp)  # (its counter: linux_client.cpp)
 set(STUBS ${CMAKE_CURRENT_BINARY_DIR}/import_stubs.cpp)
 add_custom_command(OUTPUT ${STUBS}
   COMMAND Python3::Interpreter ${ROOT}/tools/gen_import_stubs.py
@@ -114,11 +115,15 @@ if(BF1943_CLIENT)
   target_compile_options(xenia_gpu PRIVATE -march=x86-64-v3 -w)
   target_link_libraries(xenia_gpu PUBLIC bf1943_ffmpeg SDL3::SDL3-static X11::X11 X11::X11_xcb X11::xcb)
 
-  set(CLIENT_SOURCES ${RUNTIME_SOURCES})
+  # The PC menus and key icons too, their GDI / GDI+ drawn by
+  # runtime/posix_gdiplus.cpp (stb_truetype; the menus' fonts copied next to the exe).
+  set(CLIENT_SOURCES ${RUNTIME_SOURCES} ${PC_UI_SOURCES})
   add_executable(bf1943 ${CLIENT_SOURCES} ${ROOT}/runtime/bots/brain.cpp ${ROOT}/runtime/bots/nav.cpp
                  ${DETOUR_SOURCES} ${STUBS})
   target_include_directories(bf1943 PRIVATE ${ROOT}/thirdparty/recastnavigation/Detour/Include
-                             ${ROOT}/runtime ${ROOT}/runtime/xenia_shims)
+                             ${ROOT}/runtime ${ROOT}/runtime/xenia_shims ${ROOT}/thirdparty/stb)
+  add_custom_command(TARGET bf1943 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${ROOT}/data/fonts $<TARGET_FILE_DIR:bf1943>/fonts)
   target_compile_definitions(bf1943 PRIVATE BF1943_CLIENT)
   target_compile_options(bf1943 PRIVATE -march=x86-64-v3 -fno-strict-aliasing)
   target_link_libraries(bf1943 PRIVATE bf1943_ppc bf1943_xexload xenia_gpu Threads::Threads ${CMAKE_DL_LIBS})

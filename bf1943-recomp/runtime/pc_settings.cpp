@@ -12,10 +12,14 @@
 #include "lan.h"
 #include "pc_menu.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <Xinput.h>
+#else
+#include "posix_gdiplus.h"  // (Linux: key names, XInput, the launcher's folder)
+#endif
 
 #include <algorithm>
 #include <chrono>
