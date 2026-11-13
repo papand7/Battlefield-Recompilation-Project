@@ -18,7 +18,16 @@ void PatchPcText(uint8_t*, size_t) {}
 }  // namespace rt
 namespace rt::pcset {
 void Load() {}
-int Key(Action, int) { return 0; }
+// The default bindings (pc_settings.cpp's kActions), until the KEYS page is
+// there: the key, and a second one or 0.
+int Key(Action action, int slot) {
+  static const int kKeys[kActionCount][2] = {
+      {'W', 0},          {'S', 0},          {'A', 0},         {'D', 0},
+      {VK_LBUTTON, 0},   {VK_RBUTTON, 0},   {VK_SPACE, 0},    {VK_CONTROL, 'C'},
+      {VK_SHIFT, 0},     {'R', 0},          {'E', 0},         {'F', 'V'},
+      {'G', VK_MBUTTON}, {'1', '2'},        {VK_TAB, 0},      {VK_ESCAPE, 0}};
+  return action >= 0 && action < kActionCount && slot >= 0 && slot < 2 ? kKeys[action][slot] : 0;
+}
 bool IsOpen() { return false; }
 void Open() {}
 void OpenHost() {}

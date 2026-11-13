@@ -10,6 +10,8 @@
 
 #ifdef _WIN32
 #include "xenia/apu/xaudio2/xaudio2_audio_driver.h"
+#elif defined(BF1943_CLIENT)
+#include <SDL3/SDL.h>  // (the Linux game's sound: an SDL3 audio stream per client)
 #endif
 #include "xenia/apu/xma_context.h"
 #include "xenia/apu/xma_decoder.h"
@@ -34,6 +36,16 @@ struct Client {
   std::unique_ptr<xe::threading::Semaphore> semaphore;
 #ifdef _WIN32
   std::unique_ptr<xe::apu::xaudio2::XAudio2AudioDriver> driver;
+#elif defined(BF1943_CLIENT)
+  // The Linux game: 6 channels (front L/R, centre, LFE, rear L/R: SDL's order
+  // too, mixed down by SDL for the device), 32-bit float, 48 kHz.
+  struct Stream {
+    explicit Stream(SDL_AudioStream* stream) : s(stream) {}
+    Stream(const Stream&) = delete;
+    ~Stream() { SDL_DestroyAudioStream(s); }
+    SDL_AudioStream* s;
+  };
+  std::unique_ptr<Stream> driver;
 #else
   std::unique_ptr<int> driver;  // no sound device (the Linux server)
 #endif
@@ -168,7 +180,7 @@ uint32_t XMADisableContext(uint32_t c, uint32_t wait) {
 
 // ---- render driver clients -------------------------------------------------------
 int OpenClient() {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(BF1943_CLIENT)
   return -1;  // no sound device: the client runs silent (audio.cpp)
 #endif
   for (int i = 0; i < kMaxClients; ++i) {
@@ -178,6 +190,17 @@ int OpenClient() {
 #ifdef _WIN32
     cl.driver = std::make_unique<xe::apu::xaudio2::XAudio2AudioDriver>(cl.semaphore.get());
     if (!cl.driver->Initialize()) {
+#elif defined(BF1943_CLIENT)
+    SDL_InitSubSystem(SDL_INIT_AUDIO);
+    SDL_AudioSpec spec{SDL_AUDIO_F32, 6, 48000};
+    SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    if (stream) {
+      SDL_ResumeAudioStreamDevice(stream);
+      cl.driver = std::make_unique<Client::Stream>(stream);
+    } else {
+      fprintf(stderr, "[xapu] no sound device: %s\n", SDL_GetError());
+    }
+    if (!cl.driver) {
 #else
     if (true) {
 #endif
@@ -198,6 +221,13 @@ void CloseClient(int index) {
   g_clients[index].semaphore.reset();
 }
 bool TakeFrameSlot(int index) {
+#if !defined(_WIN32) && defined(BF1943_CLIENT)
+  // Room while under kQueuedFrames' worth... kept to 8 frames (43 ms): the
+  // stream's queue is the device's latency.
+  constexpr int kFrameBytes = 256 * 6 * 4;
+  auto& d = g_clients[index].driver;
+  return d && SDL_GetAudioStreamQueued(d->s) < 8 * kFrameBytes;
+#endif
   auto& sem = g_clients[index].semaphore;
   return sem && xe::threading::Wait(sem.get(), false, std::chrono::milliseconds(0)) ==
                     xe::threading::WaitResult::kSuccess;
@@ -206,6 +236,20 @@ void SubmitFrame(int index, uint32_t samples) {
 #ifdef _WIN32
   if (index >= 0 && index < kMaxClients && g_clients[index].driver)
     g_clients[index].driver->SubmitFrame(reinterpret_cast<float*>(Ptr(samples)));
+#elif defined(BF1943_CLIENT)
+  if (index >= 0 && index < kMaxClients && g_clients[index].driver) {
+    SDL_AudioStream* stream = g_clients[index].driver->s;
+    // The guest's frame: 6 channels one after another, 256 big-endian floats
+    // each -> interleaved, host order.
+    const uint32_t* in = reinterpret_cast<const uint32_t*>(Ptr(samples));
+    float out[256 * 6];
+    for (int n = 0; n < 256; ++n)
+      for (int c = 0; c < 6; ++c) {
+        uint32_t u = xe::byte_swap(in[c * 256 + n]);
+        std::memcpy(&out[n * 6 + c], &u, 4);
+      }
+    SDL_PutAudioStreamData(stream, out, sizeof(out));
+  }
 #else
   (void)index, (void)samples;
 #endif

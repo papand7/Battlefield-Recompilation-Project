@@ -327,6 +327,12 @@ bool Start(uint8_t* guest_base, bool present, InterruptFn interrupt, uint32_t ti
   g_kernel->set_title_id(title_id);
   g_graphics = std::make_unique<xe::gpu::vulkan::VulkanGraphicsSystem>();
   g_graphics->on_interrupt = interrupt;
+#ifndef _WIN32
+  // Mesa offers only FIFO on XWayland, and its X11 FIFO waits for present-done
+  // events that can stop coming: the window froze on its first frames. Mailbox
+  // (no tearing either; the guest paces itself) unless the player set it.
+  setenv("MESA_VK_WSI_PRESENT_MODE", "mailbox", 0);
+#endif
   fprintf(stderr, "[xgpu] Setup(present=%d)\n", int(present));
   if (g_graphics->Setup(g_processor.get(), g_kernel.get(), nullptr, present) != 0) {
     g_graphics.reset();
