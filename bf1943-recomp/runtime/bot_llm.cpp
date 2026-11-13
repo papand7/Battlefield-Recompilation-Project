@@ -347,6 +347,10 @@ float g_run_bounds[3] = {0, 0, 1};
 std::map<int, std::pair<int, std::vector<std::array<float, 3>>>> g_tracks;  // bot: team, (t x z)
 std::vector<RunCase> g_run_cases;
 std::vector<RunLearned> g_run_learned;
+struct RunShot { float t, fx, fz, tx, tz; int bot; bool hit; };
+struct RunKill { float t, x, z; int team, killer; };
+std::vector<RunShot> g_run_shots;
+std::vector<RunKill> g_run_kills;
 
 const char* kViewer = R"VIEWER(<!DOCTYPE html><html><head><meta charset="utf-8"><title>Bot training</title>
 <style>
@@ -398,6 +402,13 @@ function draw(){
    if(last&&p[0]-last[0]<5){g.strokeStyle=col(b.team,i,Math.max(0.1,1-(T-p[0])/120));const[a,c]=P(last[1],last[2]),[d,e]=P(p[1],p[2]);g.beginPath();g.moveTo(a,c);g.lineTo(d,e);g.stroke();}
    last=p;}
   if(last&&T-last[0]<3){const[x,y]=P(last[1],last[2]);g.fillStyle=col(b.team,i,1);g.beginPath();g.arc(x,y,5,0,7);g.fill();g.fillStyle='#fff';g.font='10px sans-serif';g.fillText(b.id,x+6,y-6);}});
+ const S=R.shots||[],X=R.kills||[],bi={};R.bots.forEach((b,i)=>bi[b.id]=[b.team,i]);
+ for(const s of S){if(s[0]>T||T-s[0]>1.5)continue;const[tm,i]=bi[s[1]]||[1,0],[a,b]=P(s[2],s[3]),[c,d]=P(s[4],s[5]);
+  g.globalAlpha=(s[6]?1:0.45)*(1-(T-s[0])/1.5);g.strokeStyle=s[6]?'#fff':col(tm,i,1);g.lineWidth=s[6]?2:1;
+  g.beginPath();g.moveTo(a,b);g.lineTo(c,d);g.stroke();if(s[6]){g.fillStyle='#f33';g.beginPath();g.arc(c,d,3,0,7);g.fill();}g.globalAlpha=1;}
+ for(const k of X){if(k[0]>T||T-k[0]>60)continue;const[x,y]=P(k[1],k[2]);g.globalAlpha=Math.max(0.15,1-(T-k[0])/60);
+  g.strokeStyle=k[3]==1?'#6cf':'#f96';g.lineWidth=2;g.beginPath();g.moveTo(x-5,y-5);g.lineTo(x+5,y+5);g.moveTo(x+5,y-5);g.lineTo(x-5,y+5);g.stroke();
+  if(k[4]>=0){g.fillStyle='#fff';g.font='9px sans-serif';g.fillText('by '+k[4],x+6,y+10);}g.globalAlpha=1;}
  for(const l of R.learned){if(l.t>T)continue;const[x,y]=P(l.x,l.z);g.fillStyle=l.worked?'#3c3':'#e33';g.globalAlpha=Math.max(0.2,1-(T-l.t)/300);g.fillRect(x-3,y-3,6,6);g.globalAlpha=1;}
  for(const c of R.cases){if(c.t>T)continue;const[x,y]=P(c.x,c.z),f=c.worked===true?'#3c3':c.worked===false?'#e33':'#bbb';
   g.globalAlpha=Math.max(0.25,1-(T-c.t)/300);
@@ -412,7 +423,7 @@ const list=document.getElementById('list');
 for(const c of R.cases){const e=document.createElement('div'),k=c.worked===true?'ok':c.worked===false?'bad':'unk';e.className='case';
  e.innerHTML=`<span class=${k}>&#9679;</span> ${fmt(c.t)} bot ${c.bot}, ${kind(c)}: place ${c.place}`;e.onclick=()=>show(c);list.appendChild(e);}
 const ok=R.cases.filter(c=>c.worked===true).length,bad=R.cases.filter(c=>c.worked===false).length;
-document.getElementById('sum').innerHTML=`<h2>${esc(R.map)}</h2><p>${R.bots.length} bots, ${fmt(end)} of game time at ${R.speed}x.<br>${R.cases.length} questions: <span class=ok>${ok} worked</span>, <span class=bad>${bad} failed</span>.<br>${R.learned.length} learned places reused (${R.learned.filter(l=>l.worked).length} worked).</p><p class=unk>Circles: questions (S stuck, C cover, V vehicle, I idle, F where to fight), the dashed line to the place picked. Squares: learned places reused. Green worked, red failed.</p>`;
+document.getElementById('sum').innerHTML=`<h2>${esc(R.map)}</h2><p>${R.bots.length} bots, ${fmt(end)} of game time at ${R.speed}x.<br>${R.cases.length} questions: <span class=ok>${ok} worked</span>, <span class=bad>${bad} failed</span>.<br>${R.learned.length} learned places reused (${R.learned.filter(l=>l.worked).length} worked).<br>${(R.shots||[]).length} shots shown (${(R.shots||[]).filter(s=>s[6]).length} hits), ${(R.kills||[]).length} killed.</p><p class=unk>Circles: questions (S stuck, C cover, V vehicle, I idle, F where to fight), the dashed line to the place picked. Squares: learned places reused. Green worked, red failed. Lines: shots (white with a red dot: a hit). X: a soldier killed (blue US, orange Japan; "by N": the bot that killed it).</p>`;
 cv.onclick=e=>{if(drag&&drag.moved)return;const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;let best=null,bd=12;
  for(const c of R.cases){if(c.t>T)continue;const[x,y]=P(c.x,c.z),d=Math.hypot(x-mx,y-my);if(d<bd){bd=d;best=c;}}if(best)show(best);};
 tr.oninput=()=>{T=+tr.value;draw();};
@@ -460,6 +471,19 @@ void WriteRun() {  // (g_run_mutex held)
     const RunLearned& l = g_run_learned[i];
     snprintf(buf, sizeof(buf), "%s{\"t\":%.1f,\"kind\":%d,\"x\":%.1f,\"z\":%.1f,\"worked\":%s}", i ? "," : "", l.t, l.kind,
              l.x, l.z, l.worked ? "true" : "false");
+    o += buf;
+  }
+  o += "],\"shots\":[";
+  for (size_t i = 0; i < g_run_shots.size(); ++i) {
+    const RunShot& s = g_run_shots[i];
+    snprintf(buf, sizeof(buf), "%s[%.1f,%d,%.1f,%.1f,%.1f,%.1f,%d]", i ? "," : "", s.t, s.bot, s.fx, s.fz, s.tx, s.tz,
+             s.hit ? 1 : 0);
+    o += buf;
+  }
+  o += "],\"kills\":[";
+  for (size_t i = 0; i < g_run_kills.size(); ++i) {
+    const RunKill& k = g_run_kills[i];
+    snprintf(buf, sizeof(buf), "%s[%.1f,%.1f,%.1f,%d,%d]", i ? "," : "", k.t, k.x, k.z, k.team, k.killer);
     o += buf;
   }
   o += "]};\n";
@@ -861,7 +885,7 @@ void SetLevelMap(const std::string& map, const MapView& level) {
     std::lock_guard lock(g_run_mutex);
     if (map == g_run_map) return;
     WriteRun();  // (the last map's, as it ended)
-    g_tracks.clear(), g_run_cases.clear(), g_run_learned.clear();
+    g_tracks.clear(), g_run_cases.clear(), g_run_learned.clear(), g_run_shots.clear(), g_run_kills.clear();
     g_run_map = map;
     g_run_t0 = GuestSeconds();
     g_run_bounds[0] = level.cx, g_run_bounds[1] = level.cz, g_run_bounds[2] = level.half;
@@ -900,6 +924,26 @@ void Track(int bot, int team, float x, float z) {
   if (!tr.second.empty() && t - tr.second.back()[0] < 1.0) return;  // (once a game second)
   tr.first = team;
   tr.second.push_back({float(t), x, z});
+}
+
+void Shot(int bot, const float from[3], const float to[3], bool hit) {
+  if (!g_training) return;
+  std::lock_guard lock(g_run_mutex);
+  if (g_run_dir.empty()) return;
+  // Misses at most twice a game second per bot (it fires several times a
+  // second); every hit.
+  static std::map<int, double> last;
+  double t = RunTime();
+  if (!hit && t - last[bot] < 0.5) return;
+  last[bot] = t;
+  g_run_shots.push_back({float(t), from[0], from[2], to[0], to[2], bot, hit});
+}
+
+void Killed(float x, float z, int team, int killer) {
+  if (!g_training) return;
+  std::lock_guard lock(g_run_mutex);
+  if (g_run_dir.empty()) return;
+  g_run_kills.push_back({float(RunTime()), x, z, team, killer});
 }
 
 void FinishRun() {

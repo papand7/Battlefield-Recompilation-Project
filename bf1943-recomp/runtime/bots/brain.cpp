@@ -340,18 +340,19 @@ struct Brain {
     for (int i = 0; i < w.point_count; ++i) {
       const Point& p = w.points[i];
       if (i == self.avoid_point && w.now < self.avoid_until && w.point_count > 1) continue;
-      float temp = p.owner == me.team ? 10.0f : (p.owner == 0 ? 60.0f : 45.0f);
+      float temp = p.owner == me.team ? 10.0f : (p.owner == 0 ? Setting(io, kFlagNeutral) : Setting(io, kFlagEnemy));
       // Enemy soldiers near a point we own make it hot to defend.
       int threats = 0;
       for (int k = 0; k < w.soldier_count; ++k)
         if (w.soldiers[k].team != me.team && Dist2D(w.soldiers[k].pos, p.pos) < 40) ++threats;
-      if (p.owner == me.team) temp += 25.0f * threats;
+      if (p.owner == me.team) temp += Setting(io, kFlagDefend) * threats;
       int mates = 0;
       for (int k = 0; k < w.bot_count; ++k) {
         const BotIO& o = w.bots[k];
         if (&o != &io && o.mem_tag == kTag && reinterpret_cast<const Bot*>(o.mem)->target_point == i) ++mates;
       }
-      float score = temp - 12.0f * mates - Dist2D(me.pos, p.pos) / 25.0f + Rand(0, 5);
+      float score = temp - Setting(io, kFlagMates) * mates - Dist2D(me.pos, p.pos) * Setting(io, kFlagDistance) +
+                    Rand(0, 5);
       if (score > best_score) best_score = score, best = i;
     }
     return best;
@@ -516,7 +517,7 @@ struct Brain {
         Vec next = NextOnRoute(io, b, me, boat->pos);  // on the navigation mesh, when there is one
         Steer(cmd, me, std::atan2(next.x - me.pos.x, next.z - me.pos.z), 0.0f);
         Walk(cmd, me, next, 1.0f);
-        if (std::hypot(dx, dz) > 25) cmd.buttons |= kLeftThumb;  // sprint
+        if (std::hypot(dx, dz) > Setting(io, kSprintDistance)) cmd.buttons |= kLeftThumb;  // sprint
         if (std::hypot(dx, dz) < 4.0f) {
           SetState(io, b, me, kBoard);
           b.board_cycle = w.now;
@@ -857,7 +858,7 @@ struct Brain {
         const Soldier& s = w.soldiers[i];
         if (s.team == me->team) continue;
         float d = Dist3D(s.pos, me->pos);
-        if (d > 70) continue;
+        if (d > Setting(io, kEngageRange)) continue;
         if (s.obj == b.seen_enemy && w.now < b.seen_until && d < enemy_d) enemy = &s, enemy_d = d;
         for (int k = 0; k < 3; ++k)
           if (d < near_d[k]) {
@@ -874,7 +875,8 @@ struct Brain {
         break;
       }
     }
-    float w_engage = enemy && enemy_d < 70 && (sc.kind == Scenario::kNone || sc.kind == Scenario::kFight) ? 100 - enemy_d : 0;
+    float w_engage = enemy && enemy_d < Setting(io, kEngageRange) &&
+                     (sc.kind == Scenario::kNone || sc.kind == Scenario::kFight) ? 120 - enemy_d : 0;
     // Losing a fight (under 45 health), or shot by someone it can't see (25
     // or more lost in 3 s): the advisor picks cover.
     if (w.now - b.health_t > 3) b.health_was = me->health, b.health_t = w.now;
@@ -993,11 +995,14 @@ struct Brain {
       float want_yaw = std::atan2(dx, dz);
       float want_pitch = std::atan2(enemy->pos.y + 1.2f - (me->pos.y + 1.6f), std::hypot(dx, dz));
       Steer(cmd, *me, want_yaw, want_pitch);
-      if (std::fabs(Wrap(want_yaw - me->yaw)) < 0.06f && std::fabs(want_pitch - me->pitch) < 0.08f)
+      const float aim = Setting(io, kAimTolerance);
+      if (std::fabs(Wrap(want_yaw - me->yaw)) < aim && std::fabs(want_pitch - me->pitch) < aim * 1.33f)
         cmd.triggers |= 255u << 8;  // right trigger: fire
-      if (w.now > b.next_strafe) b.strafe = Rand(-1, 1), b.next_strafe = w.now + Rand(0.6f, 1.8f);
+      if (w.now > b.next_strafe)
+        b.strafe = Rand(-1, 1) * Setting(io, kStrafeAmount),
+        b.next_strafe = w.now + Rand(0.5f, 1.5f) * Setting(io, kStrafePeriod);
       cmd.lx = b.strafe;
-      cmd.ly = enemy_d > 30 ? 0.6f : 0.0f;
+      cmd.ly = enemy_d > Setting(io, kCloseIn) ? Setting(io, kAdvance) : 0.0f;
       if (w.now < b.advice_until && b.advice_cover) Walk(cmd, *me, b.advice, 1.0f);  // (to cover, firing)
       snprintf(io.state, sizeof(io.state), "engage");
     } else if (w.now < b.advice_until) {
@@ -1082,7 +1087,7 @@ struct Brain {
       bool watch = b.threat && Dist2D(me->pos, flag) < 60;
       Steer(cmd, *me, watch ? b.threat_yaw : std::atan2(next.x - me->pos.x, next.z - me->pos.z), 0.0f);
       Walk(cmd, *me, next, 1.0f);
-      if (!watch && !at_point && std::hypot(dx, dz) > 25) cmd.buttons |= kLeftThumb;  // sprint
+      if (!watch && !at_point && std::hypot(dx, dz) > Setting(io, kSprintDistance)) cmd.buttons |= kLeftThumb;  // sprint
       snprintf(io.state, sizeof(io.state), at_point ? "at flag %d" : "to flag %d", b.target_point);
     }
     io.pad = cmd;

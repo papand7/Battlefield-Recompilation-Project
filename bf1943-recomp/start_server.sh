@@ -13,14 +13,16 @@ PUBLISH=0
 # (Qwen3.5 4B through llama.cpp, run on this machine) where to go. Installed into llm/ the
 # first time (about 3.5 GB). Faster with a graphics card (Vulkan).
 BOT_LLM=0
-# TRAIN=1: a training run instead: nobody can join, 16 bots, the game 4x as fast, the bots
-# ask about more (with BOT_LLM=1) and learn; it ends after TRAIN_MINUTES (real time) and
-# writes a viewer of the whole run: server_data/bot_advice/runs/<map>_<date>/index.html
+# TRAIN=1: a training run instead: nobody can join, 16 bots, the game twice as fast; the
+# bots tune how they play (half of each team tries new settings each round, the better
+# ones are kept: server_data/bot_knowledge/<map>.tune), ask about more (with BOT_LLM=1)
+# and learn. It ends after TRAIN_MINUTES (real time) and writes a replay of the whole run
+# (tracks, shots, kills, questions): open server_data/bot_advice/runs/<map>_<date>/index.html
 TRAIN=0
 TRAIN_MINUTES=30
 EXTRA=
 [ "$PUBLISH" = "1" ] && EXTRA=--publish
-[ "$TRAIN" = "1" ] && EXTRA="--train --speed 4 --train-minutes $TRAIN_MINUTES"
+[ "$TRAIN" = "1" ] && EXTRA="--train --speed 2 --train-minutes $TRAIN_MINUTES"
 cd "$(dirname "$0")" || exit 1
 if [ "$BOT_LLM" = "1" ]; then
   if [ -f llm/bot_llm.ini ] || python3 tools/setup_bot_llm.py --dir llm; then EXTRA="$EXTRA --bot-llm llm"; fi

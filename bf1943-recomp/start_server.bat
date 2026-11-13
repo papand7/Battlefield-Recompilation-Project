@@ -12,14 +12,16 @@ rem BOT_LLM=1: in difficult spots (stuck, losing a fight) the bots ask a small v
 rem (Qwen3.5 4B through llama.cpp, run on this PC) where to go. Installed into llm\ the first
 rem time (about 3.5 GB; needs Python). Faster with a graphics card.
 set BOT_LLM=0
-rem TRAIN=1: a training run instead: nobody can join, 16 bots, the game 4x as fast, the bots
-rem ask about more (with BOT_LLM=1) and learn; it ends after TRAIN_MINUTES (real time) and
-rem writes a viewer of the whole run: server_data\bot_advice\runs\<map>_<date>\index.html
+rem TRAIN=1: a training run instead: nobody can join, 16 bots, the game twice as fast; the
+rem bots tune how they play (half of each team tries new settings each round, the better
+rem ones are kept: server_data\bot_knowledge\<map>.tune), ask about more (with BOT_LLM=1)
+rem and learn. It ends after TRAIN_MINUTES (real time) and writes a replay of the whole run
+rem (tracks, shots, kills, questions): open server_data\bot_advice\runs\<map>_<date>\index.html
 set TRAIN=0
 set TRAIN_MINUTES=30
 set EXTRA=
 if "%PUBLISH%"=="1" set EXTRA=--publish
-if "%TRAIN%"=="1" set EXTRA=--train --speed 4 --train-minutes %TRAIN_MINUTES%
+if "%TRAIN%"=="1" set EXTRA=--train --speed 2 --train-minutes %TRAIN_MINUTES%
 cd /d "%~dp0"
 if not "%BOT_LLM%"=="1" goto run
 if exist llm\bot_llm.ini goto llm

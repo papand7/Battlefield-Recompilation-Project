@@ -21,6 +21,7 @@
 //     craft's crane).
 // A soldier object exists while its player is alive.
 #include "bot_knowledge.h"
+#include "bot_tuning.h"
 #include "bot_llm.h"
 #include "bot_players.h"
 #include "bots/bot_api.h"
@@ -662,6 +663,24 @@ void StartBotDirector() {
       }
       bool flags_changed = d.Refresh(rescan);
       for (botapi::BotIO& b : d.bots) b.soldier = BotPlayerSoldier(b.slot);
+      // Self-play tuning (bot_tuning.h): each bot's settings; a flag taken
+      // counts for its team's bots within 25 m of it.
+      tuning::UseMap(map, g_training);
+      for (botapi::BotIO& b : d.bots) b.tune = tuning::For(b.slot);
+      {
+        static std::vector<int> owners;
+        if (flags_changed || owners.size() != d.points.size()) owners.clear();
+        for (size_t i = 0; i < d.points.size(); ++i) {
+          const Point& p = d.points[i];
+          if (i < owners.size() && owners[i] != p.owner && p.owner > 0)
+            for (const botapi::BotIO& b : d.bots)
+              if (const Soldier* s = b.soldier ? d.Find(b.soldier) : nullptr)
+                if (s->team == p.owner && botapi::Dist2D(s->pos, p.pos) < 25) tuning::Capture(b.slot);
+          if (i < owners.size()) owners[i] = p.owner;
+          else owners.push_back(p.owner);
+        }
+      }
+      tuning::Update(d.now, int(d.bots.size()));
       if (d.points.empty()) continue;
 
       botapi::World w{};

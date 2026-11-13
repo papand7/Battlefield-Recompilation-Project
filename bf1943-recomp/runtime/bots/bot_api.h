@@ -10,13 +10,38 @@
 
 namespace botapi {
 
-constexpr int kVersion = 7;      // bump when a struct here changes
+constexpr int kVersion = 8;      // bump when a struct here changes
 constexpr int kMaxBots = 16;
 constexpr int kMemSize = 1024;   // per-bot brain state
 constexpr float kPi = 3.14159265f;
 
 // Pad buttons (XInput's bits).
 enum : uint32_t { kDpadRight = 0x0008, kLeftThumb = 0x0040, kA = 0x1000, kB = 0x2000 };
+
+// The behaviour settings the bots tune by self-play (runtime/bot_tuning.h):
+// each with its default (the hand-made brain's) and the range tried.
+enum Tune {
+  kEngageRange,     // enemies fought within (m)
+  kCloseIn,         // farther than this (m), it walks at the enemy while firing
+  kAdvance,         // how fast it walks in then (stick, 0-1)
+  kStrafePeriod,    // seconds between strafe changes (on average)
+  kStrafeAmount,    // how hard it strafes (stick, 0-1)
+  kAimTolerance,    // it fires when its aim is within this (radians)
+  kFlagMates,       // a flag is worth this much less per teammate going there
+  kFlagDistance,    // ... and this much less per metre away
+  kFlagDefend,      // an own flag is worth this much more per enemy near it
+  kFlagNeutral,     // a neutral flag's worth
+  kFlagEnemy,       // an enemy flag's worth
+  kSprintDistance,  // farther than this from where it goes (m): it sprints
+  kTuneCount
+};
+struct TuneInfo { const char* name; float def, lo, hi; };
+inline constexpr TuneInfo kTuneInfo[kTuneCount] = {
+    {"engage_range", 70, 40, 110},   {"close_in", 30, 10, 60},       {"advance", 0.6f, 0, 1},
+    {"strafe_period", 1.2f, 0.3f, 3}, {"strafe_amount", 1, 0, 1},     {"aim_tolerance", 0.06f, 0.02f, 0.15f},
+    {"flag_mates", 12, 0, 30},       {"flag_distance", 0.04f, 0, 0.15f}, {"flag_defend", 25, 0, 60},
+    {"flag_neutral", 60, 20, 100},   {"flag_enemy", 45, 20, 100},    {"sprint_distance", 25, 5, 60},
+};
 
 struct Vec { float x = 0, y = 0, z = 0; };
 struct Soldier {
@@ -42,6 +67,7 @@ struct BotIO {
   char state[24];       // out: what it is doing (logs, BF_BOT_LOG)
   bool teleport;        // out: put the soldier at `to` (scenarios)
   Vec to;
+  const float* tune;    // in: its behaviour settings (kTuneCount; null: the defaults)
   uint32_t mem_tag;     // the brain's state: reset when the tag isn't its own
   alignas(8) unsigned char mem[kMemSize];
 };
@@ -92,6 +118,7 @@ inline float Wrap(float a) {
   while (a < -kPi) a += 2 * kPi;
   return a;
 }
+inline float Setting(const BotIO& io, Tune t) { return io.tune ? io.tune[t] : kTuneInfo[t].def; }
 inline float Dist2D(Vec a, Vec b) { return std::hypot(a.x - b.x, a.z - b.z); }
 inline float Dist3D(Vec a, Vec b) { return std::hypot(Dist2D(a, b), a.y - b.y); }
 

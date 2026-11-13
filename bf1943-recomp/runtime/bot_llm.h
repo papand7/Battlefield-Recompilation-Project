@@ -77,6 +77,10 @@ void Learn(int kind, const float at[3], float dir, const float place[3], bool wo
 // (--train-minutes: then the server exits).
 void SetLevelMap(const std::string& map, const MapView& level);
 void Track(int bot, int team, float x, float z);
+// A bot's shot (from its eyes to what it hit, or as far as it reaches) and a
+// soldier killed (where it fell; killer: the bot's slot, -1 a real player).
+void Shot(int bot, const float from[3], const float to[3], bool hit);
+void Killed(float x, float z, int team, int killer);
 void FinishRun();
 
 }  // namespace rt::botllm

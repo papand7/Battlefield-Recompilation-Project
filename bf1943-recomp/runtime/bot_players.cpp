@@ -32,6 +32,8 @@
 #include <vector>
 
 #include "bot_knowledge.h"
+#include "bot_tuning.h"
+#include "bot_llm.h"
 #include "bot_players.h"
 #include "guest.h"
 #include "kernel.h"
@@ -956,7 +958,13 @@ GAME_PATCH(82414430) {
       // A move a tick (the server moves a soldier on foot a step per move;
       // BF_BOT_PUMP=n: n a tick). (Three made up for a server held to 18
       // frames a second, gpu.cpp's background cap, now off without a window.)
-      static const int pump = getenv("BF_BOT_PUMP") ? atoi(getenv("BF_BOT_PUMP")) : 1;
+      // --speed N: 2N moves a tick. The server's updates stay as many a second
+      // while the game's time runs N times as fast, and each move then covers
+      // about half as much: with one a tick the bots walked an eighth as far in
+      // the game's time and never met (measured at 4x: 8 a tick, 5.5 m/s in the
+      // game's time, as 4.6 at 1x).
+      static const int pump_env = getenv("BF_BOT_PUMP") ? atoi(getenv("BF_BOT_PUMP")) : 1;
+      const int pump = pump_env * (g_time_speed > 1.05 ? std::max(2, int(std::lround(2 * g_time_speed))) : 1);
       for (int k = 1; k < pump; ++k) {
         St32(b.move_msg + 4, ++b.move_seq);
         c = ctx, c.r3.u64 = b.mover, c.r4.u64 = b.move_msg, c.r5.u64 = 1, c.r6.u64 = 0;
@@ -1711,6 +1719,10 @@ void BotShoot(PPCContext& ctx, uint8_t* base, BotPlayer& b, int64_t now) {
     best = t, best_t = along;
     for (int i = 0; i < 3; ++i) hit[i] = o[i] + along * dir[i];
   }
+  // The training replay: where the shot went.
+  float to[3];
+  for (int i = 0; i < 3; ++i) to[i] = best ? hit[i] : o[i] + best_t * dir[i];
+  botllm::Shot(b.index, o, to, best != 0);
   if (!best) return;
   // Applied after the server's update (ApplyHits), not here in a soldier's
   // step: a kill there took a soldier away while the game went through them,
@@ -1838,13 +1850,25 @@ GAME_PATCH(823194B0) {  // damage a soldier
     float before;
     ~NoteKill() {
       if (before <= 0 || LdF(victim + 0x3C) > 0) return;
-      auto is_bot = [](uint32_t so) {
-        for (const BotPlayer& b : g_players)
-          if (b.soldier == so) return true;
-        return false;
+      // (the bot's slot, -1 for a real player)
+      auto bot_slot = [](uint32_t so) {
+        for (size_t i = 0; i < g_players.size(); ++i)
+          if (g_players[i].soldier == so) return int(i);
+        return -1;
       };
+      auto is_bot = [&](uint32_t so) { return bot_slot(so) >= 0; };
       knowledge::Add(knowledge::kDeaths, int(Ld32(victim + 0x48)), LdF(victim + 0x180), LdF(victim + 0x188),
                      is_bot(victim) ? 0.3f : 1.0f);
+      tuning::Death(bot_slot(victim));  // (self-play tuning: bot_tuning.h)
+      // (the training replay: where it fell, and by which bot once known below)
+      int killer_slot = -1;
+      struct Mark {
+        uint32_t victim;
+        int& killer;
+        ~Mark() {
+          botllm::Killed(LdF(victim + 0x180), LdF(victim + 0x188), int(Ld32(victim + 0x48)), killer);
+        }
+      } mark{victim, killer_slot};
       uint32_t w1 = IsCommitted(giver_w) ? Ld32(giver_w) : 0, w2 = IsCommitted(w1) ? Ld32(w1) : 0;
       uint32_t sp = w2 >= 0xDC ? w2 - 0xDC : 0;
       if (!IsCommitted(sp + 0x200) || Ld32(sp) != kSpawnObject) return;
@@ -1852,6 +1876,8 @@ GAME_PATCH(823194B0) {  // damage a soldier
       if (!IsCommitted(killer + 0x400) || Ld32(killer) != kSoldier || killer == victim) return;
       knowledge::Add(knowledge::kKills, int(Ld32(killer + 0x48)), LdF(killer + 0x180), LdF(killer + 0x188),
                      is_bot(killer) ? 0.3f : 1.0f);
+      if (Ld32(killer + 0x48) != Ld32(victim + 0x48)) tuning::Kill(bot_slot(killer));  // (not a teammate)
+      killer_slot = bot_slot(killer);
     }
   } note_kill{victim, giver_w, hp_before};
   // BF_BOT_DAMAGE_TRACE: each call: the soldier (vt), the record's first

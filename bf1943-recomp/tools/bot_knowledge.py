@@ -11,10 +11,13 @@ exe), so every copy of the next version starts from what all of them learned.
       recent play weighs more. --clear empties the merged learned files after
       (they are in the shipped data now; merging them again would count them twice;
       stop those servers first, or they save theirs again). --to DIR: into DIR instead.
+      The bots' tuned behaviour (<map>.tune, runtime/bot_tuning.h: what
+      training servers found plays best) goes in too: of all given and the
+      shipped one, the furthest tuned (highest generation) per map.
   python tools/bot_knowledge.py info <file>...
       cells, totals per team, and the spots killed from most.
 
-Only positions on the maps go in these files (no game data).
+Only positions on the maps and behaviour settings go in these files (no game data).
 """
 import glob
 import os
@@ -47,16 +50,45 @@ def write(path, name, cells):
                 f.write('c %d %d %s\n' % (ix, iz, ' '.join('%.2f' % x for x in v)))
 
 
-def files(args):
+def files(args, ext='.txt'):
     out = []
     for a in args:
         if not os.path.exists(a):
             print('(not there: %s)' % a)
         elif os.path.isdir(a):
-            out += sorted(glob.glob(os.path.join(a, '*.txt')))
-        else:
+            out += sorted(glob.glob(os.path.join(a, '*' + ext)))
+        elif a.endswith(ext):
             out.append(a)
     return out
+
+
+def tune_generation(path):
+    """A .tune file's generation (its first line: '... generation N, ...')."""
+    with open(path) as f:
+        head = f.readline().split()
+    try:
+        return int(head[head.index('generation') + 1].rstrip(','))
+    except (ValueError, IndexError):
+        return 0
+
+
+def merge_tunes(paths, to):
+    best = {}
+    for path in paths:
+        name = os.path.splitext(os.path.basename(path))[0]
+        gen = tune_generation(path)
+        if name not in best or gen > best[name][0]:
+            best[name] = (gen, path)
+    for name, (gen, path) in sorted(best.items()):
+        target = os.path.join(to, name + '.tune')
+        have = tune_generation(target) if os.path.exists(target) else -1
+        if gen > have:
+            os.makedirs(to, exist_ok=True)
+            with open(path) as f, open(target, 'w', newline='\n') as out:
+                out.write(f.read())
+            print('%s: tuning generation %d from %s -> %s (was %d)' % (name, gen, path, target, have))
+        else:
+            print('%s: tuning kept at generation %d (%s has %d)' % (name, have, path, gen))
 
 
 def merge(args):
@@ -77,9 +109,10 @@ def merge(args):
         else:
             rest.append(args[i])
         i += 1
-    learned = files(rest)
-    if not learned:
+    learned, tunes = files(rest), files(rest, '.tune')
+    if not learned and not tunes:
         sys.exit('nothing to merge')
+    merge_tunes(tunes, to)
     by_map = {}
     for path in learned:
         name, cells = read(path)
