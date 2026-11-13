@@ -1,6 +1,7 @@
 # Only the two recompilation projects (and this repo's own files) are tracked.
 /*
 !/.gitignore
+!/.gitattributes
 !/README.md
 !/docs/
 !/bf1943-recomp/
@@ -20,8 +21,12 @@ out/
 .vs/
 frames/
 research/
-userdata/
+userdata*/
 shader_cache/
+# NVIDIA's DLSS SDK: its licence keeps it out of an open repo (tools/fetch_dlss.py)
+bf1943-recomp/thirdparty/dlss/
+# The bots' advisor: llama.cpp and the model (tools/setup_bot_llm.py)
+llm/
 *.log
 *.wav
 *.out

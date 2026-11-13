@@ -1,3 +1,7 @@
+# The tone mapping pass (scene + bloom c6, exposure c3, then pow(c7) gamma, colour
+# matrix c0-c2, vignette, grain; as bf1943's 8DD620FF8D8BB8FA): r1.yzw after 11 is the
+# exposed HDR colour.
+13583D117317C23F tonemap=r1.yzw@11 tm_exposure=1.0 tm_saturation=1.2
 # 00B0A520EFB8B01C rm=7 n=r4.yzx@25 v=r10.xyz@11 ao=r0.x@39 out=r0.xyz@64 pow=c251.x rough_scale=0.66 bump=5  missing a
 # 00C451FBC9EA4A48 rm=13 n=r5.yzx@50 v=r0.xzw@49 env=r4.xyz@85 ao=r9.y@10 out=r0.yzx@91 rough_scale=0.66 bump=5  missing a
 # 01E1B680F37E957C n=r4.xyz@s v=r1.xzw@27 lit=r2.w@38 env=r5.xyz@43 ao=r6.y@21 out=r0.xyz@71 pow=c250.x rough_scale=0.66 bump=5  missing a

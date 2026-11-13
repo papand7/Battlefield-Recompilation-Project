@@ -7,75 +7,112 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="teams"><span class="us"></span><span class="jp"></span></div>
-  <header class="titlebar">
-    <nav class="games" aria-label="Game">
-      <button class="game on" id="tab-bf1943" data-game="bf1943"><span class="mark">43</span>Battlefield 1943</button>
-      <button class="game" id="tab-bfbc1" data-game="bfbc1"><span class="mark bc">BC</span>Bad Company<span class="soon" hidden>Not installed</span></button>
+  <!-- Laid out as the NightFire launcher: title bar with the game tabs, a
+       side menu, pages (home: the game, its setup and PLAY; settings). -->
+  <header id="titlebar">
+    <div class="brand">
+      <span class="brand-mark">BF</span>
+      <span class="brand-name">BATTLEFIELD</span><span class="brand-sub">LAUNCHER</span>
+    </div>
+    <nav class="gametabs" aria-label="Game">
+      <button class="game on" id="tab-bf1943" data-game="bf1943">Battlefield 1943</button>
+      <button class="game" id="tab-bfbc1" data-game="bfbc1">Bad Company<span class="soon" hidden>Not installed</span></button>
     </nav>
-    <div class="chrome">
-      <button id="min" title="Minimise" aria-label="Minimise">
-        <svg viewBox="0 0 10 10"><path d="M1 5h8"/></svg>
-      </button>
-      <button id="close" class="close" title="Close" aria-label="Close">
-        <svg viewBox="0 0 10 10"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg>
-      </button>
+    <div class="drag"></div>
+    <div class="winbtns">
+      <button id="min" title="Minimise" aria-label="Minimise"><svg viewBox="0 0 10 10"><path d="M1 5h8"/></svg></button>
+      <button id="close" class="close" title="Close" aria-label="Close"><svg viewBox="0 0 10 10"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg></button>
     </div>
   </header>
 
-  <main>
-    <section class="left">
-      <div class="logo">
-        <div class="word">BATTLEFIELD</div>
-        <div class="year" id="year">1943</div>
-        <div class="hint">PC edition</div>
+  <div id="shell">
+    <nav id="nav">
+      <button data-page="home" class="active"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><path d="M12 1v5M12 18v5M1 12h5M18 12h5"/></svg><span>Battle</span></button>
+      <button data-page="settings"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>Settings</span></button>
+      <div class="nav-foot">
+        <button id="updatebtn" class="btn ghost small" hidden>UPDATE</button>
+        <div class="classified">// FIELD ORDERS</div>
       </div>
-      <div class="launch">
-        <label class="hint" for="name">Player name</label>
-        <input id="name" maxlength="15" spellcheck="false" autocomplete="off">
-        <button id="play" class="play">PLAY</button>
-        <div id="status" class="hint status"></div>
-      </div>
-    </section>
+    </nav>
 
-    <section class="card setup" id="setupcard" hidden>
-      <h2 id="setuptitle">Set up Battlefield 1943</h2>
-      <p class="hint" id="setuphint">The game is built on this PC from your own copy. Choose your game files: the Xbox 360
-        package of Battlefield 1943 (version 1.06), or <b>default.xex</b> in a folder you unpacked.</p>
-      <div class="pick">
-        <button id="pick" class="ghost">Choose game files…</button>
-        <div id="pickpath" class="hint path">No files chosen</div>
-      </div>
-      <ol class="steps">
-        <li data-step="game"><span class="dot"></span>Game files</li>
-        <li data-step="tools"><span class="dot"></span>Build tools (LLVM, CMake, Visual Studio C++, Vulkan SDK)</li>
-        <li data-step="recompile"><span class="dot"></span>Recompile the game code</li>
-        <li data-step="build"><span class="dot"></span>Build the game</li>
-      </ol>
-      <div class="bar"><span id="barfill"></span></div>
-      <pre id="setuplog" class="log"></pre>
-      <button id="install" class="play small" disabled>INSTALL</button>
-    </section>
+    <main>
+      <!-- HOME: the game, its setup, PLAY -->
+      <section id="page-home" class="page active">
+        <div class="hero">
+          <div class="rings"></div>
+          <div class="hero-text">
+            <div class="hero-kicker">BATTLEFIELD</div>
+            <h1 id="year">1943</h1>
+          </div>
+        </div>
 
-    <section class="card" id="graphicscard">
-      <h2>Graphics</h2>
-      <div id="rows"></div>
-      <div class="line"></div>
-      <div class="toggle-row">
-        <div><div class="label">HD textures</div><div id="texhint" class="hint">AI-upscaled texture pack</div></div>
-        <button id="texmake" class="ghost small" title="Makes the HD texture pack on this PC from your game files: AI upscaling with PBR materials (can take hours; a stopped run carries on)">MAKE</button>
-        <label class="switch"><input type="checkbox" id="textures"><span></span></label>
-      </div>
-      <div class="toggle-row" id="bloodrow">
-        <div><div class="label" id="bloodlabel">Blood on hit</div><div class="hint">Blood where soldiers are hit; explosions tear bodies apart, gore stays on the ground</div></div>
-        <label class="switch"><input type="checkbox" id="blood"><span></span></label>
-      </div>
-      <div class="toggle-row">
-        <div><div class="label">HDR</div><div class="hint">HDR10 output; needs HDR on in the Windows display settings</div></div>
-        <label class="switch"><input type="checkbox" id="hdr"><span></span></label>
-      </div>
-    </section>
-  </main>
+        <div class="grid">
+          <div class="card">
+            <div class="card-head"><span class="num">01</span> Soldier</div>
+            <div class="card-body">
+              <label class="muted" for="name">Player name</label>
+              <input id="name" type="text" maxlength="15" spellcheck="false" autocomplete="off">
+            </div>
+          </div>
+
+          <div class="card setup" id="setupcard" hidden>
+            <div class="card-head"><span class="num">02</span> <span id="setuptitle">Set up Battlefield 1943</span></div>
+            <div class="card-body">
+              <p class="muted" id="setuphint">The game is built on this PC from your own copy.</p>
+              <div class="row">
+                <button id="pick" class="btn ghost">Choose game files…</button>
+                <div id="pickpath" class="path">No files chosen</div>
+              </div>
+              <ol class="steps">
+                <li data-step="game"><span class="dot"></span>Game files</li>
+                <li data-step="tools"><span class="dot"></span>Build tools (LLVM, CMake, Visual Studio C++, Vulkan SDK)</li>
+                <li data-step="recompile"><span class="dot"></span>Recompile the game code</li>
+                <li data-step="build"><span class="dot"></span>Build the game</li>
+              </ol>
+              <div class="bar"><span id="barfill"></span></div>
+              <pre id="setuplog" class="log small"></pre>
+              <div class="row"><button id="install" class="btn" disabled>INSTALL</button></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="play-row">
+          <button id="play" class="play">PLAY</button>
+          <div class="play-side">
+            <div id="status" class="muted status"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SETTINGS: graphics and the launcher -->
+      <section id="page-settings" class="page">
+        <div class="page-head"><h2>Settings</h2></div>
+        <div class="card" id="graphicscard">
+          <div class="card-head"><span class="num">01</span> Graphics</div>
+          <div class="card-body">
+            <div id="rows"></div>
+            <div class="toggle-row">
+              <div><div class="label">HD textures</div><div id="texhint" class="muted">AI-upscaled texture pack</div></div>
+              <button id="texmake" class="btn ghost small" title="Makes the HD texture pack on this PC from your game files: AI upscaling with PBR materials (can take hours; a stopped run carries on)">MAKE</button>
+              <input type="checkbox" class="switch" id="textures">
+            </div>
+            <div class="toggle-row" id="bloodrow">
+              <div><div class="label" id="bloodlabel">Blood on hit</div><div class="muted">Blood where soldiers are hit; explosions tear bodies apart, gore stays on the ground</div></div>
+              <input type="checkbox" class="switch" id="blood">
+            </div>
+            <div class="toggle-row">
+              <div><div class="label">HDR</div><div class="muted">HDR10 output; needs HDR on in the Windows display settings</div></div>
+              <input type="checkbox" class="switch" id="hdr">
+            </div>
+            <div class="toggle-row">
+              <div><div class="label">Automatic updates</div><div class="muted">Installs a new release from GitHub when the launcher starts</div></div>
+              <input type="checkbox" class="switch" id="autoupdate">
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
 
   <script src="renderer.js"></script>
 </body>

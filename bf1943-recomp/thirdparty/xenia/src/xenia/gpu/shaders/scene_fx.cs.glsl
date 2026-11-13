@@ -32,9 +32,19 @@ layout(set = 0, binding = 4, r32f) uniform image2D saved_depth;
 // The clouds at half resolution (pass 5): rgb light, a how much they hide.
 layout(set = 0, binding = 14, rgba16f) uniform image2D cloud_image;
 // The ambient occlusion at half resolution (pass 6): r visibility, g distance.
-layout(set = 0, binding = 15, rg16f) uniform image2D ao_image;
+layout(set = 0, binding = 15, rgba16f) uniform image2D ao_image;  // AO, distance, traced sun shadow
 // The scene with what is seen through the sea bent by its waves (pass 7).
 layout(set = 0, binding = 16, rgba16f) uniform image2D refract_image;
+// The haze at half resolution (pass 8): x in-scattered, y optical depth, z the
+// distance (-1 sky).
+layout(set = 0, binding = 17, rgba16f) uniform image2D haze_image;
+// The world's colour at the depth copy (pass 0), before the game draws its
+// particles (impact dust, sparks, smoke): pass 1 lights that and puts what
+// the game drew over it back on top unchanged.
+layout(set = 0, binding = 18, rgba16f) uniform image2D world_color;
+// FSR 3's motion vectors (pass 9): where each pixel was last frame, in
+// pixels, previous minus current (the camera's motion; moving objects not).
+layout(set = 0, binding = 19, rg16f) uniform image2D motion_image;
 layout(set = 0, binding = 5, std430) buffer Horizon {
   vec4 horizon[64];     // rgb sky colour above the horizon by world azimuth
                         // (64 bins over 360 degrees), w: 1 once measured
@@ -95,10 +105,14 @@ layout(set = 0, binding = 12, r32f) uniform image2D light_out_dist;
 // The --pbr pixels' materials (runtime/xenia_shims/pbr_shaders.h): per pixel
 // the nearest one's distance (top 24 bits), roughness << 4 and metallic (4
 // bits each); all ones for none.
-layout(set = 0, binding = 13, std430) readonly buffer Materials {
+layout(set = 0, binding = 13, std430) buffer Materials {
   uint materials[];
 };
 const uint kMaterialPitch = 4096u, kMaterialRows = 2560u;
+// The scene's view depth (clip w) for the soft particles, after the materials.
+const uint kMaterialDepthOffset = kMaterialPitch * kMaterialRows;
+// The camera for the lit shaders without a view vector (pbr camv=1).
+const uint kMaterialCameraOffset = kMaterialDepthOffset * 2u;
 #endif
 layout(push_constant) uniform Push {
   uint pass_mode;
@@ -126,7 +140,7 @@ layout(set = 0, binding = 3, std140) uniform Params {
   mat4 view_proj;       // world -> (NDC x, y, depth value)
   vec4 ss;              // screen-space shadows: x strength, y length (m),
                         // z steps, w thickness (m)
-  vec4 rt;              // ray-traced shadows: x on, y length (m), z instances
+  vec4 rt;              // ray-traced shadows: x on, y length (m), z instances, w sun radius (rad)
   mat4 prev_view_proj;  // last frame's view_proj
   vec4 prev_camera;     // last frame's eye, w: 1 if last frame's light is usable
   vec4 gi;              // ray-traced light: x strength (0 off), y rays,
@@ -223,6 +237,35 @@ float SunVisibilityAt(vec3 p, out float t_occ, out float texel_m) {
   return 1.0;
 }
 
+// SunVisibility filtered (percentage closer, 4x4 texels with bilinear
+// weights): 0...1, smooth over about two texels instead of the map's steps.
+float SunVisibilitySoft(vec3 p) {
+  vec4 pw = vec4(p, 1.0);
+  for (int i = 0; i < 3; ++i) {
+    vec3 s = vec3(dot(slices[i * 3], pw), dot(slices[i * 3 + 1], pw),
+                  dot(slices[i * 3 + 2], pw));
+    if (all(lessThan(abs(s.xy), vec2(0.495))) && s.z > 0.0 && s.z < 1.0) {
+      float size = float(shadow_info.x);
+      vec2 g = (s.xy + 0.5) * size - 0.5;
+      vec2 base = floor(g) - 1.0;
+      vec2 f = g - floor(g);
+      // Weights of the 4 columns (rows): a tent over two texels.
+      vec4 wx = vec4(1.0 - f.x, 2.0 - f.x, 1.0 + f.x, f.x) * 0.25;
+      vec4 wy = vec4(1.0 - f.y, 2.0 - f.y, 1.0 + f.y, f.y) * 0.25;
+      float lit = 0.0;
+      for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+          uvec2 texel = uvec2(clamp(base + vec2(x, y), vec2(0.0), vec2(size - 1.0)));
+          float d = ShadowDepth(uint(i), texel);
+          lit += (s.z - strength.z <= d ? 1.0 : 0.0) * wx[x] * wy[y];
+        }
+      }
+      return lit;
+    }
+  }
+  return 1.0;
+}
+
 // SunVisibility for p = origin + dir * t, with the slice coordinates of the
 // origin (base) and their change per metre (delta) worked out once per ray.
 float SunVisibilityAlong(float t, vec3 base[3], vec3 delta[3]) {
@@ -236,6 +279,11 @@ float SunVisibilityAlong(float t, vec3 base[3], vec3 delta[3]) {
   }
   return 1.0;
 }
+
+// Under DLSS / FSR 3 (march.w >= 64): fewer samples, and the noise that was
+// fixed per pixel changes every frame (the upscaler averages it away).
+bool Temporal() { return march.w >= 64.0; }
+float TemporalFrame() { return Temporal() ? march.w : 0.0; }
 
 float InterleavedGradientNoise(vec2 pixel, float frame) {
   pixel += 5.588238 * mod(frame, 64.0);
@@ -334,6 +382,13 @@ void ScanColumn() {
 // Pass 2 (one workgroup): fold the pass 3 columns into the azimuth bins.
 void MeasureHorizon() {
   uint column = gl_LocalInvocationIndex;
+#ifdef SCENE_FX_RT
+  if (column == 0u) {
+    materials[kMaterialCameraOffset] = floatBitsToUint(camera.x);
+    materials[kMaterialCameraOffset + 1u] = floatBitsToUint(camera.y);
+    materials[kMaterialCameraOffset + 2u] = floatBitsToUint(camera.z);
+  }
+#endif
   found[column] = columns[column];
   found_bin[column] = column_info[column].x;
   waterline[column] = column_info[column].y;
@@ -414,24 +469,63 @@ float ScreenSpaceShadow(vec3 p, vec3 normal, float dist, ivec2 size, float jitte
   return 0.0;
 }
 
-// 1 where one of the world's meshes stands between the point and the sun.
-float RayShadow(vec3 p, vec3 normal, float dist) {
 #ifdef SCENE_FX_RT
-  vec3 to_sun = normalize(sun_dir.xyz);
-  // Off the surface: the position rebuilt from the depth is coarser further
-  // away.
-  vec3 origin = p + normal * (0.03 + 0.002 * dist) + to_sun * (0.02 + 0.001 * dist);
+// Whether a sun ray from origin along dir hits one of the world's meshes.
+float SunRayBlocked(vec3 origin, vec3 dir) {
   rayQueryEXT query;
   // Back faces culled: only the terrain has them (the other meshes' instances
   // opt out), where the ray starts under the heightmap's surface.
   rayQueryInitializeEXT(query, world_meshes,
                         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
-                        0xFF, origin, 0.0, to_sun, rt.y);
+                        0xFF, origin, 0.0, dir, rt.y);
   TRACE_ALPHA_TESTED(query)
   return rayQueryGetIntersectionTypeEXT(query, true) !=
                  gl_RayQueryCommittedIntersectionNoneEXT
              ? 1.0
              : 0.0;
+}
+#endif
+
+// One hard ray to the sun's centre (far away, where a penumbra is under a
+// pixel wide).
+float RayShadowHard(vec3 p, vec3 normal, float dist) {
+#ifdef SCENE_FX_RT
+  vec3 to_sun = normalize(sun_dir.xyz);
+  return SunRayBlocked(p + normal * (0.03 + 0.002 * dist) + to_sun * (0.02 + 0.001 * dist), to_sun);
+#else
+  return 0.0;
+#endif
+}
+
+// How much of the sun's disc the world's meshes hide from the point (0...1).
+// Three rays over the disc; where they disagree (a penumbra) seven more. A
+// fixed per-pixel rotation (no frame term): steady, the resolve averages it.
+float RayShadow(vec3 p, vec3 normal, float dist, vec2 pixel) {
+#ifdef SCENE_FX_RT
+  vec3 to_sun = normalize(sun_dir.xyz);
+  // Off the surface: the position rebuilt from the depth is coarser further
+  // away.
+  vec3 origin = p + normal * (0.03 + 0.002 * dist) + to_sun * (0.02 + 0.001 * dist);
+  if (rt.w <= 0.0) return SunRayBlocked(origin, to_sun);
+  vec3 side = normalize(cross(to_sun, abs(to_sun.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+  vec3 up = cross(side, to_sun);
+  float turn = InterleavedGradientNoise(pixel, TemporalFrame()) * 6.2831853;
+  // Vogel disc: 10 points, the first 3 spread over the whole disc. Under an
+  // upscaler 2, and 3 more in a penumbra, turned every frame.
+  const int kOrder[10] = int[10](0, 6, 3, 8, 1, 5, 9, 2, 7, 4);
+  int first = Temporal() ? 2 : 3, last = Temporal() ? 5 : 10;
+  float blocked = 0.0;
+  int n = 0;
+  for (int i = 0; i < last; ++i) {
+    if (i == first && (blocked == 0.0 || blocked == float(first))) break;
+    float k = float(kOrder[i]);
+    float r = sqrt((k + 0.5) / 10.0) * rt.w;
+    float a = k * 2.3999632 + turn;
+    vec3 dir = normalize(to_sun + (side * cos(a) + up * sin(a)) * r);
+    blocked += SunRayBlocked(origin, dir);
+    ++n;
+  }
+  return blocked / float(n);
 #else
   return 0.0;
 #endif
@@ -773,9 +867,16 @@ vec4 Clouds(vec3 dir, float max_t, float jitter) {
   vec3 sky_tint = mix(vec3(1.0), ambient.rgb / max(dot(ambient.rgb, lum), 1e-4), 0.6);
   // Henyey-Greenstein, forward and a little back scattering (1 = even).
   float mu = dot(dir, l);
-  float g1 = 0.6, g2 = -0.25;
-  float phase = 0.5 * (1.0 - g1 * g1) / pow(1.0 + g1 * g1 - 2.0 * g1 * mu, 1.5) +
+  // Multiple scattering (Hillaire 2016, after Wrenninge): octaves of light
+  // that went further in, extinction, contribution and phase anisotropy each
+  // halved, so thick clouds stay bright inside instead of turning grey.
+  float phases[3];
+  for (int o = 0; o < 3; ++o) {
+    float sc = pow(0.5, float(o));
+    float g1 = 0.6 * sc, g2 = -0.25 * sc;
+    phases[o] = 0.5 * (1.0 - g1 * g1) / pow(1.0 + g1 * g1 - 2.0 * g1 * mu, 1.5) +
                 0.5 * (1.0 - g2 * g2) / pow(1.0 + g2 * g2 - 2.0 * g2 * mu, 1.5);
+  }
   float base = CloudSeaLevel() + cloud.y;
   vec3 light = vec3(0.0);
   float transmittance = 1.0;
@@ -792,12 +893,16 @@ vec4 Clouds(vec3 dir, float max_t, float jitter) {
       float s = 60.0 * float(k * k);
       od += CloudDensity(p + l * s, false) * 60.0 * float(2 * k - 1);
     }
-    float sun_t = exp(-od * cloud2.y);
+    float sun_scatter = 0.0;
+    for (int o = 0; o < 3; ++o) {
+      float sc = pow(0.5, float(o));
+      sun_scatter += sc * exp(-od * cloud2.y * sc) * phases[o];
+    }
     // Thin edges facing the sun glow, thick cores scatter more in (powder).
     float powder = 1.0 - exp(-2.0 * od * cloud2.y - 0.3);
     float h = clamp((p.y - base) / cloud.z, 0.0, 1.0);
-    vec3 in_light = white * (2.4 * sun_tint * sun_t * phase * mix(1.0, powder, 0.5) +
-                             0.75 * sky_tint * (0.55 + 0.45 * h));
+    vec3 in_light = white * (2.4 * sun_tint * sun_scatter * mix(1.0, powder, 0.5) +
+                             0.85 * sky_tint * (0.6 + 0.4 * h));
     // Far away they fade into the haze at the horizon.
     in_light = mix(in_light, haze, smoothstep(4000.0, 30000.0, t) * 0.75);
     float step_t = exp(-sigma * dt);
@@ -809,13 +914,14 @@ vec4 Clouds(vec3 dir, float max_t, float jitter) {
   return vec4(light * (hide / max(1.0 - transmittance, 1e-4)), hide);
 }
 
-// Pass 5, one thread per half-resolution pixel: the clouds along its view
-// ray, however far (pass 1 leaves them out in front of nearer surfaces).
+// Pass 5, one thread per quarter-resolution pixel (soft enough not to show
+// it): the clouds along its view ray, however far (pass 1 leaves them out in
+// front of nearer surfaces).
 void MarchClouds() {
   ivec2 at = ivec2(gl_GlobalInvocationID.xy);
   ivec2 cloud_size = imageSize(cloud_image);
   if (any(greaterThanEqual(at, cloud_size))) return;
-  vec2 local = vec2(at) * 2.0 + 0.5;
+  vec2 local = vec2(at) * 4.0 + 1.5;
   vec3 dir = ViewDir(local);
   imageStore(cloud_image, at,
              Clouds(dir, 1e9, InterleavedGradientNoise(vec2(at), 0.0)));
@@ -824,7 +930,7 @@ void MarchClouds() {
 // Pass 1: the clouds at a full-resolution pixel (bilinear from pass 5).
 vec4 CloudsAt(ivec2 local) {
   ivec2 cloud_size = imageSize(cloud_image);
-  vec2 g = (vec2(local) + 0.5) * 0.5 - 0.5;
+  vec2 g = (vec2(local) + 0.5) * 0.25 - 0.5;
   ivec2 g0 = ivec2(floor(g));
   vec2 f = g - vec2(g0);
   vec4 a = imageLoad(cloud_image, clamp(g0, ivec2(0), cloud_size - 1));
@@ -838,6 +944,34 @@ vec4 CloudsAt(ivec2 local) {
 // occlusion (Jimenez et al. 2016) from the saved depth. In slices through the
 // view direction, the highest horizon on either side within ao.y metres, and
 // the arc of sky between them, cosine weighted about the normal.
+#ifdef SCENE_FX_RT
+// Whether the surface at world (dist along dir from the eye) is ground for
+// the surface detail: the traced terrain, or a ground mesh lying on it
+// (Guadalcanal's airfield: flat, facing up, low, with the terrain at most a
+// metre under it; not wings or decks, nor the first-person weapon).
+bool GroundAt(vec3 world, vec3 normal, vec3 dir, float dist, float sea_level) {
+  if (normal.y > 0.55) {
+    // A short eye ray around the surface against the terrain only.
+    rayQueryEXT q;
+    float slack = 0.3 + 0.01 * dist;
+    rayQueryInitializeEXT(q, world_meshes, gl_RayFlagsOpaqueEXT, 0x02, camera.xyz,
+                          max(dist - slack, 0.0), dir, dist + slack);
+    while (rayQueryProceedEXT(q)) {
+    }
+    if (rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT) return true;
+  }
+  if (dist > 1.5 && normal.y > 0.92 && world.y < sea_level + 8.0) {
+    rayQueryEXT below;
+    rayQueryInitializeEXT(below, world_meshes, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                          0x02, world + vec3(0.0, 0.2, 0.0), 0.0, vec3(0.0, -1.0, 0.0), 1.2);
+    while (rayQueryProceedEXT(below)) {
+    }
+    return rayQueryGetIntersectionTypeEXT(below, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+  }
+  return false;
+}
+#endif
+
 void TraceOcclusion() {
   ivec2 at = ivec2(gl_GlobalInvocationID.xy);
   ivec2 ao_size = imageSize(ao_image);
@@ -848,7 +982,7 @@ void TraceOcclusion() {
   vec3 p = RelativeAt(local, depth);
   float dist = length(p);
   if (IsSky(depth) || !(dist > 1e-3) || dist > ao.w) {
-    imageStore(ao_image, at, vec4(1.0, 0.0, 0.0, 0.0));
+    imageStore(ao_image, at, vec4(1.0, 0.0, 0.0, -1.0));
     return;
   }
   vec3 v = -p / dist;
@@ -859,8 +993,9 @@ void TraceOcclusion() {
   float pixel_angle = length(ViewDir(vec2(local) + vec2(1.0, 0.0)) - ViewDir(vec2(local)));
   float radius_px = clamp(ao.y / max(dist * pixel_angle, 1e-6), 2.0, float(size.y) / 16.0);
   float falloff = ao.y * 0.4;
-  const int kSlices = 3, kSteps = 8;
-  float noise = InterleavedGradientNoise(vec2(at), 0.0);
+  const int kSteps = 8;
+  int kSlices = Temporal() ? 2 : 3;
+  float noise = InterleavedGradientNoise(vec2(at), TemporalFrame());
   float jitter = fract(noise * 7.31 + 0.37);
   float visibility = 0.0;
   for (int s = 0; s < kSlices; ++s) {
@@ -903,7 +1038,21 @@ void TraceOcclusion() {
   visibility = clamp(visibility / float(kSlices), 0.0, 1.0);
   // Fades out towards the furthest distance.
   visibility = mix(visibility, 1.0, smoothstep(0.7 * ao.w, ao.w, dist));
-  imageStore(ao_image, at, vec4(visibility, dist, 0.0, 0.0));
+  // The soft traced sun shadow here too, at half resolution: pass 1 filters
+  // it with the occlusion (SunShadowAt), so the penumbra's few rays a pixel
+  // come out smooth instead of dotted.
+  float sun_shadow = 0.0;
+  if (rt.x > 0.0 && rt.w > 0.0) sun_shadow = RayShadow(camera.xyz + p, n, dist, vec2(at));
+  // In alpha: whether it is ground for pass 1's surface detail (-1: not
+  // worked out, past the detail's distance).
+  float ground = -1.0;
+#ifdef SCENE_FX_RT
+  if (rt.x > 0.0 && detail.x > 0.0 && dist < detail.y) {
+    float sea_level = sea.w != 0.0 ? sea.x : camera.y - water.x;
+    ground = GroundAt(camera.xyz + p, n, p / dist, dist, sea_level) ? 1.0 : 0.0;
+  }
+#endif
+  imageStore(ao_image, at, vec4(visibility, dist, sun_shadow, ground));
 }
 
 // Water at a pixel: the sea beyond what the game drew (no depth, below the
@@ -916,7 +1065,30 @@ bool WaterPixel(ivec2 local, float sea_level) {
   vec2 uv = (vec2(local) + 0.5) * screen.zw;
   vec4 w4 = inv_view_proj * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
   if (w4.w <= 1e-6) return true;
-  return camera.y + w4.y / w4.w < sea_level + 0.5;
+  float y = camera.y + w4.y / w4.w;
+  if (y >= sea_level + 0.5) return false;
+  // What is seen through the sea, well under its surface.
+  if (y < sea_level - 0.3) return true;
+  // At the surface's height only water (blue or turquoise) with nothing
+  // traced right under it: ground at the sea's height (Guadalcanal's
+  // airfield, in runs whose measured sea level came out near it) was bent by
+  // the waves, and its oil stains shimmered like water.
+  vec3 col = imageLoad(scene, local + ivec2(screen.xy)).rgb;
+  vec3 c = col / max(dot(col, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+  bool cool = c.b > c.r * 1.05 || (c.g > c.r * 1.05 && c.b > c.r * 0.95);
+  if (!cool) return false;
+#ifdef SCENE_FX_RT
+  if (rt.x > 0.0) {
+    vec3 world = camera.xyz + w4.xyz / w4.w;
+    rayQueryEXT under;
+    rayQueryInitializeEXT(under, world_meshes, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                          0xFF, world + vec3(0.0, 0.15, 0.0), 0.0, vec3(0.0, -1.0, 0.0), 0.6);
+    while (rayQueryProceedEXT(under)) {
+    }
+    if (rayQueryGetIntersectionTypeEXT(under, true) != gl_RayQueryCommittedIntersectionNoneEXT) return false;
+  }
+#endif
+  return true;
 }
 
 // The sea's surface normal: a few travelling waves, flatter further away
@@ -984,24 +1156,76 @@ void Voronoi(vec2 p, out float d1, out float d2, out vec2 offset, out vec2 cell)
   }
 }
 
-// Pass 1: the ambient occlusion at a full-resolution pixel, from the 3x3 half
-// resolution pixels around it at a similar distance.
-float OcclusionAt(ivec2 local, float dist) {
+// The stone layer on bare ground: flattened domes in two sizes (pebbles in
+// cells of detail.z metres, stones in cells four times that), each inside
+// its own cell (one cell looked up per size: the 3x3 search made the march
+// far too slow), in patches (density, from noise worked out once per pixel).
+// Their height over the ground at xz (0 where there is none), and the
+// surface normal and tint of the one that is highest there.
+float StoneHeight(vec2 xz, float density, out vec3 n, out float tint) {
+  float best = 0.0;
+  n = vec3(0.0, 1.0, 0.0);
+  tint = 1.0;
+  for (int k = 0; k < 2; ++k) {
+    float s = k == 0 ? detail.z : detail.z * 4.0;
+    float seed = k == 0 ? 2.9 : 6.7;
+    vec2 g = xz / s;
+    vec2 cell = floor(g);
+    float present = k == 0 ? 0.5 * density : 0.35 * density;
+    if (CloudHash(vec3(cell, seed)) >= present) continue;
+    float r = 0.22 + 0.16 * CloudHash(vec3(cell, 9.1 + seed));
+    // Its centre anywhere it still fits in the cell.
+    vec2 centre = r + (1.0 - 2.0 * r) * vec2(CloudHash(vec3(cell, 1.7 + seed)),
+                                              CloudHash(vec3(cell, 5.3 + seed)));
+    vec2 off = g - cell - centre;
+    // An irregular outline: the radius varies around the stone.
+    float a = atan(off.y, off.x);
+    float ph = 6.2831853 * CloudHash(vec3(cell, 7.7 + seed));
+    r *= 0.85 + 0.12 * sin(3.0 * a + ph) + 0.06 * sin(5.0 * a + 2.0 * ph);
+    float d2 = dot(off, off);
+    if (d2 >= r * r) continue;
+    float hmax = r * s * (0.45 + 0.35 * CloudHash(vec3(cell, 3.3 + seed)));
+    float q = sqrt(1.0 - d2 / (r * r));
+    float h = hmax * q;
+    if (h > best) {
+      best = h;
+      // The slope of hmax sqrt(1 - |o|^2 / r^2), o in cells of s metres.
+      vec2 slope = hmax * off / (r * r * max(q, 0.08) * s);
+      n = normalize(vec3(slope.x, 1.0, slope.y));
+      tint = 0.8 + 0.4 * CloudHash(vec3(cell, 4.4 + seed));
+    }
+  }
+  return best;
+}
+
+// Pass 1: the ambient occlusion (x) and the traced sun shadow (y) at a
+// full-resolution pixel, from the 3x3 half resolution pixels around it at a
+// similar distance; z: how much of them there was (0: none, compute here).
+vec3 HalfResAt(ivec2 local, float dist) {
   ivec2 ao_size = imageSize(ao_image);
   vec2 g = (vec2(local) + 0.5) * 0.5 - 0.5;
   ivec2 g0 = ivec2(floor(g + 0.5));
-  vec2 sum = vec2(0.0);
+  vec3 sum = vec3(0.0);
   for (int y = -1; y <= 1; ++y) {
     for (int x = -1; x <= 1; ++x) {
       ivec2 q = clamp(g0 + ivec2(x, y), ivec2(0), ao_size - 1);
-      vec2 a = imageLoad(ao_image, q).rg;
+      vec3 a = imageLoad(ao_image, q).rgb;
       if (a.g <= 0.0) continue;
       vec2 off = vec2(q) - g;
       float w = exp(-dot(off, off) * 0.5) * exp(-abs(a.g - dist) / (0.01 * dist + 0.05));
-      sum += vec2(a.r, 1.0) * w;
+      sum += vec3(a.r, a.b, 1.0) * w;
     }
   }
-  return sum.y > 1e-4 ? sum.x / sum.y : 1.0;
+  return sum.z > 1e-4 ? vec3(sum.xy / sum.z, sum.z) : vec3(1.0, 0.0, 0.0);
+}
+float OcclusionAt(ivec2 local, float dist) { return HalfResAt(local, dist).x; }
+// Pass 1 needs it up to three times a pixel (the sun shadow, the occlusion,
+// the grime): worked out once.
+vec3 g_half_res;
+bool g_half_res_done = false;
+vec3 HalfResCached(ivec2 local, float dist) {
+  if (!g_half_res_done) g_half_res = HalfResAt(local, dist), g_half_res_done = true;
+  return g_half_res;
 }
 
 #ifdef SCENE_FX_RT
@@ -1031,6 +1255,34 @@ void TraceLight() {
                                                : cross(normal, vec3(1.0, 0.0, 0.0)));
   vec3 bitangent = cross(normal, tangent);
   vec3 origin = world + normal * (0.05 + 0.002 * dist);
+  // Last frame's light at the same surface.
+  float frames = 0.0;
+  vec3 history = vec3(1.0);
+  if (prev_camera.w > 0.0) {
+    vec4 pc = prev_view_proj * vec4(world, 1.0);
+    if (pc.w > 1e-6) {
+      vec2 ndc = pc.xy / pc.w;
+      ivec2 prev = ivec2(vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2(light_size));
+      if (all(greaterThanEqual(prev, ivec2(0))) && all(lessThan(prev, light_size))) {
+        float prev_dist = imageLoad(light_history_dist, prev).r;
+        float expected = length(world - prev_camera.xyz);
+        if (prev_dist > 0.0 && abs(prev_dist - expected) < 0.03 * expected + 0.15) {
+          vec4 h = imageLoad(light_history, prev);
+          if (!any(isnan(h))) {
+            history = h.rgb;
+            frames = min(h.a, gi2.y - 1.0);
+          }
+        }
+      }
+    }
+  }
+  // Half the pixels trace each frame (a checkerboard turning over every
+  // frame); the others keep what they had, once they have some history.
+  if (frames >= 2.0 && ((at.x + at.y + int(gi.w)) & 1) == 1) {
+    imageStore(light_out, at, vec4(history, frames));
+    imageStore(light_out_dist, at, vec4(dist));
+    return;
+  }
   vec3 seen = vec3(0.0), open = vec3(0.0);
   int rays = int(gi.y);
   for (int i = 0; i < rays; ++i) {
@@ -1054,53 +1306,45 @@ void TraceLight() {
     }
   }
   vec3 ratio = clamp(seen / max(open, vec3(1e-5)), vec3(0.0), vec3(2.5));
-  // Last frame's light at the same surface.
-  float frames = 0.0;
-  vec3 history = ratio;
-  if (prev_camera.w > 0.0) {
-    vec4 pc = prev_view_proj * vec4(world, 1.0);
-    if (pc.w > 1e-6) {
-      vec2 ndc = pc.xy / pc.w;
-      ivec2 prev = ivec2(vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2(light_size));
-      if (all(greaterThanEqual(prev, ivec2(0))) && all(lessThan(prev, light_size))) {
-        float prev_dist = imageLoad(light_history_dist, prev).r;
-        float expected = length(world - prev_camera.xyz);
-        if (prev_dist > 0.0 && abs(prev_dist - expected) < 0.03 * expected + 0.15) {
-          vec4 h = imageLoad(light_history, prev);
-          if (!any(isnan(h))) {
-            history = h.rgb;
-            frames = min(h.a, gi2.y - 1.0);
-          }
-        }
-      }
-    }
-  }
+  if (frames <= 0.0) history = ratio;
   imageStore(light_out, at, vec4(mix(history, ratio, 1.0 / (frames + 1.0)), frames + 1.0));
   imageStore(light_out_dist, at, vec4(dist));
 }
 
 // Pass 1: the ray-traced light at a full-resolution pixel, from the 3x3 half
-// resolution pixels around it at a similar distance.
-vec3 LightAt(ivec2 local, float dist) {
+// resolution pixels around it at a similar distance and on the pixel's own
+// plane (normal): where a post meets the ground both are at one distance, and
+// the ground's light on the post (and the post's on the ground) was a blotch.
+vec3 LightAt(ivec2 local, float dist, vec3 normal) {
+  vec3 here = ViewDir(vec2(local)) * dist;
+  float plane_tolerance = 0.02 * dist + 0.04;
   ivec2 light_size = imageSize(light_out);
   vec2 g = (vec2(local) + 0.5) * 0.5 - 0.5;
   ivec2 g0 = ivec2(floor(g + 0.5));
   vec4 sum = vec4(0.0);
+  // Without the distance weight too: where no neighbour is at the pixel's
+  // distance (bumpy ground) it had no light at all, and such pixels stayed
+  // bright specks in the darker light around them.
+  vec4 near = vec4(0.0);
   for (int y = -1; y <= 1; ++y) {
     for (int x = -1; x <= 1; ++x) {
       ivec2 q = clamp(g0 + ivec2(x, y), ivec2(0), light_size - 1);
       float qd = imageLoad(light_out_dist, q).r;
       if (qd <= 0.0) continue;
       vec2 off = vec2(q) - g;
-      float w = exp(-dot(off, off) * 0.8) *
-                exp(-abs(qd - dist) / (0.01 * dist + 0.05));
       vec4 l = imageLoad(light_out, q);
-      // Pixels with few frames yet count less.
-      w *= min(l.a, 8.0);
+      // Pixels with few frames yet count less; ones off this pixel's plane
+      // hardly at all.
+      vec3 there = ViewDir(vec2(q) * 2.0 + 0.5) * qd;
+      float plane = abs(dot(normal, there - here)) / plane_tolerance;
+      float w = exp(-dot(off, off) * 0.35) * min(l.a, 8.0) * exp(-plane * plane);
+      near += vec4(l.rgb, 1.0) * w;
+      w *= exp(-abs(qd - dist) / (0.01 * dist + 0.05));
       sum += vec4(l.rgb, 1.0) * w;
     }
   }
-  return sum.w > 1e-4 ? sum.rgb / sum.w : vec3(1.0);
+  if (sum.w > 1e-3) return sum.rgb / sum.w;
+  return near.w > 1e-4 ? near.rgb / near.w : vec3(1.0);
 }
 
 
@@ -1167,6 +1411,54 @@ vec3 ApplyGore(vec3 color, vec3 world, bool surface, vec3 dir, float dist) {
     vec4 b = gore[i * 2 + 1];
     float kind = b.x;
     vec2 sp = vec2(b.y * 7.31, b.y * 3.17);
+    if (kind == 6.0) {
+      // Explosion smoke: a puff ray-marched as a volume. Noise inside a soft
+      // sphere that grows and thins, lit by the sun (through itself, darker
+      // underneath, and the shadow map) and the sky; cut off by the surface
+      // behind, so it sits in the scene without hard edges.
+      float t = b.z;
+      float R = a.w * (1.0 + 1.6 * sqrt(t));
+      vec3 oc = camera.xyz - a.xyz;
+      float bq = dot(oc, dir), h = bq * bq - (dot(oc, oc) - R * R);
+      if (h <= 0.0) continue;
+      h = sqrt(h);
+      float t0 = max(-bq - h, 0.05), t1 = -bq + h;
+      if (surface) t1 = min(t1, dist);
+      if (t1 <= t0) continue;
+      float alive = smoothstep(0.0, 0.03, t) * (1.0 - smoothstep(0.55, 1.0, t));
+      float dens0 = 1.6 / R * alive * (1.0 - 0.55 * t);
+      vec3 l = normalize(sun_dir.xyz);
+      int slice;
+      float sun_vis = SunVisibility(a.xyz, slice);
+      float mu = dot(dir, l);
+      float phase = 0.55 + 0.45 * (1.0 - 0.16) / pow(1.0 + 0.16 - 0.8 * mu, 1.5);
+      vec3 albedo = mix(vec3(0.42, 0.40, 0.38), vec3(0.62, 0.58, 0.52), t);  // darker when fresh
+      vec3 seed3 = vec3(b.y * 1.37, b.y * 2.11, b.y * 0.73);
+      const int kSteps = 8;
+      float step_t = (t1 - t0) / float(kSteps);
+      float jitter = CloudHash(dir * 1731.0 + seed3);
+      float T = 1.0;
+      vec3 L = vec3(0.0);
+      for (int k = 0; k < kSteps; ++k) {
+        vec3 p = camera.xyz + dir * (t0 + (float(k) + jitter) * step_t);
+        vec3 q = (p - a.xyz) / R;
+        float r = length(q);
+        vec3 np = p * (0.9 / max(a.w, 0.5)) + seed3 + vec3(0.0, -t * 3.0, 0.0);
+        float n = CloudNoise(np) * 0.65 + CloudNoise(np * 2.3) * 0.35;
+        float d = dens0 * (1.0 - smoothstep(0.35, 1.0, r)) * clamp(n * 1.6 - 0.25, 0.0, 1.5);
+        if (d <= 0.0) continue;
+        // Through itself towards the sun: thicker from the far side.
+        float sun_t = exp(-dens0 * R * 1.1 * clamp(1.0 - dot(q, l), 0.0, 2.0));
+        vec3 lit = albedo * (ambient.rgb * (0.75 + 0.35 * q.y) + sun_color.rgb * sun_t * phase * sun_vis) *
+                   camera.w * gore_info.y;
+        float a_step = 1.0 - exp(-d * step_t);
+        L += T * lit * a_step;
+        T *= 1.0 - a_step;
+        if (T < 0.02) break;
+      }
+      color = color * T + L;
+      continue;
+    }
     float t = b.z;
     float cover = 0.0;
     vec3 blood;
@@ -1208,6 +1500,20 @@ vec3 ApplyGore(vec3 color, vec3 world, bool surface, vec3 dir, float dist) {
         float drops = step(0.75, GoreNoise(q * 5.0 + sp)) * step(grow * 0.4, r) * step(r, grow * 1.7);
         cover = max(mist * 0.85, drops) * (1.0 - t) * (1.0 - t);
         blood = vec3(0.5, 0.02, 0.03) * (0.75 + 0.25 * mist);
+      } else if (kind == 5.0 || kind == 6.0) {
+        // Gun smoke (grey) and an explosion's dust (sandy): a soft, noisy
+        // puff that grows and thins out.
+        float grow = kind == 5.0 ? 0.6 + 1.6 * sqrt(t) : 0.7 + 1.1 * sqrt(t);
+        float wisp = GoreNoise(q * 1.7 / grow + sp + vec2(t * 0.6));
+        float edge = grow * (0.6 + 0.5 * wisp);
+        float dens = 1.0 - smoothstep(edge * 0.25, edge, r);
+        cover = dens * (kind == 5.0 ? 0.5 : 0.8) * (1.0 - t) * smoothstep(0.0, 0.04, t);
+        blood = kind == 5.0 ? vec3(1.5, 1.5, 1.55) : vec3(1.75, 1.55, 1.25);
+      } else if (kind == 7.0) {
+        // Debris: a small dark lump of earth or stone.
+        float edge = 0.75 + 0.3 * GoreNoise(q * 2.5 + sp);
+        cover = (1.0 - smoothstep(edge - 0.15, edge, r)) * (1.0 - smoothstep(0.9, 1.0, t));
+        blood = vec3(0.6, 0.55, 0.5);
       } else if (kind == 1.0) {
         float edge = 0.8 + 0.35 * GoreNoise(q * 2.5 + sp);
         cover = (1.0 - smoothstep(edge - 0.15, edge, r)) * (1.0 - smoothstep(0.9, 1.0, t));
@@ -1226,7 +1532,147 @@ vec3 ApplyGore(vec3 color, vec3 world, bool surface, vec3 dir, float dist) {
   return color;
 }
 
+// Single scattering in the height fog along the view ray, len metres (the
+// surface's distance, at most march.x): in-scattered light (times the haze
+// colour) and optical depth. The haze converges to the measured horizon sky
+// colour; where the shadow map says the air is in shadow it loses the
+// sunlit share (the light shafts).
+void HazeMarch(vec3 dir, float len, bool sky, float jitter, out float scattered, out float optical) {
+  int steps = int(march.y);
+  float dt = len / float(steps);
+  // The densest fog is at the (measured) sea level.
+  float fog_base = (sea.w != 0.0 ? sea.x : camera.y - water.x) + ambient.w;
+  // The game's sky already has its haze: thinner fog in front of it.
+  float density_scale = sky ? water.z : 1.0;
+  scattered = 0.0;
+  optical = 0.0;
+  vec3 base[3], delta[3];
+  for (int i = 0; i < 3; ++i) {
+    base[i] = vec3(dot(slices[i * 3], vec4(camera.xyz, 1.0)), dot(slices[i * 3 + 1], vec4(camera.xyz, 1.0)),
+                   dot(slices[i * 3 + 2], vec4(camera.xyz, 1.0)));
+    delta[i] = vec3(dot(slices[i * 3].xyz, dir), dot(slices[i * 3 + 1].xyz, dir),
+                    dot(slices[i * 3 + 2].xyz, dir));
+  }
+  for (int i = 0; i < steps; ++i) {
+    float t = (float(i) + jitter) * dt;
+    float y = camera.y + dir.y * t;
+    float density = density_scale * sun_dir.w * exp(-sun_color.w * max(y - fog_base, 0.0));
+    float vis = SunVisibilityAlong(t, base, delta);
+    float step_optical = density * dt;
+    scattered += exp(-(optical + 0.5 * step_optical)) * step_optical *
+                 (1.0 - strength.x * (1.0 - vis));
+    optical += step_optical;
+  }
+  if (!sky) {
+    // Surfaces never get more haze than the sky in the same direction, so
+    // they fade into it with distance and the horizon has no seam. (Thinning
+    // the whole ray by the surface's distance instead left the sea from
+    // 300 m out less hazy than nearer: a darker band in the distance.)
+    const int kFull = 8;
+    float full_dt = march.x / float(kFull);
+    float full = 0.0;
+    for (int i = 0; i < kFull; ++i) {
+      float y = camera.y + dir.y * (float(i) + 0.5) * full_dt;
+      full += sun_dir.w * exp(-sun_color.w * max(y - fog_base, 0.0)) * full_dt;
+    }
+    float cap = water.z * full;
+    if (optical > cap) {
+      scattered *= (1.0 - exp(-cap)) / max(1.0 - exp(-optical), 1e-6);
+      optical = cap;
+    }
+  }
+}
+
+// Pass 8, one thread per half-resolution pixel: the haze along its view ray
+// (the march is the costliest part of pass 1 at full resolution, and the
+// haze and its light shafts change slowly across the screen).
+void MarchHazeHalf() {
+  ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 half_size = imageSize(haze_image);
+  if (any(greaterThanEqual(at, half_size))) return;
+  ivec2 size = ivec2(1.0 / screen.zw + 0.5);
+  ivec2 local = min(at * 2, size - 1);
+  float depth = imageLoad(saved_depth, local).r;
+  vec2 uv = (vec2(local) + 0.5) * screen.zw;
+  vec4 world4 = inv_view_proj * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+  vec3 dir = ViewDir(vec2(local));
+  bool sky = IsSky(depth) || world4.w <= 1e-6;
+  float dist = sky ? 1e9 : length(world4.xyz / world4.w);
+  if (sky && dir.y < -1e-4) {
+    float sea_level = sea.w != 0.0 ? sea.x : camera.y - water.x;
+    dist = (sea_level - camera.y) / dir.y;
+    sky = false;
+  }
+  float scattered, optical;
+  HazeMarch(dir, min(dist, march.x), sky, InterleavedGradientNoise(vec2(at), march.w), scattered, optical);
+  imageStore(haze_image, at, vec4(scattered, optical, sky ? -1.0 : dist, 0.0));
+}
+
+// Pass 1: the haze at a full-resolution pixel from the 3x3 half-resolution
+// pixels around it at a similar distance (or also sky); false if none is.
+bool HazeAt(ivec2 local, float dist, bool sky, out float scattered, out float optical) {
+  scattered = 0.0;
+  optical = 0.0;
+  if (march.z <= 0.0) return false;
+  ivec2 half_size = imageSize(haze_image);
+  vec2 g = (vec2(local) + 0.5) * 0.5 - 0.5;
+  ivec2 g0 = ivec2(floor(g + 0.5));
+  vec3 sum = vec3(0.0);
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      ivec2 q = clamp(g0 + ivec2(x, y), ivec2(0), half_size - 1);
+      vec4 h = imageLoad(haze_image, q);
+      bool q_sky = h.z < 0.0;
+      if (q_sky != sky) continue;
+      vec2 off = vec2(q) - g;
+      float w = exp(-dot(off, off) * 0.6);
+      if (!sky) w *= exp(-abs(h.z - dist) / (0.02 * dist + 0.1));
+      sum += vec3(h.x, h.y, 1.0) * w;
+    }
+  }
+  if (sum.z < 0.05) return false;
+  scattered = sum.x / sum.z;
+  optical = sum.y / sum.z;
+  return true;
+}
+
+// Pass 9, one thread per pixel: FSR 3's motion vectors from the saved depth
+// and last frame's view: the world position (or, for the sky, the direction)
+// projected both ways.
+void MotionVectors() {
+  ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(motion_image);
+  if (any(greaterThanEqual(local, size))) return;
+  float depth = imageLoad(saved_depth, local).r;
+  vec2 uv = (vec2(local) + 0.5) / vec2(size);
+  vec4 ndc = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+  vec4 w4 = inv_view_proj * ndc;
+  vec4 prev;
+  if (IsSky(depth) || w4.w <= 1e-6) {
+    // Far: only the rotation counts (a direction, w 0).
+    vec3 dir = ViewDir(vec2(local));
+    prev = prev_view_proj * vec4(dir, 0.0);
+  } else {
+    prev = prev_view_proj * vec4(camera.xyz + w4.xyz / w4.w, 1.0);
+  }
+  vec2 mv = vec2(0.0);
+  if (prev.w > 1e-6) {
+    vec2 prev_ndc = prev.xy / prev.w;
+    vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+    mv = (prev_uv - uv) * vec2(size);
+  }
+  imageStore(motion_image, local, vec4(mv, 0.0, 0.0));
+}
+
 void main() {
+  if (pass_mode == 9u) {
+    MotionVectors();
+    return;
+  }
+  if (pass_mode == 8u) {
+    MarchHazeHalf();
+    return;
+  }
   if (pass_mode == 2u) {
     MeasureHorizon();
     return;
@@ -1260,6 +1706,27 @@ void main() {
   ivec2 local = ivec2(gl_GlobalInvocationID.xy);
   if (pass_mode == 0u) {
     imageStore(saved_depth, local, vec4(texelFetch(scene_depth, ivec2(pixel), 0).r));
+    imageStore(world_color, local, imageLoad(scene, ivec2(pixel)));
+#ifdef SCENE_FX_RT
+    if (pixel.x < kMaterialPitch && pixel.y < kMaterialRows) {
+      float d = texelFetch(scene_depth, ivec2(pixel), 0).r;
+      vec2 duv = (vec2(local) + 0.5) * screen.zw;
+      vec4 w4 = inv_view_proj * vec4(duv.x * 2.0 - 1.0, 1.0 - duv.y * 2.0, d, 1.0);
+      // Clip w is 1 / w4.w; sky (or nothing): far.
+      bool far_away = IsSky(d) || w4.w <= 1e-6;
+      float w = far_away ? 1e6 : 1.0 / w4.w;
+      // In the low 8 bits: how much sun reaches the surface (last frame's
+      // half-resolution traced shadow), for the particles near it.
+      float lit = 1.0;
+      if (!far_away && rt.x > 0.0 && rt.w > 0.0) {
+        // The nearest half-resolution value (the particles only need it roughly).
+        vec4 hr = imageLoad(ao_image, clamp(local / 2, ivec2(0), imageSize(ao_image) - 1));
+        if (hr.g > 0.0) lit = 1.0 - hr.b;
+      }
+      materials[kMaterialDepthOffset + pixel.y * kMaterialPitch + pixel.x] =
+          (floatBitsToUint(w) & 0xFFFFFF00u) | uint(clamp(lit, 0.0, 1.0) * 255.0 + 0.5);
+    }
+#endif
     return;
   }
   // Pixels with depth now were drawn after the world's depth was copied out:
@@ -1285,6 +1752,18 @@ void main() {
   }
   vec3 world = camera.xyz + dir * min(dist, 1e5);
   float len = min(dist, march.x);
+  // What the game drew over the world after the depth copy (its particles:
+  // impact dust, sparks, smoke) is taken off here and put back unchanged at
+  // the end, so shadows, occlusion and surface detail light the ground under
+  // it, not it (it came out as black squares and big bright bursts). Not
+  // the sea and what is seen through it (drawn after the copy too).
+  vec3 overlay = vec3(0.0);
+  if (!sky && depth > 0.0 &&
+      world.y > (sea.w != 0.0 ? sea.x : camera.y - water.x) + 0.5) {
+    vec3 before = imageLoad(world_color, local).rgb;
+    overlay = color.rgb - before;
+    color.rgb = before;
+  }
 
   uint debug = shadow_info.w;
   // Debug 17: everything as usual, but the left half without the traced light.
@@ -1304,16 +1783,23 @@ void main() {
   bool own = gi2.z > 0.0;
   float sea_level = sea.w != 0.0 ? sea.x : camera.y - water.x;
   // Far away the depth is coarse: a looser height and no normal test.
-  bool on_sea = has_depth && abs(world.y - sea_level) < 0.75 + 0.005 * dist &&
+  // Within 0.3 m of the measured sea level close by (the sea is drawn flat at
+  // it), looser further out where the depth is coarse: at 0.75 m Guadalcanal's
+  // airfield, just over the sea, passed for it in runs where its shaded
+  // ground looked blue enough (waves and foam on dry land).
+  bool on_sea = has_depth && abs(world.y - sea_level) < min(0.3 + 0.005 * dist, 0.75 + 0.005 * dist) &&
                 (normal.y > 0.9 || dist > 300.0);
+  bool ground_at_sea = false;
 #ifdef SCENE_FX_RT
   // Never a traced mesh (the sea isn't one): a deck at a wrong sea level.
   if (on_sea && rt.x > 0.0) {
     vec3 n;
     float t = TraceMeshes(camera.xyz, dir, dist * 1.02 + 2.0, n);
-    if (t > 0.0 && abs(t - dist) < 1.0 + 0.01 * dist) on_sea = false;
+    if (t > 0.0 && abs(t - dist) < 1.0 + 0.01 * dist) on_sea = false, ground_at_sea = true;
   }
   // Nor bare ground at the sea's height (Guadalcanal's airfield took the
+  // sea's reflections; ground_at_sea then: the surface detail takes it as
+  // bare ground, though it is not the traced terrain).
   // sea's reflections): the terrain right at the pixel, not blue or
   // turquoise (water drawn over the terrain in the shallows stays sea).
   if (on_sea && rt.x > 0.0 && dist < 400.0) {
@@ -1328,7 +1814,22 @@ void main() {
     // Water drawn with depth is blue or turquoise; anything else at the sea's
     // height is ground or a deck (some ground, as that airfield, isn't in the
     // traced terrain; grey shadowed dirt took the sea's reflections).
-    if (!cool) on_sea = false;
+    if (!cool) on_sea = false, ground_at_sea = true;
+  }
+  // Nor ground meshes at the sea's height (the airfield): the eye ray's
+  // checks missed them at grazing angles, and dark
+  // oil stains on them passed for water (waves and foam in specks, in the
+  // runs whose measured sea level came out near the airfield's height).
+  if (on_sea && rt.x > 0.0 && dist < 400.0 && normal.y > 0.9) {
+    rayQueryEXT under;
+    // Any traced mesh (the airfield's own, or the terrain) right under it.
+    rayQueryInitializeEXT(under, world_meshes, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                          0xFF, world + vec3(0.0, 0.15, 0.0), 0.0, vec3(0.0, -1.0, 0.0), 0.6);
+    while (rayQueryProceedEXT(under)) {
+    }
+    if (rayQueryGetIntersectionTypeEXT(under, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+      on_sea = false, ground_at_sea = true;
+    }
   }
 #endif
   // The game's shading already darkens where its shadow map says shadow
@@ -1350,10 +1851,25 @@ void main() {
       // edges, and the traced shadows plus the game's own cover it.
       if (ss.x > 0.0 && rt.x <= 0.0) {
         occluded = max(occluded, ss.x * graze * ScreenSpaceShadow(world, normal, dist, size,
-                                            InterleavedGradientNoise(vec2(pixel), 0.0)));
+                                            InterleavedGradientNoise(vec2(pixel), TemporalFrame())));
       }
       if (rt.x > 0.0) {
-        traced = RayShadow(world, normal, dist);
+        // Soft, filtered at half resolution with the occlusion (within its
+        // distance); further out, or without it, one ray per pixel here.
+        vec3 half_res = ao.x > 0.0 && rt.w > 0.0 && dist < 0.95 * ao.w ? HalfResCached(local, dist)
+                                                                       : vec3(0.0);
+        // Far away (past the occlusion's distance) one hard ray: a penumbra
+        // there is under a pixel wide, and 3-10 rays a pixel over the distant
+        // ground was a good part of the frame.
+        // From 85 % to 95 % of that distance the filtered shadow fades into
+        // the hard ray, so there is no line where one takes over.
+        if (half_res.z > 0.05) {
+          traced = half_res.y;
+          float far = smoothstep(0.85 * ao.w, 0.95 * ao.w, dist);
+          if (far > 0.0) traced = mix(traced, RayShadowHard(world, normal, dist), far);
+        } else {
+          traced = dist > 0.9 * ao.w ? RayShadowHard(world, normal, dist) : RayShadow(world, normal, dist, vec2(pixel));
+        }
         occluded = max(occluded, traced * graze);
       }
       if (own && traced == 0.0) {
@@ -1362,7 +1878,8 @@ void main() {
             (rt.x <= 0.0 ||
              !OccluderTraced(world + normalize(sun_dir.xyz) * t_occ, 3.0 * texel_m + 0.15))) {
           map_only = 1.0;
-          occluded = max(occluded, graze);
+          // Filtered: the map's texels showed as steps along the edges.
+          occluded = max(occluded, graze * (1.0 - SunVisibilitySoft(world)));
         }
       }
     }
@@ -1422,7 +1939,13 @@ void main() {
     // a little under the measured sea level (Guadalcanal's airfield) is not,
     // and took the shallows' tint and foam (white-green, grainy).
     vec3 cn = color.rgb / max(dot(color.rgb, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
-    bool through_water = cn.b > cn.r * 1.15 || (cn.g > cn.r * 1.15 && cn.b > cn.r);
+    // Nor dark: the oil stains on the airfield (dark and a little blue) took
+    // the shallows' tint and drifting foam in runs whose measured sea level
+    // came out over the airfield (white specks moving like water).
+    float lum_here = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+    float lum_sky = dot(HazeColor(normalize(vec3(dir.x, 0.05, dir.z))), vec3(0.2126, 0.7152, 0.0722));
+    bool through_water = (cn.b > cn.r * 1.15 || (cn.g > cn.r * 1.15 && cn.b > cn.r)) &&
+                         lum_here > 0.12 * lum_sky;
     bool below = has_depth && !on_sea && world.y < sea_level - 0.05 && dist > t_surf && through_water;
     bool surface = !has_depth || on_sea;
     if ((below || surface) && (t_surf < 400.0 || water_debug)) {
@@ -1483,7 +2006,7 @@ void main() {
   // sun's) darkened by how much of the sky the surroundings hide. Debug 19
   // shows it; debug 20: the left half without it.
   if (ao.x > 0.0 && has_depth && !on_sea && (debug == 0u || debug == 19u || debug == 20u)) {
-    float visibility = OcclusionAt(local, dist);
+    float visibility = HalfResCached(local, dist).x;
     if (debug == 19u) {
       imageStore(scene, ivec2(pixel), vec4(vec3(visibility * 0.6), color.a));
       return;
@@ -1505,61 +2028,109 @@ void main() {
   // cracks blue.
   // (Not under the sea: the seabed seen through the water is terrain too.)
   if (detail.x > 0.0 && has_depth && !on_sea && dist < detail.y &&
-      world.y > sea_level + 0.3 && (debug == 0u || debug == 23u)) {
+      (world.y > sea_level + 0.3 || ground_at_sea) && (debug == 0u || debug == 23u)) {
     const vec3 lum = vec3(0.2126, 0.7152, 0.0722);
     float pixel_m = dist * length(ViewDir(vec2(local) + vec2(1.0, 0.0)) - ViewDir(vec2(local)));
     float fade = 1.0 - smoothstep(0.6 * detail.y, detail.y, dist);
     // Grime: broad blotches, and darker where the surroundings hide the sky.
     float blotch = CloudNoise(world * 0.6) * 0.65 + CloudNoise(world * 2.3 + 7.1) * 0.35;
-    float hidden = ao.x > 0.0 ? 1.0 - OcclusionAt(local, dist) : 0.0;
+    float hidden = ao.x > 0.0 ? 1.0 - HalfResCached(local, dist).x : 0.0;
     float grime = (0.1 * smoothstep(0.45, 0.8, blotch) + 0.3 * hidden) * detail.x * fade;
     vec3 v23 = color.rgb * 0.25;
-    bool terrain = false;
+    bool terrain = ground_at_sea;
 #ifdef SCENE_FX_RT
-    if (rt.x > 0.0 && normal.y > 0.55) {
-      // A short eye ray around the surface against the terrain only.
-      rayQueryEXT q;
-      float slack = 0.3 + 0.01 * dist;
-      rayQueryInitializeEXT(q, world_meshes, gl_RayFlagsOpaqueEXT, 0x02, camera.xyz,
-                            max(dist - slack, 0.0), dir, dist + slack);
-      while (rayQueryProceedEXT(q)) {
+    if (rt.x > 0.0 && !terrain) {
+      // From the occlusion pass (half resolution) where its pixel is this
+      // surface; else traced here.
+      bool known = false;
+      if (ao.x > 0.0) {
+        vec4 hq = imageLoad(ao_image, clamp(local / 2, ivec2(0), imageSize(ao_image) - 1));
+        if (hq.a >= 0.0 && hq.g > 0.0 && abs(hq.g - dist) < 0.03 * dist + 0.2) {
+          terrain = hq.a > 0.5;
+          known = true;
+        }
       }
-      terrain = rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+      if (!known) terrain = GroundAt(world, normal, dir, dist, sea_level);
     }
 #endif
     // Bare ground (sand, dirt, rock: warm or grey): not green (grass), and
     // not cool (blue or turquoise water drawn over the terrain, as in the
     // lagoon, above the measured sea level).
     vec3 c = color.rgb / max(dot(color.rgb, lum), 1e-4);
-    bool bare = terrain && !(c.g > c.r * 1.04 && c.g > c.b * 1.08) && c.r >= c.b * 0.95;
+    // Grass (olive to green: green at least as strong as red, well above
+    // blue) against bare ground (sand, dirt, rock: warm or grey).
+    bool green = c.g >= c.r * 0.97 && c.g > c.b * 1.2;
+    bool bare = terrain && !green && c.r >= c.b * 0.95;
+    if (terrain) v23.r = 0.35;
     if (bare) {
       v23.r = 0.8;
       vec3 l = normalize(sun_dir.xyz);
-      // Pebbles: where a patch noise allows, one per cell or none.
-      float pebble_fade = smoothstep(2.0, 5.0, detail.z / max(pixel_m, 1e-4)) * fade;
-      if (pebble_fade > 0.0) {
-        float d1, d2;
-        vec2 off, cell;
-        Voronoi(world.xz / detail.z, d1, d2, off, cell);
+      // Stones and pebbles as a thin height layer over the ground: the view
+      // ray is marched through it back from the ground point, so they stand
+      // up with their own outlines and parallax; ground they do not cover
+      // marches towards the sun for their contact shadows.
+      float stone_fade = smoothstep(2.0, 5.0, detail.z / max(pixel_m, 1e-4)) * fade *
+                         (1.0 - smoothstep(9.0, 12.0, dist));
+      if (stone_fade > 0.0) {
+        float layer = detail.z * 4.0 * 0.42 * 0.8;  // the tallest stone
+        vec3 up = normal;
+        float lit = 1.0 - occluded;
+        float ground_ndl = max(dot(up, l), 0.0);
+        vec3 back = -dir;
+        float rise = dot(back, up);
+        bool hit = false;
+        vec3 sn;
+        float tint, stone_h = 0.0;
         float patch_noise = CloudNoise(vec3(world.xz * 0.35, 3.0));
-        float r = 0.22 + 0.2 * CloudHash(vec3(cell, 9.1));
-        bool present = CloudHash(vec3(cell, 2.9)) < smoothstep(0.35, 0.75, patch_noise);
-        if (present) {
-          float edge = pixel_m / detail.z;
-          float inside = 1.0 - smoothstep(r - edge, r + edge, d1);
-          // A dome: its normal from the offset; lit by the sun, a little
-          // lighter or darker stone per pebble.
-          float hgt = sqrt(max(1.0 - (d1 * d1) / (r * r), 0.0));
-          vec3 dn = normalize(vec3(off.x, hgt * r * 1.2, off.y));
-          float shade = 0.62 + 0.55 * max(dot(dn, l), 0.0);
-          vec3 tint = vec3(0.85 + 0.35 * CloudHash(vec3(cell, 4.4)));
-          // Its contact shadow just outside, away from the sun.
-          float ring = smoothstep(r * 1.35, r, d1) * (1.0 - inside) *
-                       clamp(-dot(normalize(vec2(off.x, off.y) + 1e-5), normalize(l.xz + 1e-5)) * 0.5 + 0.5, 0.0, 1.0);
-          float k = detail.x * pebble_fade;
-          color.rgb *= mix(vec3(1.0), shade * tint, inside * k);
-          color.rgb *= 1.0 - 0.35 * ring * k;
-          v23.g = max(inside, ring * 0.5);
+        float density = smoothstep(0.35, 0.75, patch_noise);
+        if (rise > 0.04 && density > 0.0) {
+          const int kSteps = 8;
+          float t_in = layer / rise;
+          float prev_t = t_in;
+          for (int i = 1; i <= kSteps; ++i) {
+            float t = t_in * (1.0 - float(i) / float(kSteps));
+            vec3 p = world + back * t;
+            float h = StoneHeight(p.xz, density, sn, tint);
+            if (t * rise <= h) {
+              // Between the last step above and this one.
+              float lo = t, hi = prev_t;
+              for (int r = 0; r < 1; ++r) {
+                float mid = 0.5 * (lo + hi);
+                if (mid * rise <= StoneHeight((world + back * mid).xz, density, sn, tint)) lo = mid;
+                else hi = mid;
+              }
+              stone_h = StoneHeight((world + back * lo).xz, density, sn, tint);
+              hit = stone_h > 0.0;
+              break;
+            }
+            prev_t = t;
+          }
+        }
+        float k = detail.x * stone_fade;
+        if (hit) {
+          // Lit like the ground around it, by its own facing; darker at its
+          // foot (the ground's bounce and sky light blocked).
+          float stone_ndl = max(dot(sn, l), 0.0);
+          float shade = (0.45 + lit * stone_ndl) / (0.45 + lit * ground_ndl);
+          // Steep sides (towards its foot) darker: less sky reaches them.
+          float foot = mix(0.7, 1.0, smoothstep(0.3, 0.9, sn.y));
+          // Stone a little cooler or warmer than the ground, by its tint.
+          vec3 hue = mix(vec3(0.95, 0.97, 1.02), vec3(1.04, 1.0, 0.94), fract(tint * 7.31));
+          color.rgb *= mix(vec3(1.0), shade * tint * foot * hue, k);
+          v23.g = 1.0;
+        } else if (lit > 0.0 && l.y > 0.05 && density > 0.0) {
+          // Shadowed by a stone between here and the sun.
+          float sun_rise = dot(l, up);
+          for (int i = 1; i <= 3; ++i) {
+            float t = layer / max(sun_rise, 0.05) * float(i) / 3.0;
+            vec3 dummy_n;
+            float dummy_t;
+            if (t * sun_rise < StoneHeight((world + l * t).xz, density, dummy_n, dummy_t)) {
+              color.rgb *= 1.0 - 0.5 * lit * ground_ndl / (0.45 + ground_ndl) * k;
+              v23.g = 0.5;
+              break;
+            }
+          }
         }
       }
       // Cracks: thin dark lines along cell borders in dry patches.
@@ -1575,8 +2146,49 @@ void main() {
         float line = 1.0 - smoothstep(width * 0.5, width, d2 - d1);
         float dry = smoothstep(0.55, 0.75, CloudNoise(vec3(world.xz * 0.15, 11.0)));
         float crack = line * dry * crack_fade * detail.x;
-        color.rgb *= 1.0 - 0.45 * crack;
+        // Faint: on the airfield's wide flat ground strong ones read as seams.
+        color.rgb *= 1.0 - 0.22 * crack;
         v23.b = crack;
+      }
+    }
+    // Grass: blades in a layer kGrassHeight deep over green ground, the view
+    // ray marched down through it from the top, so the nearest blade wins;
+    // each blade a thin leaning strand from a random point in its cell,
+    // darker at its foot, lighter and yellower at its tip. Faded out where
+    // a blade would be thinner than a pixel.
+    bool grassy = terrain && green && normal.y > 0.6;
+    float grass_fade = smoothstep(0.5, 1.5, 0.012 / max(pixel_m, 1e-4)) * fade *
+                       (1.0 - smoothstep(25.0, 30.0, dist));
+    if (grassy && grass_fade > 0.0) {
+      const float kGrassHeight = 0.22, kCell = 0.045;
+      vec3 back = -dir;
+      float rise = max(dot(back, normal), 0.03);
+      float t_in = kGrassHeight / rise;
+      float meadow = smoothstep(0.25, 0.6, CloudNoise(vec3(world.xz * 0.5, 13.0)));
+      const int kSteps = 10;
+      for (int i = 0; i < kSteps; ++i) {
+        float t = t_in * (1.0 - (float(i) + 0.5) / float(kSteps));
+        vec3 p = world + back * t;
+        float y = t * rise;  // over the ground
+        vec2 g = p.xz / kCell;
+        vec2 cell = floor(g);
+        if (CloudHash(vec3(cell, 21.0)) > 0.35 + 0.6 * meadow) continue;
+        float hb = kGrassHeight * (0.35 + 0.65 * CloudHash(vec3(cell, 22.0)));
+        if (y > hb) continue;
+        float u = y / hb;
+        vec2 base = vec2(0.2) + 0.6 * vec2(CloudHash(vec3(cell, 23.0)), CloudHash(vec3(cell, 24.0)));
+        float lean_a = 6.2831853 * CloudHash(vec3(cell, 25.0));
+        vec2 axis = base + vec2(cos(lean_a), sin(lean_a)) * (0.35 * u * u);
+        float width = 0.16 * (1.0 - u);  // in cells
+        vec2 o = g - cell - axis;
+        if (dot(o, o) < width * width) {
+          float shade = mix(0.45, 1.15, u);
+          vec3 tip = mix(vec3(1.0), vec3(1.15, 1.08, 0.8), u * u);
+          color.rgb *= mix(vec3(1.0), shade * tip * (0.85 + 0.3 * CloudHash(vec3(cell, 26.0))),
+                           detail.x * grass_fade);
+          v23.g = 0.7;
+          break;
+        }
       }
     }
     color.rgb *= 1.0 - grime;
@@ -1598,8 +2210,11 @@ void main() {
                   (1.0 - occluded);
     float amb_l = dot(ambient.rgb, lum);
     float share = amb_l / max(sun_l + amb_l, 1e-4);
-    // At most half again the game's ambient, at least a fifth of it.
-    vec3 light = clamp(LightAt(local, dist), vec3(0.2), vec3(1.5));
+    // Between 0.6 and 1.1 times the game's ambient: lower turned the ground
+    // under a plane into a dark stain; higher, bounce rays from shadow onto
+    // cache cells learnt in the sun brightened shadows in moving patches
+    // (the ground looked like water).
+    vec3 light = clamp(LightAt(local, dist, normal), vec3(0.6), vec3(1.1));
     if (debug == 10u) {
       imageStore(scene, ivec2(pixel), vec4(light * 0.5, color.a));
       return;
@@ -1644,9 +2259,12 @@ void main() {
     float fresnel = f0 + (1.0 - f0) * pow(1.0 - facing, 5.0);
     float amount = water_surface ? fresnel * refl_amount.x
                  : fresnel * refl_amount.y * (1.0 - smoothstep(0.1, 0.4, rough));
-    // Ground and floors facing up mirror nothing unless metal (dirt whose
-    // material read smooth reflected planes in red and white patches).
-    if (!water_surface && normal.y > 0.7 && metal < 0.5) amount = 0.0;
+    // Nothing facing up but water mirrors here: dirt whose material read
+    // smooth reflected planes in red and white patches, and the oil decals
+    // under the planes (read as metal) shimmered like water as the colour
+    // cache of the plane above them changed. The game's own reflection
+    // still shows them the sky.
+    if (!water_surface && normal.y > 0.7) amount = 0.0;
     // Metals tint what they reflect with their colour.
     const vec3 lum3 = vec3(0.2126, 0.7152, 0.0722);
     vec3 tint = mix(vec3(1.0), clamp(color.rgb / max(dot(color.rgb, lum3), 1e-3), 0.0, 2.0), metal);
@@ -1764,6 +2382,7 @@ void main() {
   // loses the sunlit share (the light shafts).
   int steps = int(march.y);
   if (steps == 0) {  // no fog (blood only)
+    color.rgb = max(color.rgb + overlay, vec3(0.0));
     imageStore(scene, ivec2(pixel), color);
     return;
   }
@@ -1777,50 +2396,11 @@ void main() {
       color.rgb = color.rgb * (1.0 - c.a) + c.rgb;
     }
   }
-  float dt = len / float(steps);
   vec3 haze = HazeColor(dir);
-  // The densest fog is at the (measured) sea level.
-  float fog_base = (sea.w != 0.0 ? sea.x : camera.y - water.x) + ambient.w;
-  // The game's sky already has its haze: thinner fog in front of it.
-  float density_scale = sky ? water.z : 1.0;
-  float scattered = 0.0;
-  float optical = 0.0;
-  vec3 base[3], delta[3];
-  for (int i = 0; i < 3; ++i) {
-    base[i] = vec3(dot(slices[i * 3], vec4(camera.xyz, 1.0)), dot(slices[i * 3 + 1], vec4(camera.xyz, 1.0)),
-                   dot(slices[i * 3 + 2], vec4(camera.xyz, 1.0)));
-    delta[i] = vec3(dot(slices[i * 3].xyz, dir), dot(slices[i * 3 + 1].xyz, dir),
-                    dot(slices[i * 3 + 2].xyz, dir));
-  }
-  for (int i = 0; i < steps; ++i) {
-    float t = (float(i) + jitter) * dt;
-    float y = camera.y + dir.y * t;
-    float density = density_scale * sun_dir.w * exp(-sun_color.w * max(y - fog_base, 0.0));
-    float vis = SunVisibilityAlong(t, base, delta);
-    float step_optical = density * dt;
-    scattered += exp(-(optical + 0.5 * step_optical)) * step_optical *
-                 (1.0 - strength.x * (1.0 - vis));
-    optical += step_optical;
-  }
-  if (!sky) {
-    // Surfaces never get more haze than the sky in the same direction, so
-    // they fade into it with distance and the horizon has no seam. (Thinning
-    // the whole ray by the surface's distance instead left the sea from
-    // 300 m out less hazy than nearer: a darker band in the distance.)
-    const int kFull = 8;
-    float full_dt = march.x / float(kFull);
-    float full = 0.0;
-    for (int i = 0; i < kFull; ++i) {
-      float y = camera.y + dir.y * (float(i) + 0.5) * full_dt;
-      full += sun_dir.w * exp(-sun_color.w * max(y - fog_base, 0.0)) * full_dt;
-    }
-    float cap = water.z * full;
-    if (optical > cap) {
-      scattered *= (1.0 - exp(-cap)) / max(1.0 - exp(-optical), 1e-6);
-      optical = cap;
-    }
-  }
+  float scattered, optical;
+  if (!HazeAt(local, dist, sky, scattered, optical)) HazeMarch(dir, len, sky, jitter, scattered, optical);
   float transmittance = exp(-optical);
   color.rgb = color.rgb * transmittance + haze * scattered;
+  color.rgb = max(color.rgb + overlay * transmittance, vec3(0.0));
   imageStore(scene, ivec2(pixel), color);
 }

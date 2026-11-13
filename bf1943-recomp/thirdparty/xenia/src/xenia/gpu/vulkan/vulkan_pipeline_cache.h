@@ -543,6 +543,9 @@ class VulkanPipelineCache {
   // VkPipelineCache persistence path.
   std::filesystem::path vk_pipeline_cache_path_;
   std::mutex vk_pipeline_cache_save_mutex_;
+  // bf1943: pipelines made, and how many there were at the last save.
+  std::atomic<uint64_t> bf_pipelines_created_{0};
+  uint64_t bf_pipelines_saved_ = 0;
 };
 
 }  // namespace vulkan

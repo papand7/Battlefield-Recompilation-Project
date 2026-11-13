@@ -60,3 +60,9 @@ add_custom_command(TARGET bfbc1 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BC}/data/pbr_shaders.txt $<TARGET_FILE_DIR:bfbc1>/pbr_shaders.txt)
 add_custom_command(TARGET bfbc1 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${ROOT}/data/fonts $<TARGET_FILE_DIR:bfbc1>/fonts)
+# FSR 3 and DLSS, as bf1943's (bf_fsr3.cc, bf_dlss.cc load them at run time).
+add_custom_command(TARGET bfbc1 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ROOT}/thirdparty/fidelityfx/bin/amd_fidelityfx_loader_vk.dll
+          ${ROOT}/thirdparty/fidelityfx/bin/amd_fidelityfx_upscaler_vk.dll $<TARGET_FILE_DIR:bfbc1>)
+add_custom_command(TARGET bfbc1 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ROOT}/thirdparty/dlss/bin/nvngx_dlss.dll $<TARGET_FILE_DIR:bfbc1>)

@@ -379,11 +379,11 @@ void XeniaInterrupt(uint32_t source, uint32_t cpu) { PostInterrupt(source, 1u <<
 // any, else the clients'. A drop is a hit; a drop to 0 a death, which bursts
 // the body apart when the blow was an explosion (an impulse over 1500) or
 // took 60 or more.
-struct SoldierKind {
-  uint32_t vtable, part, feet;
-};
-constexpr SoldierKind kServerSoldier = {0x82013A40u, 0x820139F0u, 0x180};
-constexpr SoldierKind kClientSoldier = {0x82007518u, 0x820074F0u, 0x5D0};
+// (Each game's layout: rt::g_blood_server / g_blood_client; bf1943's in
+// game_patches.cpp.)
+using SoldierKind = rt::SoldierLayout;
+const SoldierKind& kServerSoldier = rt::g_blood_server;
+const SoldierKind& kClientSoldier = rt::g_blood_client;
 
 bool HealthObject(uint32_t health, const SoldierKind& kind) {
   return Ld32(health - 8) == kind.part && Ld32(health - 16) == 0x00011100u &&
@@ -474,8 +474,8 @@ void HealthWatchThread() {
         // The blow's impulse (the server's only).
         float push[3] = {0.0f, 0.0f, 0.0f};
         float impulse = 0.0f;
-        if (kind == &kServerSoldier) {
-          uint32_t at = s + (h <= 0.0f ? 0x120 : 0x280);
+        if (kind->hit_impulse && kind->death_impulse) {
+          uint32_t at = s + (h <= 0.0f ? kind->death_impulse : kind->hit_impulse);
           float v[3] = {HealthAt(at), HealthAt(at + 4), HealthAt(at + 8)};
           float m = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
           if (std::isfinite(m) && m > 1.0f && m < 1e6f) {
@@ -536,7 +536,7 @@ void InterruptThread() {
       if (g_use_xenia_gpu) xgpu::Vblank();
       St32(kGpuRegs + 0x1951 * 4, 1);  // vblank pending
       St32(kGpuRegs + D1MODE_V_COUNTER * 4, 720);
-      next_vblank += std::chrono::microseconds(1000000 / g_vblank_hz);
+      next_vblank += std::chrono::microseconds(int64_t(1000000 / (g_vblank_hz * g_time_speed)));  // (--speed)
     }
     if (!g_gpu.interrupt_callback) continue;
     for (uint32_t cpu = 0; cpu < 6; ++cpu) {
@@ -722,13 +722,19 @@ GUEST_IMPORT(VdSwap) {
   if (uint32_t changes = ARG32(6)) memset(G(changes), 0, 0x94);
   ++g_gpu.swaps;
   ++g_title_swaps;
-  if (g_max_fps) {
+  FrameSwapped();
+  // In the background (another window in front): its own cap (PC settings).
+  uint32_t max_fps = g_max_fps;
+  // (only a window can be behind another: not a dedicated server's or a bot's,
+  // whose simulation runs a tick a frame and would slow down with it)
+  if (!g_window_focused && g_background_fps && g_use_xenia_gpu && g_present) max_fps = max_fps ? std::min(max_fps, g_background_fps) : g_background_fps;
+  if (max_fps) {
     // Frame cap (--max-fps). The game's own limiter is told "no limit"
     // (game_patches.cpp): with a limit it runs a simulation tick per frame at
     // that rate, and each tick is 1/30 s of game time.
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
-    const auto period = std::chrono::nanoseconds(1000000000 / g_max_fps);
+    const auto period = std::chrono::nanoseconds(1000000000 / max_fps);
     auto now = clock::now();
     if (now > next + period) next = now;  // fell behind: don't catch up
     while ((now = clock::now()) < next) {

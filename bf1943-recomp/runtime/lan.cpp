@@ -6,6 +6,7 @@
 // FixAnyDestination). On the same PC the joiner's ports are offset, as for
 // --bots.
 #include "kernel.h"
+#include "http.h"
 #include "lan.h"
 
 #ifdef _WIN32
@@ -45,6 +46,46 @@ uint16_t kBeaconPort = 19430;  // SetGame
 char g_tag[5] = "BF43";  // a plain array: SetGame may run during static initialization
 std::mutex g_mutex;
 std::vector<Server> g_found;
+std::string g_master = "https://masterserver.dankelsoft.dk/api.php";
+std::atomic<bool> g_publish{false}, g_publishing{false};
+
+// The master's name for this game.
+std::string MasterGame() { return std::string(g_tag) == "BFBC" ? "bfbc1" : "bf1943"; }
+
+std::vector<std::string> Split(const std::string& s, char sep) {
+  std::vector<std::string> out;
+  for (size_t at = 0;;) {
+    size_t e = s.find(sep, at);
+    out.push_back(s.substr(at, e == std::string::npos ? std::string::npos : e - at));
+    if (e == std::string::npos) return out;
+    at = e + 1;
+  }
+}
+
+// The master's list: one server a line, address, port, name, map, players,
+// max, mode, version (tab-separated).
+std::vector<Server> MasterList() {
+  std::vector<Server> out;
+  std::string body;
+  if (g_master.empty()) return out;
+  if (!http::Get(g_master + "?a=list&game=" + MasterGame() + "&format=lines", &body, 4000)) {
+    RT_INFO("lan: the master server did not answer");
+    return out;
+  }
+  for (std::string line : Split(body, '\n')) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    auto f = Split(line, '\t');
+    if (f.size() < 5) continue;
+    in_addr ip{};
+    if (inet_pton(AF_INET, f[0].c_str(), &ip) != 1) continue;
+    Server sv{f[2], f[3], f[0], uint16_t(atoi(f[1].c_str())), -1};
+    for (char& c : sv.map) if (c == ' ') c = '_';  // (the master shows it with spaces)
+    sv.online = true;
+    sv.players = atoi(f[4].c_str());
+    out.push_back(sv);
+  }
+  return out;
+}
 std::atomic<bool> g_browsing{false}, g_beacon{false};
 
 void Beacon() {
@@ -157,6 +198,12 @@ void Refresh() {
       if (!dup) found.push_back(sv);
     }
     closesocket(s);
+    // The internet's games (the master's list), after the network's.
+    for (const Server& sv : MasterList()) {
+      bool dup = false;
+      for (const Server& o : found) dup |= o.address == sv.address && o.port == sv.port;
+      if (!dup) found.push_back(sv);
+    }
     {
       std::lock_guard lock(g_mutex);
       g_found = found;
@@ -180,6 +227,75 @@ void Host(const std::string& map, int bots) {
   if (!g_beacon.exchange(true)) std::thread(Beacon).detach();
   RT_INFO("lan: hosting %s with %d bots", map.c_str(), bots);
   RequestHost();
+  StartPublishing();
+}
+
+// Whether UDP port is free to bind on this PC.
+static bool PortFree(uint16_t port, uint32_t address) {
+#ifdef _WIN32
+  static WSADATA wsa;
+  static bool started = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+  (void)started;
+  SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (s == INVALID_SOCKET) return true;
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(port);
+  a.sin_addr.s_addr = address;
+  bool ok = bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+  closesocket(s);
+  return ok;
+#else
+  (void)port, (void)address;
+  return true;
+#endif
+}
+
+std::wstring HostProblem() {
+  // The game's server binds 0.0.0.0:1003 and 127.0.0.1:1001 (+ the port offset).
+  uint16_t server = uint16_t(1003 + g_port_offset), local = uint16_t(1001 + g_port_offset);
+  if (!PortFree(server, htonl(INADDR_ANY)) || !PortFree(local, htonl(INADDR_LOOPBACK))) {
+    RT_WARN("lan: ports %u/%u are taken, not hosting", local, server);
+    return L"Can't host: the game's network ports (UDP " + std::to_wstring(local) + L"/" +
+           std::to_wstring(server) + L") are in use. Close any other copy of the game, or restart this one.";
+  }
+  return L"";
+}
+
+void SetMaster(const std::string& url) { g_master = url; }
+void SetPublish(bool on) { g_publish = on; }
+bool Publish() { return g_publish; }
+
+void StartPublishing() {
+  if (!g_publish || g_master.empty() || g_publishing.exchange(true)) return;
+  std::thread([] {
+    const uint16_t port = uint16_t(1003 + g_port_offset);
+    bool listed = false, was_in_level = false;
+    auto next = std::chrono::steady_clock::now();
+    for (;;) {
+      bool in_level = !g_in_menus;
+      was_in_level |= in_level;
+      // Back in the menus after a level (the host left): off the list.
+      if (was_in_level && !in_level && !g_dedicated) break;
+      if (in_level && std::chrono::steady_clock::now() >= next) {
+        next = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        std::string body;
+        bool ok = http::Get(g_master + "?a=announce&game=" + MasterGame() + "&port=" + std::to_string(port) +
+                                "&max=24&mode=Conquest&v=pc", &body);
+        bool now_listed = ok && body.find("\"listed\":true") != std::string::npos;
+        if (now_listed != listed || !ok) {
+          // Its reason ("no answer from ...: open UDP port ...") when not listed.
+          RT_INFO("lan: master server: %s", now_listed ? "this game is listed on the internet" : body.c_str());
+        }
+        listed = now_listed;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    std::string body;
+    http::Get(g_master + "?a=remove&game=" + MasterGame() + "&port=" + std::to_string(port), &body);
+    RT_INFO("lan: master server: this game is off the list");
+    g_publishing = false;
+  }).detach();
 }
 
 void StartBeacon() {
@@ -208,8 +324,10 @@ bool PrepareJoin(const std::string& address_port, const std::string& map) {
   RT_INFO("lan: joining %s (%s)%s", address.c_str(), map.c_str(), local ? " on this PC" : "");
   return true;
 }
-void Join(const std::string& address, const std::string& map) {
-  if (PrepareJoin(address, map)) RequestHost();
+bool Join(const std::string& address, const std::string& map) {
+  if (!PrepareJoin(address, map)) return false;
+  RequestHost();
+  return true;
 }
 
 }  // namespace rt::lan

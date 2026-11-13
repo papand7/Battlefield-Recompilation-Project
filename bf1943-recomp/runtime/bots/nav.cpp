@@ -14,6 +14,7 @@
 #include <map>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -347,6 +348,50 @@ int Route(const float a[3], const float b[3], float* corners, int max, Memory* m
   int k = std::min(int(out.size()), max);
   for (int i = 0; i < k; ++i) memcpy(corners + 3 * i, out[size_t(i)].data(), 12);
   return k;
+}
+
+// Whether a soldier can stand there: on the main piece, within 1 m (near height y).
+bool Walkable(float x, float y, float z) {
+  std::lock_guard lock(g_mutex);
+  if (!g_navquery) return true;
+  dtQueryFilter filter;
+  const float ext[3] = {1.0f, 3.0f, 1.0f};
+  float p[3] = {x, y, z}, q[3];
+  dtPolyRef r = 0;
+  g_navquery->findNearestPoly(p, ext, &filter, &r, q);
+  return r && InMainPiece(r) && std::hypot(q[0] - x, q[2] - z) < 1.0f;
+}
+
+// Up to max places r0 to r1 m around `at` on the main piece, one in each of
+// max directions, clockwise from the north.
+int Places(const float at[3], float r0, float r1, float* out, int max) {
+  std::lock_guard lock(g_mutex);
+  if (!g_navquery || max <= 0) return 0;
+  dtQueryFilter filter;
+  const float ext[3] = {2, 4, 2};
+  float onmesh[3];
+  dtPolyRef start = 0;
+  g_navquery->findNearestPoly(at, ext, &filter, &start, onmesh);
+  std::vector<std::array<float, 4>> found;  // angle, x y z
+  std::vector<bool> taken(size_t(max), false);
+  for (int tries = 0; start && tries < 24 * max && int(found.size()) < max; ++tries) {
+    dtPolyRef ref = 0;
+    float pt[3];
+    if (dtStatusFailed(g_navquery->findRandomPointAroundCircle(start, onmesh, r1, &filter,
+                                                               [] { return float(rand()) / RAND_MAX; }, &ref, pt)))
+      break;
+    float d = std::hypot(pt[0] - at[0], pt[2] - at[2]);
+    if (d < r0 || d > r1 || !InMainPiece(ref)) continue;
+    float a = std::atan2(pt[0] - at[0], pt[2] - at[2]);
+    if (a < 0) a += 6.2831853f;
+    int sector = std::min(int(a / 6.2831853f * max), max - 1);
+    if (taken[size_t(sector)]) continue;
+    taken[size_t(sector)] = true;
+    found.push_back({a, pt[0], pt[1], pt[2]});
+  }
+  std::sort(found.begin(), found.end());
+  for (size_t i = 0; i < found.size(); ++i) memcpy(out + 3 * i, &found[i][1], 3 * sizeof(float));
+  return int(found.size());
 }
 
 }  // namespace rt::nav

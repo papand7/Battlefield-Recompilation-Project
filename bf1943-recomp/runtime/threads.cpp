@@ -293,6 +293,9 @@ void DumpGuestThreads() {
 // BF_PROFILE=<seconds> (testing): that long after the start, every guest
 // thread's native stack sampled every 5 ms for 15 s; per thread, its samples
 // and the functions in most of them (inclusive), to see where a slow frame goes.
+// The host's own threads too (the GPU command processor, the presenter,
+// drivers'...), numbered 0x80000000 + their Windows thread id: only the
+// function they are in (drivers' code can lack the unwind data a stack needs).
 const bool g_profile_started = [] {
   const char* e = getenv("BF_PROFILE");
   if (!e) return false;
@@ -304,8 +307,70 @@ const bool g_profile_started = [] {
     std::map<uint32_t, std::pair<std::string, std::map<std::string, int>>> per;
     std::map<uint32_t, int> samples;
     std::map<uint32_t, std::map<std::string, int>> leaf;
+    // The host threads alive now (not the guest ones, not this one).
+    std::vector<std::pair<uint32_t, HANDLE>> host;
+    std::map<uint32_t, std::string> host_names;
+    {
+      std::set<DWORD> guest{GetCurrentThreadId()};
+      {
+        std::lock_guard lock(g_threads_mutex);
+        for (auto& t : g_threads)
+          if (t->host) guest.insert(GetThreadId(t->host));
+      }
+      HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+      THREADENTRY32 te{sizeof(te)};
+      for (BOOL ok = snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || guest.count(te.th32ThreadID)) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+                              te.th32ThreadID);
+        if (!h) continue;
+        std::string name = "host";
+        PWSTR desc = nullptr;
+        if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc) {
+          char n[128];
+          WideCharToMultiByte(CP_UTF8, 0, desc, -1, n, sizeof(n), nullptr, nullptr);
+          if (n[0]) name = n;
+          LocalFree(desc);
+        }
+        uint32_t id = 0x80000000u | te.th32ThreadID;
+        host.push_back({id, h});
+        host_names[id] = name;
+      }
+      if (snap != INVALID_HANDLE_VALUE) ::CloseHandle(snap);
+    }
     auto end = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     while (std::chrono::steady_clock::now() < end) {
+      for (auto& [id, h] : host) {
+        if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) continue;
+        std::string st = "?";
+        // (Symbols looked up after it runs again: a thread stopped holding the
+        // heap's or the loader's lock would deadlock this one.)
+        if (::SuspendThread(h) != DWORD(-1)) {
+          CONTEXT c{};
+          c.ContextFlags = CONTEXT_CONTROL;
+          bool got = ::GetThreadContext(h, &c) != FALSE;
+          ::ResumeThread(h);
+          char buf[sizeof(SYMBOL_INFO) + 256]{};
+          auto* si = reinterpret_cast<SYMBOL_INFO*>(buf);
+          si->SizeOfStruct = sizeof(SYMBOL_INFO);
+          si->MaxNameLen = 255;
+          DWORD64 disp = 0;
+          if (got && SymFromAddr(GetCurrentProcess(), c.Rip, &disp, si)) st = si->Name;
+        }
+        auto& e2 = per[id];
+        e2.first = host_names[id];
+        samples[id]++;
+        std::set<std::string> once;
+        leaf[id][st.substr(0, st.find(" < "))]++;
+        size_t pos = 0;
+        while (pos < st.size()) {
+          size_t q = st.find(" < ", pos);
+          std::string f = st.substr(pos, q == std::string::npos ? std::string::npos : q - pos);
+          if (once.insert(f).second) e2.second[f]++;
+          if (q == std::string::npos) break;
+          pos = q + 3;
+        }
+      }
       std::vector<std::shared_ptr<GuestThread>> threads;
       {
         std::lock_guard lock(g_threads_mutex);
@@ -330,6 +395,7 @@ const bool g_profile_started = [] {
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+    for (auto& [id, h] : host) ::CloseHandle(h);
     for (auto& [id, e2] : per) {
       std::vector<std::pair<int, std::string>> top;
       for (auto& [f, n] : e2.second) top.push_back({n, f});
@@ -493,6 +559,7 @@ GUEST_IMPORT(NtYieldExecution) {
 // high-resolution waitable timer: Sleep() rounds them up to a whole millisecond.
 GUEST_IMPORT(KeDelayExecutionThread) {
   int64_t t = int64_t(Ld64(ARG32(5)));
+  if (g_time_speed != 1.0) t = int64_t(double(t) / g_time_speed);  // (--speed)
   if (t < 0) {
     int64_t us = -t / 10;
     if (us <= 0) {

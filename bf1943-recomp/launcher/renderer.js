@@ -1,10 +1,12 @@
 // Settings rows: [settings key, label, [[button text, value], ...]]
 const rows = [
+  ['display', 'Display', [['Window', 'windowed'], ['Fullscreen', 'fullscreen']]],
   ['window', 'Resolution', [['480p', '854x480'], ['720p', '1280x720'], ['1080p', '1920x1080'],
     ['1440p', '2560x1440'], ['4K', '3840x2160']]],
   ['resolution', 'Render scale', [['1×', '1'], ['2×', '2'], ['3×', '3']]],
-  ['upscaling', 'Upscaling', [['FSR', 'fsr'], ['CAS', 'cas'], ['Off', 'off']]],
-  ['preset', 'Look', [['Stock', 'stock'], ['Enhanced', 'enhanced'], ['Toon', 'toon'], ['Noir', 'noir'], ['WW2', 'ww2']]],
+  ['upscaling', 'Upscaling', [['FSR', 'fsr'], ['FSR 3', 'fsr3'], ['DLSS', 'dlss'], ['Auto', 'auto'], ['CAS', 'cas'], ['Off', 'off']]],
+  ['upscaleQuality', 'Upscale quality', [['Off', 'off'], ['Quality', 'quality'], ['Balanced', 'balanced'], ['Performance', 'performance']]],
+  ['preset', 'Look', [['Stock', 'stock'], ['Enhanced', 'enhanced'], ['Vivid', 'vivid'], ['Toon', 'toon'], ['Noir', 'noir'], ['WW2', 'ww2']]],
   ['frameRate', 'Frame rate', [['60', '60'], ['120', '120'], ['144', '144'], ['Max', '0']]],
 ];
 
@@ -66,7 +68,6 @@ function selectGame(key) {
   document.querySelectorAll('.game').forEach((t) => t.classList.toggle('on', t.dataset.game === key));
   $('year').textContent = key === 'bfbc1' ? 'BAD COMPANY' : '1943';
   $('year').classList.toggle('long', key === 'bfbc1');
-  $('bloodrow').hidden = key === 'bfbc1';  // BF1943 only
   showTextures(key);
   document.title = g.title;
   setStatus(g.error || '', !!g.error);
@@ -83,6 +84,10 @@ const setupText = {
     + 'The game files take about 5 GB.'],
 };
 const foundHint = ' Put them next to the launcher and they are found by themselves.';
+// Linux: build_linux.sh, with the distribution's own packages (installed after asking for the password).
+if (window.launcher.platform === 'linux')
+  document.querySelector('.steps li[data-step="tools"]').lastChild.textContent =
+    'Build tools (your distribution\'s packages: clang, CMake, Vulkan)';
 // Linux: build_linux.sh, with the distribution's own packages (installed after asking for the password).
 if (window.launcher.platform === 'linux')
   document.querySelector('.steps li[data-step="tools"]').lastChild.textContent =
@@ -105,8 +110,12 @@ async function showSetup(key, on) {
     $('barfill').style.width = '0%';
     $('install').textContent = 'INSTALL';
   }
-  $('setuptitle').textContent = setupText[key][0];
-  $('setuphint').innerHTML = setupText[key][1] + foundHint;
+  const rebuild = !!(games[key] && games[key].outdated);
+  $('setuptitle').textContent = rebuild ? setupText[key][0].replace('Set up', 'Update') : setupText[key][0];
+  $('setuphint').innerHTML = rebuild
+    ? 'A new version of the port is installed: the game is built again from your own files (they are kept).'
+    : setupText[key][1] + foundHint;
+  if (rebuild && $('install').textContent === 'INSTALL') $('install').textContent = 'UPDATE';
   $('pick').disabled = false;
   setupState = await window.launcher.setupStatus(key);
   if (!setupState.ok) {
@@ -114,7 +123,7 @@ async function showSetup(key, on) {
     $('pick').disabled = $('install').disabled = true;
     return;
   }
-  setStatus('Set up the game first (right).');
+  setStatus(games[key] && games[key].outdated ? 'Update the game first (right).' : 'Set up the game first (right).');
   // The game's files next to the launcher, unless the player chose others.
   const found = setupState.found;
   if (!gamePath && found && found.path && !setupState.gameFiles) {
@@ -244,8 +253,48 @@ window.launcher.onTexturesEvent(async (ev) => {
 window.addEventListener('focus', () => {
   if (!$('setupcard').hidden && setupGame) showSetup(setupGame, true);
 });
+// The side menu: its pages (home, settings).
+document.querySelectorAll('#nav > button[data-page]').forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll('#nav > button[data-page]').forEach((x) => x.classList.toggle('active', x === b));
+    document.querySelectorAll('.page').forEach((p) => p.classList.toggle('active', p.id === 'page-' + b.dataset.page));
+  };
+});
 $('min').onclick = () => window.launcher.minimize();
 $('close').onclick = () => window.launcher.close();
 $('name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('play').click(); });
 
-init();
+// Updates: the newest release on GitHub, installed by itself (Automatic
+// updates) or with the UPDATE button; the launcher then restarts as the new one.
+async function runUpdate(version) {
+  $('updatebtn').disabled = true;
+  setStatus(`Downloading version ${version}…`);
+  const r = await window.launcher.updateRun();
+  if (r.error) {
+    setStatus(r.error, true);
+    $('updatebtn').disabled = false;
+  } else {
+    setStatus(`Starting version ${version}…`);
+  }
+}
+window.launcher.onUpdateEvent((ev) => {
+  if (ev.progress !== undefined) setStatus(`Downloading the update… ${Math.round(ev.progress * 100)}%`);
+});
+async function checkUpdate() {
+  const u = await window.launcher.updateCheck();
+  if (!u.available) return;
+  $('updatebtn').textContent = `UPDATE TO ${u.version}`;
+  $('updatebtn').title = u.notes || '';
+  $('updatebtn').hidden = false;
+  $('updatebtn').onclick = () => runUpdate(u.version);
+  if (settings.autoUpdate !== false && !setupBusy) runUpdate(u.version);
+}
+$('autoupdate').onchange = () => {
+  settings.autoUpdate = $('autoupdate').checked;
+  window.launcher.saveSettings(settings);
+};
+
+init().then(() => {
+  $('autoupdate').checked = settings.autoUpdate !== false;
+  checkUpdate();
+});

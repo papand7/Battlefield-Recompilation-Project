@@ -1,0 +1,5 @@
+# Batch files with CRLF (cmd's goto finds labels wrongly in LF-only files);
+# shell scripts with LF (bash fails on a CR).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.sh text eol=lf

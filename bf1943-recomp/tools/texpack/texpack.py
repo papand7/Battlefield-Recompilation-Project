@@ -719,6 +719,15 @@ def write_rtex(path, img):
             f.write(np.ascontiguousarray(lv, np.uint8).tobytes())
 
 
+# Kept as the game's own: upscaled, their alpha-tested edges break up into
+# specks that shimmer with every bit of camera sway (the oil puddles under
+# the planes looked like water).
+KEEP_ORIGINAL = ('textures/terrain/quad/oil_puddle',)
+# The terrain's normal maps too: upscaled, they shaded the hills in dark
+# blotches with white specks that slid like water as the view moved.
+KEEP_ORIGINAL_NORMALS = ('terrains/',)
+
+
 def cmd_install(args):
     work, out = args.work, args.out
     pack = os.path.join(work, 'pack')
@@ -741,7 +750,9 @@ def cmd_install(args):
         if e.get('type') == 'texture' and (args.ui or not n.lower().startswith(('menu', 'awards', 'textures/ui', 'ui/'))):
             wanted.setdefault(n, ('texture', os.path.join(pack, e['file'])))
     flt = (args.filter or '').lower()
-    wanted = {n: v for n, v in wanted.items() if flt in n.lower() and index[n]['format'] in REPLACEABLE}
+    wanted = {n: v for n, v in wanted.items() if flt in n.lower() and index[n]['format'] in REPLACEABLE
+              and not n.lower().startswith(KEEP_ORIGINAL)
+              and not (n.lower().startswith(KEEP_ORIGINAL_NORMALS) and n.lower().endswith(('_n.res', '_nm.res')))}
 
     os.makedirs(os.path.join(out, 'rtex'), exist_ok=True)
     lines, done = [], set()
@@ -758,7 +769,11 @@ def cmd_install(args):
             img = np.asarray(Image.open(src).convert('RGBA'))
             if role == 'normal':
                 img = game_normal(img, load_rgba(work, index, name))
-            pbr = args.pbr and fmt in PBR_NORMAL_FORMATS and role in ('normal', 'texture')
+            # Not the terrain's: its shaders are not --pbr ones and read the
+            # blue of its DXT1 normal maps as the normal's z, so roughness
+            # there left dark blotches and glints that slid like water.
+            pbr = (args.pbr and fmt in PBR_NORMAL_FORMATS and role in ('normal', 'texture')
+                   and not name.lower().startswith('terrains/'))
             if pbr and role == 'normal':
                 img = add_pbr_channels(img, os.path.dirname(src))
             elif pbr:

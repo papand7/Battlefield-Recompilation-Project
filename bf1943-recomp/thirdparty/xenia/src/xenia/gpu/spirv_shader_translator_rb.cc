@@ -428,6 +428,9 @@ spv::Id SpirvShaderTranslator::Depth20e4To32(SpirvBuilder& builder,
 }
 
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+  // bf1943: soft particles; FSR 3's pre-HUD frame.
+  EmitSoftParticle();
+  EmitFsrCapture();
   // Loaded if needed.
   spv::Id msaa_samples = spv::NoResult;
 

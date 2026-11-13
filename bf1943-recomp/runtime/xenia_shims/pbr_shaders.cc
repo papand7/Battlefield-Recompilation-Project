@@ -59,12 +59,22 @@ uint32_t ParseConstant(const std::string& s) {
 
 }  // namespace
 
+namespace {
+uint64_t g_table_hash = 0;
+}  // namespace
+
 size_t Load(const std::filesystem::path& file) {
   g_shaders.clear();
   std::ifstream in(file);
   if (!in) {
     XELOGE("pbr: cannot read {}", file.string());
     return 0;
+  }
+  {
+    std::ifstream raw(file, std::ios::binary);
+    uint64_t h = 1469598103934665603ull;
+    for (char c; raw.get(c);) h = (h ^ uint8_t(c)) * 1099511628211ull;
+    g_table_hash = h;
   }
   std::string line;
   while (std::getline(in, line)) {
@@ -82,7 +92,7 @@ size_t Load(const std::filesystem::path& file) {
       Tap* tap = key == "n" ? &c.n : key == "v" ? &c.v : key == "a" ? &c.albedo
                : key == "lit" ? &c.lit : key == "env" ? &c.env
                : key == "so" ? &c.so : key == "ao" ? &c.ao : key == "out" ? &c.out
-               : key == "wp" ? &c.wp : nullptr;
+               : key == "wp" ? &c.wp : key == "tonemap" ? &c.tonemap : nullptr;
       if (tap) ok &= ParseTap(value, *tap);
       else if (key == "rm") c.rm_fetch = uint32_t(std::atoi(value.c_str()));
       else if (key == "env_scale") ok &= ParseScalar(value, c.env_scale);
@@ -110,10 +120,20 @@ size_t Load(const std::filesystem::path& file) {
       else if (key == "sun") c.c_sun = ParseConstant(value);
       else if (key == "cam") c.c_cam = ParseConstant(value);
       else if (key == "pom") c.pom = float(std::atof(value.c_str()));
+      else if (key == "tm_exposure") c.tm_exposure = float(std::atof(value.c_str()));
+      else if (key == "soft") c.soft = float(std::atof(value.c_str()));
+      else if (key == "camv") c.cam_from_buffer = value == "1";
+      else if (key == "pl") c.point_lights = value == "1";
+      else if (key == "tm_saturation") c.tm_saturation = float(std::atof(value.c_str()));
       else ok = false;
     }
-    if (!ok || !c.n.valid() || !c.v.valid() || !c.albedo.valid() ||
-        !c.out.valid() || c.n.count < 3 || c.v.count < 3 || c.albedo.count < 3) {
+    if (ok && !c.out.valid() && (c.soft > 0.0f || (c.tonemap.valid() && c.tonemap.count >= 3))) {
+      g_shaders[hash] = c;
+      continue;
+    }
+    bool v_ok = (c.v.valid() && c.v.count >= 3) || c.cam_from_buffer;
+    if (!ok || !c.n.valid() || !v_ok || !c.albedo.valid() ||
+        !c.out.valid() || c.n.count < 3 || c.albedo.count < 3) {
       XELOGE("pbr: bad line: {}", line);
       continue;
     }
@@ -129,6 +149,21 @@ namespace {
 bool g_material_output = false;
 bool g_game_shadows_off = false;
 }  // namespace
+float g_tonemap = std::getenv("BF_TONEMAP") ? float(std::atof(std::getenv("BF_TONEMAP"))) : 1.0f;
+void SetTonemap(float strength) { g_tonemap = strength; }
+bool g_soft_particles = true;
+void SetSoftParticles(bool on) { g_soft_particles = on; }
+bool SoftParticles() { return g_soft_particles; }
+bool g_fsr_capture = false;
+void SetFsrCapture(bool on) { g_fsr_capture = on; }
+bool FsrCapture() { return g_fsr_capture; }
+float Tonemap() { return g_tonemap; }
+bool Filmic() {
+  if (g_tonemap < 1.0f) return false;
+  for (const auto& [hash, c] : g_shaders)
+    if (c.tonemap.valid()) return true;
+  return false;
+}
 void SetGameShadowsOff(bool off) { g_game_shadows_off = off; }
 bool GameShadowsOff() { return g_game_shadows_off; }
 void SetMaterialOutput(bool on) { g_material_output = on; }
@@ -138,6 +173,17 @@ float g_pom_scale = 1.0f;
 void SetPomScale(float scale) { g_pom_scale = scale; }
 float PomScale() { return g_pom_scale; }
 bool MaterialOutput() { return g_material_output; }
+
+uint64_t TranslationKey() {
+  uint64_t h = g_table_hash ^ 0x9E3779B97F4A7C15ull;
+  auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  uint32_t u;
+  std::memcpy(&u, &g_tonemap, 4), mix(u);
+  std::memcpy(&u, &g_pom_scale, 4), mix(u);
+  mix(uint64_t(g_soft_particles) | uint64_t(g_fsr_capture) << 1 | uint64_t(g_game_shadows_off) << 2 |
+      uint64_t(g_material_output) << 3);
+  return h;
+}
 
 const ShaderConfig* Find(uint64_t pixel_shader_hash) {
   auto it = g_shaders.find(pixel_shader_hash);

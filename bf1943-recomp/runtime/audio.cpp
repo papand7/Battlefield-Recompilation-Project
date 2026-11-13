@@ -118,6 +118,10 @@ struct Client {
 Client g_clients[kMaxClients];
 std::once_flag g_pump_started;
 
+}  // namespace
+void (*rt::g_audio_tick)(PPCContext& ctx) = nullptr;
+namespace {
+
 void PumpThread() {
   PPCContext& ctx = AdoptHostThread("audio driver", 0x10000);
   timeBeginPeriod(1);
@@ -125,7 +129,7 @@ void PumpThread() {
   constexpr auto kFrame = std::chrono::microseconds(5333);  // 256 samples at 48 kHz
   auto next = clock::now();
   for (;;) {
-    next += kFrame;
+    next += kFrame;  // (--speed: still in real time; four times as many mixes slowed the server down 4x)
     auto now = clock::now();
     if (next < now - 20 * kFrame) next = now;  // fell far behind (debugger, load): resync
     std::this_thread::sleep_until(next);
@@ -136,6 +140,7 @@ void PumpThread() {
       // The mixer keeps per-CPU buffers (indexed by KPCR+0x10C), so the callback
       // must run as the hardware thread the client registered from.
       *G<uint8_t>(ctx.r13.u32 + 0x10C) = c.cpu;
+      if (rt::g_audio_tick) rt::g_audio_tick(ctx);
       GuestCall(ctx, c.callback, {c.wrapped_arg});
     }
   }

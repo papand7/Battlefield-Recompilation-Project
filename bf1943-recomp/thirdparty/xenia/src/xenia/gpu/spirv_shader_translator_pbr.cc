@@ -25,6 +25,19 @@ uint32_t SpirvShaderTranslator::GetExtraRegisterCount() {
   if (!is_pixel_shader() || !pbr::Enabled()) return 0;
   const pbr::ShaderConfig* config = pbr::Find(current_shader().ucode_data_hash());
   if (!config) return 0;
+  pbr_tonemap_only_ = !config->out.valid();
+  if (pbr_tonemap_only_) {
+    if (config->soft > 0.0f && pbr::MaterialOutput() && pbr::SoftParticles()) {
+      // A particle shader: the scene depth buffer and the pixel position.
+      pbr_ = config;
+      pbr_need_frag_coord_ = true;
+    } else if (config->tonemap.valid() && (pbr::Tonemap() > 0.0f || pbr::FsrCapture())) {
+      pbr_ = config;
+      // FSR 3: its output into the buffer at the pixel.
+      if (pbr::FsrCapture() && pbr::MaterialOutput()) pbr_need_frag_coord_ = true;
+    }
+    return 0;
+  }
   const Shader::ConstantRegisterMap& map = current_shader().constant_register_map();
   std::vector<uint32_t> constants = {config->c_light, config->c_up, config->c_sky,
                                      config->c_ground, config->c_sun};
@@ -67,7 +80,7 @@ constexpr float kPbrAlphaMin = 189.5f / 255.0f;
 }  // namespace
 
 void SpirvShaderTranslator::ProcessInstructionBegin(uint32_t address) {
-  if (!pbr_) return;
+  if (!pbr_ || pbr_tonemap_only_) return;
   if (!pbr_started_) {
     pbr_started_ = true;
     StorePbrTaps(pbr::kTapAtStart);
@@ -153,8 +166,198 @@ void SpirvShaderTranslator::ProcessInstructionBegin(uint32_t address) {
 
 void SpirvShaderTranslator::ProcessInstructionEnd(uint32_t address) {
   if (!pbr_) return;
+  if (pbr_tonemap_only_) {
+    if (address == pbr_->tonemap.address) EmitTonemap();
+    return;
+  }
   StorePbrTaps(address);
   if (address == pbr_->out.address) EmitPbrLighting();
+}
+
+void SpirvShaderTranslator::EmitFsrCapture() {
+  if (!pbr_ || !pbr_->tonemap.valid() || !pbr::FsrCapture() ||
+      buffer_bf_material_ == spv::NoResult || input_fragment_coordinates_ == spv::NoResult ||
+      output_or_var_fragment_data_[0] == spv::NoResult) {
+    return;
+  }
+  EnsureBuildPointAvailable();
+  SpirvBuilder& b = *builder_;
+  const spv::Id f1 = type_float_, u1 = type_uint_;
+  auto k = [&](float v) { return b.makeFloatConstant(v); };
+  auto ku = [&](uint32_t v) { return b.makeUintConstant(v); };
+  spv::Id frag = b.createLoad(input_fragment_coordinates_, spv::NoPrecision);
+  spv::Id x = b.createUnaryOp(spv::OpConvertFToU, u1, b.createCompositeExtract(frag, f1, 0));
+  spv::Id y = b.createUnaryOp(spv::OpConvertFToU, u1, b.createCompositeExtract(frag, f1, 1));
+  spv::Id inside = b.createBinOp(
+      spv::OpLogicalAnd, type_bool_,
+      b.createBinOp(spv::OpULessThan, type_bool_, x, ku(pbr::kMaterialPitch)),
+      b.createBinOp(spv::OpULessThan, type_bool_, y, ku(pbr::kMaterialRows)));
+  SpirvBuilder::IfBuilder if_inside(inside, spv::SelectionControlDontFlattenMask, b);
+  spv::Id color = b.createLoad(output_or_var_fragment_data_[0], spv::NoPrecision);
+  spv::Id packed = ku(0);
+  for (uint32_t i = 0; i < 4; ++i) {
+    spv::Id c = b.createTriBuiltinCall(f1, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+                                       b.createCompositeExtract(color, f1, i), k(0.0f), k(1.0f));
+    spv::Id byte = b.createUnaryOp(spv::OpConvertFToU, u1,
+                                   b.createBinOp(spv::OpFAdd, f1, b.createBinOp(spv::OpFMul, f1, c, k(255.0f)), k(0.5f)));
+    packed = b.createBinOp(spv::OpBitwiseOr, u1, packed,
+                           b.createBinOp(spv::OpShiftLeftLogical, u1, byte, ku(8 * i)));
+  }
+  id_vector_temp_util_.clear();
+  id_vector_temp_util_.push_back(const_int_0_);
+  id_vector_temp_util_.push_back(b.createUnaryOp(
+      spv::OpBitcast, type_int_,
+      b.createBinOp(spv::OpIAdd, u1, ku(pbr::kMaterialColorOffset),
+                    b.createBinOp(spv::OpIAdd, u1, b.createBinOp(spv::OpIMul, u1, y, ku(pbr::kMaterialPitch)), x))));
+  spv::Id pointer = b.createAccessChain(
+      features_.spirv_version >= spv::Spv_1_3 ? spv::StorageClassStorageBuffer
+                                              : spv::StorageClassUniform,
+      buffer_bf_material_, id_vector_temp_util_);
+  b.createStore(packed, pointer);
+  if_inside.makeEndIf();
+}
+
+void SpirvShaderTranslator::EmitSoftParticle() {
+  if (!pbr_ || pbr_->soft <= 0.0f) return;
+  if (buffer_bf_material_ == spv::NoResult || input_fragment_coordinates_ == spv::NoResult ||
+      output_or_var_fragment_data_[0] == spv::NoResult ||
+      !(current_shader().writes_color_targets() & 0b1)) {
+    XELOGW("pbr: soft particle shader {:016X} left as is (buffer {}, position {}, output {})",
+           current_shader().ucode_data_hash(), buffer_bf_material_ != spv::NoResult,
+           input_fragment_coordinates_ != spv::NoResult,
+           output_or_var_fragment_data_[0] != spv::NoResult);
+    return;
+  }
+  XELOGI("pbr: soft particle shader {:016X}", current_shader().ucode_data_hash());
+  EnsureBuildPointAvailable();
+  SpirvBuilder& b = *builder_;
+  const spv::Id f1 = type_float_, u1 = type_uint_;
+  auto k = [&](float v) { return b.makeFloatConstant(v); };
+  auto ku = [&](uint32_t v) { return b.makeUintConstant(v); };
+  spv::Id frag = b.createLoad(input_fragment_coordinates_, spv::NoPrecision);
+  spv::Id x = b.createUnaryOp(spv::OpConvertFToU, u1, b.createCompositeExtract(frag, f1, 0));
+  spv::Id y = b.createUnaryOp(spv::OpConvertFToU, u1, b.createCompositeExtract(frag, f1, 1));
+  spv::Id inside = b.createBinOp(
+      spv::OpLogicalAnd, type_bool_,
+      b.createBinOp(spv::OpULessThan, type_bool_, x, ku(pbr::kMaterialPitch)),
+      b.createBinOp(spv::OpULessThan, type_bool_, y, ku(pbr::kMaterialRows)));
+  SpirvBuilder::IfBuilder if_inside(inside, spv::SelectionControlDontFlattenMask, b);
+  id_vector_temp_util_.clear();
+  id_vector_temp_util_.push_back(const_int_0_);
+  id_vector_temp_util_.push_back(b.createUnaryOp(
+      spv::OpBitcast, type_int_,
+      b.createBinOp(spv::OpIAdd, u1, ku(pbr::kMaterialDepthOffset),
+                    b.createBinOp(spv::OpIAdd, u1, b.createBinOp(spv::OpIMul, u1, y, ku(pbr::kMaterialPitch)),
+                                  x))));
+  spv::Id pointer = b.createAccessChain(
+      features_.spirv_version >= spv::Spv_1_3 ? spv::StorageClassStorageBuffer
+                                              : spv::StorageClassUniform,
+      buffer_bf_material_, id_vector_temp_util_);
+  spv::Id bits = b.createLoad(pointer, spv::NoPrecision);
+  // Not written this frame (all ones): no fade.
+  spv::Id written = b.createBinOp(spv::OpINotEqual, type_bool_, bits, ku(UINT32_MAX));
+  spv::Id scene_w = b.createUnaryOp(spv::OpBitcast, f1,
+                                    b.createBinOp(spv::OpBitwiseAnd, u1, bits, ku(0xFFFFFF00u)));
+  spv::Id scene_lit = b.createBinOp(
+      spv::OpFMul, f1,
+      b.createUnaryOp(spv::OpConvertUToF, f1, b.createBinOp(spv::OpBitwiseAnd, u1, bits, ku(0xFFu))),
+      k(1.0f / 255.0f));
+  // The particle's clip w: 1 / gl_FragCoord.w.
+  spv::Id particle_w = b.createBinOp(spv::OpFDiv, f1, k(1.0f), b.createCompositeExtract(frag, f1, 3));
+  spv::Id fade = b.createTriBuiltinCall(
+      f1, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+      b.createBinOp(spv::OpFMul, f1, b.createBinOp(spv::OpFSub, f1, scene_w, particle_w),
+                    k(1.0f / pbr_->soft)),
+      k(0.0f), k(1.0f));
+  // Smooth (s-curve), and none where the depth was not written.
+  fade = b.createBinOp(spv::OpFMul, f1, fade,
+                       b.createBinOp(spv::OpFMul, f1, fade,
+                                     b.createBinOp(spv::OpFSub, f1, k(3.0f),
+                                                   b.createBinOp(spv::OpFMul, f1, k(2.0f), fade))));
+  // Only up close (the game draws far geometry in other depth ranges, where
+  // the saved depth means something else: distant sky sprites went black),
+  // and not where the particle would be far behind the scene (it passed the
+  // depth test, so the depth there is not this range's).
+  spv::Id usable = b.createBinOp(
+      spv::OpLogicalAnd, type_bool_, written,
+      b.createBinOp(spv::OpLogicalAnd, type_bool_,
+                    b.createBinOp(spv::OpFOrdLessThan, type_bool_, particle_w, k(200.0f)),
+                    b.createBinOp(spv::OpFOrdGreaterThan, type_bool_, scene_w,
+                                  b.createBinOp(spv::OpFSub, f1, particle_w, k(3.0f)))));
+  fade = b.createTriOp(spv::OpSelect, f1, usable, fade, k(1.0f));
+  // Premultiplied blending (ONE, INV_SRC_ALPHA): colour and alpha both.
+  spv::Id color = b.createLoad(output_or_var_fragment_data_[0], spv::NoPrecision);
+  // Shade: a particle within 3 m of a surface out of the sun is darker (to
+  // half), by how solid it is (smoke and dust; sparks and flashes, drawn with
+  // little alpha, keep their glow).
+  {
+    spv::Id closeness = b.createTriBuiltinCall(
+        f1, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+        b.createBinOp(spv::OpFSub, f1, k(1.0f),
+                      b.createBinOp(spv::OpFMul, f1, b.createBinOp(spv::OpFSub, f1, scene_w, particle_w),
+                                    k(1.0f / 3.0f))),
+        k(0.0f), k(1.0f));
+    spv::Id alpha = b.createCompositeExtract(color, f1, 3);
+    spv::Id amount = b.createBinOp(spv::OpFMul, f1, closeness, b.createTriBuiltinCall(f1, ext_inst_glsl_std_450_, GLSLstd450NClamp, alpha, k(0.0f), k(1.0f)));
+    amount = b.createTriOp(spv::OpSelect, f1, usable, amount, k(0.0f));
+    spv::Id shade = b.createBinOp(spv::OpFAdd, f1, k(1.0f),
+                                  b.createBinOp(spv::OpFMul, f1, amount,
+                                                b.createBinOp(spv::OpFMul, f1, k(0.5f),
+                                                              b.createBinOp(spv::OpFSub, f1, scene_lit, k(1.0f)))));
+    spv::Id rgb_shade = b.createCompositeConstruct(type_float4_, {shade, shade, shade, k(1.0f)});
+    color = b.createBinOp(spv::OpFMul, type_float4_, color, rgb_shade);
+  }
+  color = b.createBinOp(spv::OpVectorTimesScalar, type_float4_, color, fade);
+  static const bool debug = std::getenv("BF_SOFT_DEBUG") != nullptr;
+  if (debug) {
+    // Red: no scene depth there; else green by the fade.
+    color = b.createTriOp(spv::OpSelect, type_float4_, written,
+                          b.createCompositeConstruct(type_float4_, {k(0.0f), fade, k(0.0f), k(1.0f)}),
+                          b.createCompositeConstruct(type_float4_, {k(1.0f), k(0.0f), k(0.0f), k(1.0f)}));
+  }
+  b.createStore(color, output_or_var_fragment_data_[0]);
+  if_inside.makeEndIf();
+}
+
+void SpirvShaderTranslator::EmitTonemap() {
+  // The ACES filmic fit (Narkowicz 2015) on the exposed HDR colour, which the
+  // game would clip at 1: a toe that deepens the shadows, highlights rolled
+  // off towards white instead of flattened.
+  EnsureBuildPointAvailable();
+  SpirvBuilder& b = *builder_;
+  const spv::Id f1 = type_float_;
+  auto k = [&](float v) { return b.makeFloatConstant(v); };
+  auto add = [&](spv::Id x, spv::Id y) { return b.createBinOp(spv::OpFAdd, f1, x, y); };
+  auto mul = [&](spv::Id x, spv::Id y) { return b.createBinOp(spv::OpFMul, f1, x, y); };
+  auto ext3 = [&](int op, spv::Id x, spv::Id y, spv::Id z) {
+    return b.createTriBuiltinCall(f1, ext_inst_glsl_std_450_, op, x, y, z);
+  };
+  const pbr::Tap& t = pbr_->tonemap;
+  id_vector_temp_util_.clear();
+  id_vector_temp_util_.push_back(b.makeIntConstant(int(t.reg)));
+  spv::Id reg = b.createAccessChain(spv::StorageClassFunction, var_main_registers_,
+                                    id_vector_temp_util_);
+  spv::Id v4 = b.createLoad(reg, spv::NoPrecision);
+  const float strength = std::min(pbr::Tonemap(), 1.0f);
+  // Saturation about the luminance (Rec. 709) before the curve.
+  spv::Id rgb[3];
+  for (uint32_t i = 0; i < 3; ++i) rgb[i] = b.createCompositeExtract(v4, f1, t.comps[i]);
+  spv::Id luma = add(add(mul(rgb[0], k(0.2126f)), mul(rgb[1], k(0.7152f))), mul(rgb[2], k(0.0722f)));
+  for (uint32_t i = 0; i < std::min(t.count, 3u); ++i) {
+    spv::Id c = rgb[i];
+    if (pbr_->tm_saturation != 1.0f) {
+      c = ext3(GLSLstd450FMix, luma, c, k(1.0f + (pbr_->tm_saturation - 1.0f) * strength));
+    }
+    spv::Id x = b.createBinBuiltinCall(f1, ext_inst_glsl_std_450_, GLSLstd450FMax,
+                                       mul(c, k(pbr_->tm_exposure)), k(0.0f));
+    spv::Id num = mul(x, add(mul(x, k(2.51f)), k(0.03f)));
+    spv::Id den = add(mul(x, add(mul(x, k(2.43f)), k(0.59f))), k(0.14f));
+    spv::Id curve = ext3(GLSLstd450NClamp, b.createBinOp(spv::OpFDiv, f1, num, den), k(0.0f), k(1.0f));
+    spv::Id clipped = ext3(GLSLstd450NClamp, c, k(0.0f), k(1.0f));
+    spv::Id out = ext3(GLSLstd450FMix, clipped, curve, k(strength));
+    v4 = b.createCompositeInsert(out, v4, type_float4_, t.comps[i]);
+  }
+  b.createStore(v4, reg);
 }
 
 void SpirvShaderTranslator::StorePbrTaps(uint32_t address) {
@@ -467,6 +670,29 @@ void SpirvShaderTranslator::EmitPbrLighting() {
 
   spv::Id n = normalize(tap(0, pbr_->n, 3, 0.0f));
   spv::Id v_raw = tap(1, pbr_->v, 3, 0.0f);
+  // No view vector of its own: the camera (last frame's, from the scene
+  // effects) minus the world position.
+  spv::Id wp_here = spv::NoResult;
+  if (pbr_tap_vars_[7] != spv::NoResult && pbr_->wp.valid()) {
+    spv::Id wp4 = b.createLoad(pbr_tap_vars_[7], spv::NoPrecision);
+    wp_here = b.createCompositeConstruct(
+        f3, {component(wp4, pbr_->wp.comps[0]), component(wp4, pbr_->wp.comps[1]),
+             component(wp4, pbr_->wp.comps[std::min(2u, pbr_->wp.count - 1)])});
+  }
+  if (pbr_->cam_from_buffer && buffer_bf_material_ != spv::NoResult && wp_here != spv::NoResult) {
+    spv::Id cam_c[3];
+    for (uint32_t j = 0; j < 3; ++j) {
+      id_vector_temp_util_.clear();
+      id_vector_temp_util_.push_back(const_int_0_);
+      id_vector_temp_util_.push_back(b.makeIntConstant(int(pbr::kMaterialCameraOffset + j)));
+      spv::Id ptr = b.createAccessChain(
+          features_.spirv_version >= spv::Spv_1_3 ? spv::StorageClassStorageBuffer
+                                                  : spv::StorageClassUniform,
+          buffer_bf_material_, id_vector_temp_util_);
+      cam_c[j] = b.createUnaryOp(spv::OpBitcast, f1, b.createLoad(ptr, spv::NoPrecision));
+    }
+    v_raw = sub(f3, b.createCompositeConstruct(f3, {cam_c[0], cam_c[1], cam_c[2]}), wp_here);
+  }
   spv::Id v = normalize(v_raw);
   spv::Id ao = sat(tap(6, pbr_->ao, 1, 1.0f));
   spv::Id albedo = scale(tap(2, pbr_->albedo, 3, 0.5f), ao);
@@ -635,6 +861,23 @@ void SpirvShaderTranslator::EmitPbrLighting() {
                                                 : k(0.0f)});
   }
 
+  // The shader's point lights (explosions, muzzle flashes): as the game
+  // lights them, the colour over the distance, unshadowed.
+  if (pbr_->point_lights && wp_here != spv::NoResult) {
+    const uint32_t lights[2][2] = {{6, 7}, {9, 8}};
+    for (const auto& lc : lights) {
+      const Shader::ConstantRegisterMap& map = current_shader().constant_register_map();
+      if (map.GetPackedFloatConstantIndex(lc[0]) == UINT32_MAX ||
+          map.GetPackedFloatConstantIndex(lc[1]) == UINT32_MAX) {
+        continue;
+      }
+      spv::Id to_light = sub(f3, constant(lc[0]), wp_here);
+      spv::Id d = ext2(GLSLstd450FMax, f1, ext1(GLSLstd450Length, f1, to_light), k(0.25f));
+      spv::Id l = scale(to_light, div(k(1.0f), d));
+      spv::Id n_l = sat(dot(n, l));
+      color = add(f3, color, scale(mul(f3, albedo, constant(lc[1])), div(n_l, d)));
+    }
+  }
   // Into the game's lit colour register.
   id_vector_temp_util_.clear();
   id_vector_temp_util_.push_back(b.makeIntConstant(int(pbr_->out.reg)));

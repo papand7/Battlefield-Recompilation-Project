@@ -11,6 +11,7 @@
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/shader.h"
 #include "xenia/memory.h"
+#include "xenia/ui/vulkan/vulkan_api.h"
 
 namespace xe {
 namespace gpu {
@@ -35,11 +36,11 @@ struct Capture {
 struct Settings {
   float max_distance = 600.0f;  // metres marched per pixel
   int steps = 32;
-  float density = 0.0018f;      // extinction per metre at the base height
+  float density = 0.0009f;      // extinction per metre at the base height
   float falloff = 1.0f / 80.0f; // 1 / scale height in metres
   float base_height = 0.0f;     // densest fog, metres over the measured sea
   float shafts = 0.6f;          // how much darker shadowed air is (0...1)
-  float sky = 0.35f;            // fog density in front of the sky
+  float sky = 0.1f;            // fog density in front of the sky
   float shadow_bias = 0.002f;
   float eye_height = 20.0f;     // over the sea until the waterline is measured
   // Screen-space sun shadows: every surface pixel marches towards the sun
@@ -54,20 +55,27 @@ struct Settings {
   // queries: the world's meshes cast at any distance, on screen or not.
   float rt = 1.0f;               // 0 off
   float rt_distance = 3000.0f;   // longest ray in metres
+  // The sun's angular radius for the traced shadows (radians, 0: hard): rays
+  // spread over the disc, so shadows sharpen at contact and soften with the
+  // distance to what casts them. About twice the real sun's 0.0047.
+  float sun_size = 0.009f;
   // 1: every sun shadow is drawn here, the game's own are off: the
   // ray-traced meshes and terrain, and the game's shadow map only for what
   // the rays do not have (soldiers, billboards). 0: the game's, plus the
-  // rays'. Key own_shadows. Default 0: redrawn unfiltered, the game's map
-  // shadows came out blocky and dotted at their edges.
-  float shadows = 0.0f;
+  // rays'. Key own_shadows. Default 1 now the rays are soft (sun_size) and
+  // filtered and the destructible buildings are traced; only soldiers and
+  // alpha-tested plants still take the game's map.
+  float shadows = 1.0f;
   // Ray-traced light (with rt): what the world's meshes hit is coloured from
   // a world-space cache of what was seen on screen (cells of rt_cell metres).
   // Sky light and bounce light: rays over each surface's hemisphere, at half
   // resolution, kept over frames, scale the game's ambient share.
   float gi = 1.0f;               // 0 off
+  // Half the half-resolution pixels trace each frame (a checkerboard),
+  // averaged over 48 frames.
   int gi_rays = 2;               // per half-resolution pixel and frame
   float gi_distance = 120.0f;    // longest bounce ray in metres
-  float gi_frames = 24.0f;       // frames a pixel's light is averaged over
+  float gi_frames = 48.0f;       // frames a pixel's light is averaged over
   // Contact shading: what rays hit nearer than this (m) gives back less
   // light than its cell's average (a corner, the underside of a plane right
   // above), 0 off.
@@ -83,7 +91,7 @@ struct Settings {
   float clouds = 0.45f;          // cover 0...1, 0 off
   float cloud_base = 1400.0f;    // metres over the sea
   float cloud_thickness = 1100.0f;
-  int cloud_steps = 32;
+  int cloud_steps = 24;
   float cloud_density = 0.012f;  // extinction per metre in a full cloud
   float cloud_wind = 10.0f;      // metres a second
   float cloud_shadows = 0.85f;   // 0 off, 1 the sun's whole share under a thick cloud
@@ -104,7 +112,7 @@ struct Settings {
   // bare ground (the traced terrain, not grass), grime on everything, more in
   // corners. Fades out where it would be a few pixels.
   float detail = 1.0f;           // strength, 0 off
-  float detail_distance = 60.0f; // metres
+  float detail_distance = 40.0f; // metres
   float pebble_size = 0.09f;     // metres
   float crack_size = 0.7f;       // metres between cracks
   // The muzzle flash's light: the game's lights everything near the gun (its
@@ -138,6 +146,14 @@ bool TakeFresh(Capture& out);
 // so c7 should go to the GPU as zero; the light is then kept for this
 // frame's pass.
 bool TakeOverFlash(const Shader* pixel_shader, const RegisterFile& regs);
+// Between the world's depth copy and the scene resolve (the first-person
+// weapon, sky, sea and particles are drawn then).
+bool AfterDepthCopy();
+// FSR 3's inputs from the scene effects: the saved depth (R32F) and the
+// motion vectors (RG16F, pixels), both at the render size, in the general
+// layout. False until there are some. The views are optional (DLSS).
+bool FsrInputs(VkImage& depth, VkImage& motion, uint32_t& width, uint32_t& height,
+               VkImageView* depth_view = nullptr, VkImageView* motion_view = nullptr);
 
 }  // namespace scenefx
 }  // namespace gpu

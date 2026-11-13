@@ -215,6 +215,24 @@ class DeferredCommandBuffer {
     args.query_count = query_count;
   }
 
+  // bf1943: fn(command buffer, data) when the commands are executed (for code
+  // that records into a real command buffer itself, FSR 3).
+  void CmdBfCallback(void (*fn)(VkCommandBuffer, void*), void* data) {
+    auto& args = *reinterpret_cast<ArgsBfCallback*>(
+        WriteCommand(Command::kBfCallback, sizeof(ArgsBfCallback)));
+    args.fn = fn;
+    args.data = data;
+  }
+
+  void CmdVkWriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
+                           uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
+        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
+    args.stage = stage;
+    args.query_pool = query_pool;
+    args.query = query;
+  }
+
   void CmdClearAttachmentsEmplace(uint32_t attachment_count,
                                   VkClearAttachment*& attachments_out,
                                   uint32_t rect_count,
@@ -506,6 +524,8 @@ class DeferredCommandBuffer {
     kVkEndQuery,
     kVkCopyQueryPoolResults,
     kVkResetQueryPool,
+    kVkWriteTimestamp,
+    kBfCallback,
     kVkBeginConditionalRenderingEXT,
     kVkEndConditionalRenderingEXT,
     kVkClearAttachments,
@@ -613,6 +633,17 @@ class DeferredCommandBuffer {
     VkQueryPool query_pool;
     uint32_t first_query;
     uint32_t query_count;
+  };
+
+  struct ArgsBfCallback {
+    void (*fn)(VkCommandBuffer, void*);
+    void* data;
+  };
+
+  struct ArgsVkWriteTimestamp {
+    VkPipelineStageFlagBits stage;
+    VkQueryPool query_pool;
+    uint32_t query;
   };
 
   struct ArgsVkClearAttachments {

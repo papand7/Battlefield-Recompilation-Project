@@ -17,6 +17,10 @@ void SetOptions(int anisotropic, uint32_t texture_memory_mb, const char* shader_
 void SetDisplayOptions(int resolution_scale, int effect, int window_width, int window_height, int shadowmap);
 // The look of the final frame, HUD included (0 the game's, 1 toon, 2 noir).
 void SetLook(int look);
+// BRIGHTNESS (-0.3...0.3) and GAMMA (0.7...1.3) of the final frame (live).
+void SetPicture(float brightness, float gamma);
+// VSync: the swapchain waits for the screen's refresh (from its next creation).
+void SetVsync(bool on);
 // HDR10 output where the display has it (Windows HDR on), before Start: the
 // game's white and the highlights' peak in nits.
 void SetHdr(bool on, float paper_white, float peak);
@@ -24,9 +28,21 @@ void SetHdr(bool on, float paper_white, float peak);
 void SetHdrStretch(bool on);
 // The PC settings page: an RGBA8 image over the whole window (null: none).
 void SetOverlay(const uint8_t* rgba, uint32_t width, uint32_t height);
+// A small RGBA panel in the window's top-left corner (the FPS counter), its
+// size in pixels at 1080 lines (scaled with the window); null hides it.
+void SetCornerOverlay(const uint8_t* rgba, uint32_t width, uint32_t height);
 // HDR output: the nits of the frame's white now (0 for SDR), and setting it.
 float HdrWhite();
 void SetHdrWhite(float nits);
+// Borderless fullscreen on the window's monitor (or windowed); before the
+// window opens it applies when it does. Alt+Enter toggles it too.
+void SetFullscreen(bool on);
+bool IsFullscreen();
+int FullscreenToggles();  // Alt+Enter presses so far (the setting follows them)
+// Our explosion smoke and debris (PC settings: EXPLOSION SMOKE).
+void SetExplosionEffects(bool on);
+// Soft particles in the game's particle shaders (translated from now on).
+void SetSoftParticles(bool on);
 // The scene effects' settings again ("key=value,..."), if they are on.
 void ApplySceneFx(const char* settings);
 // The eye (world position) of the level view now; false if none drawn lately.
@@ -34,8 +50,7 @@ bool CameraEye(float out[3]);
 // The front end menu's rows in the last frame (gpu/vulkan/bf_menu.h): up to max
 // boxes {x0, y0, x1, y1} (0-1 of the frame, y down), top to bottom, and the
 // highlighted one's index (-1 if no highlighted list is on screen).
-int MenuRows(float (*rows)[4], int max, int* selected);
-// A UI atlas cell holding the Back key icon (pc_ui.cpp), and whether the
+int MenuRows(float (*rows)[4], int max, int* selected);// A UI atlas cell holding the Back key icon (pc_ui.cpp), and whether the
 // point (0-1 of the frame) is on a Back prompt drawn in the last frame.
 void AddBackIcon(uint32_t physical, uint32_t width, uint32_t height, float u0, float v0,
                  float u1, float v1);
@@ -45,6 +60,8 @@ bool OnBackPrompt(float x, float y);
 // scratch: guest physical memory for the index lists of bodies that came apart.
 void SetGore(bool on, uint32_t scratch_physical, uint32_t scratch_size);
 void GoreHit(const float feet[3], float damage);
+// An explosion at pos (world): smoke, dust and debris.
+void ExplosionAt(const float pos[3]);
 // push: the direction of the killing blow (0 if unknown).
 void GoreDeath(const float feet[3], float damage, bool gib, const float push[3]);
 bool Running();
@@ -68,6 +85,8 @@ bool CaptureFrame(const char* png_path, FrameStats* stats);
 
 // Audio: Xenia's XMA decoder (FFmpeg xmaframes) and XAudio2 output (apu_bridge.cc).
 namespace rt::xapu {
+// The output's volume (0...1): the master volume, 0 muted in the background.
+void SetOutputVolume(float volume);
 // alloc_physical returns guest physical-heap memory (for the XMA context array).
 bool Start(uint8_t* guest_base, uint32_t (*alloc_physical)(uint32_t size, uint32_t align));
 uint32_t ContextArray();

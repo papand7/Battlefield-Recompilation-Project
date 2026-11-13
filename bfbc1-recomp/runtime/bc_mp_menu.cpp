@@ -9,6 +9,7 @@
 #include "lan.h"
 #include "xenia_bridge.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -18,13 +19,18 @@
 #include <windows.h>
 #include <Xinput.h>
 #include <objidl.h>
+#else
+#include "posix_gdiplus.h"  // (Linux: GDI+, the keys of the game's window)
+#endif
 
 #include <algorithm>
+#ifdef _WIN32
 namespace Gdiplus {
 using std::max;
 using std::min;
 }  // namespace Gdiplus
 #include <gdiplus.h>
+#endif
 
 #include "bc_mp_menu.h"
 
@@ -40,7 +46,9 @@ using std::min;
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
 #pragma comment(lib, "gdiplus.lib")
+#endif
 
 namespace rt::bcmp {
 namespace {
@@ -263,13 +271,30 @@ constexpr float kPromptY = 952;
 
 float RowTop(int i, int n) { return kRowBottom - (n - i) * kRowH; }
 
+// A circle's outline and a pie wedge, as paths (Linux's GDI+ stand-in draws
+// paths; it has no DrawEllipse or FillPie).
+void DrawCircle(Graphics& g, Pen& pen, const RectF& box) {
+  GraphicsPath path;
+  path.AddArc(box.X, box.Y, box.Width, box.Height, 0.0f, 360.0f);
+  path.CloseFigure();
+  g.DrawPath(&pen, &path);
+}
+void FillWedge(Graphics& g, Brush& brush, const RectF& box, float start, float sweep) {
+  GraphicsPath path;
+  float cx = box.X + box.Width / 2, cy = box.Y + box.Height / 2;
+  path.AddLine(cx, cy, cx + box.Width / 2 * std::cos(start * 3.14159265f / 180), cy + box.Height / 2 * std::sin(start * 3.14159265f / 180));
+  path.AddArc(box.X, box.Y, box.Width, box.Height, start, sweep);
+  path.CloseFigure();
+  g.FillPath(&brush, &path);
+}
+
 void DrawPrompt(Graphics& g, float x, wchar_t letter, Color color, const std::wstring& label, bool enabled) {
   BYTE alpha = enabled ? 255 : 90;
   Color c(alpha, color.GetR(), color.GetG(), color.GetB());
   SolidBrush dark(Color(alpha, 22, 22, 22));
   Pen ring(c, 3.5f);
   g.FillEllipse(&dark, x, kPromptY - 21, 42.0f, 42.0f);
-  g.DrawEllipse(&ring, x, kPromptY - 21, 42.0f, 42.0f);
+  DrawCircle(g, ring, RectF(x, kPromptY - 21, 42.0f, 42.0f));
   Font f(g_fonts.bold.get(), 28, FontStyleRegular, UnitPixel);
   SolidBrush lb(c);
   std::wstring l(1, letter);
@@ -286,10 +311,10 @@ void DrawSpinner(Graphics& g, float cx, float cy, float r, double now) {
   Pen ring(Color(255, 240, 240, 240), 3.0f);
   float start = float(std::fmod(now * 240.0, 360.0));
   RectF box(cx - r, cy - r, 2 * r, 2 * r);
-  g.FillEllipse(&black, box);
-  g.FillPie(&white, box, start, 90);
-  g.FillPie(&white, box, start + 180, 90);
-  g.DrawEllipse(&ring, box);
+  g.FillEllipse(&black, box.X, box.Y, box.Width, box.Height);
+  FillWedge(g, white, box, start, 90);
+  FillWedge(g, white, box, start + 180, 90);
+  DrawCircle(g, ring, box);
 }
 
 struct Anim {
@@ -334,7 +359,7 @@ void Draw(Graphics& g, const View& v, Anim& anim, double now, float dt,
     SolidBrush white(Color(255, 240, 240, 240));
     Text(g, v.busy_head, hf, white, box.X + 26, box.Y + 26, 3);
     Text(g, v.busy_text, bf, white, box.X + 26, box.Y + 76, 3);
-    DrawSpinner(g, box.GetRight() - 70, box.GetBottom() - 70, 34, now);
+    DrawSpinner(g, box.X + box.Width - 70, box.Y + box.Height - 70, 34, now);
     return;
   }
 
@@ -444,7 +469,9 @@ void RenderThread() {
       g.SetSmoothingMode(SmoothingModeAntiAlias);
       g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
       g.SetCompositingQuality(CompositingQualityHighQuality);
+#ifdef _WIN32
       g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+#endif
       Draw(g, v, anim, now, dt, titles);
     }
     // To RGBA, through the HDR curve when the output is HDR10 (as pc_menu.cpp).
@@ -699,10 +726,14 @@ void DoOpen() {
 }
 
 bool OurWindowInFront() {
+#ifdef _WIN32
   HWND w = GetForegroundWindow();
   DWORD pid = 0;
   GetWindowThreadProcessId(w, &pid);
   return pid == GetCurrentProcessId();
+#else
+  return true;  // (Linux: the keys come from the game's window only)
+#endif
 }
 
 }  // namespace
@@ -800,7 +831,7 @@ bool Update(const XINPUT_GAMEPAD& pad) {
     for (int vk = 8; vk < 256; ++vk) {
       if (!pressed[vk] || g_address.size() >= 21) continue;
       if (vk >= '0' && vk <= '9' && !shift) g_address += char(vk);
-      else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) g_address += char('0' + vk - VK_NUMPAD0);
+      else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD0 + 9) g_address += char('0' + vk - VK_NUMPAD0);
       else if (vk == VK_OEM_PERIOD || vk == VK_DECIMAL) g_address += '.';
       else if (vk == VK_OEM_1 && shift) g_address += ':';
     }

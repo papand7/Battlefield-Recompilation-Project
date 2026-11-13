@@ -264,6 +264,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
                                     bool keep_dynamic_blend_constants = false,
                                     bool keep_dynamic_stencil_mask_ref = false);
   void BindExternalComputePipeline(VkPipeline pipeline);
+  // bf1943: after code that bound its own compute pipeline (FSR 3).
+  void ForgetExternalComputePipeline() { current_external_compute_pipeline_ = VK_NULL_HANDLE; }
   void SetViewport(const VkViewport& viewport);
   void SetScissor(const VkRect2D& scissor);
 

@@ -4,6 +4,8 @@
 // Output: Xenia's XAudio2 driver, one per registered render client.
 #include "../xenia_bridge.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -37,6 +39,7 @@ struct Client {
   // Opening and closing (the guest's render driver calls) against the pump
   // thread's TakeFrameSlot / SubmitFrame: no frame for an output being closed.
   std::mutex lock;
+  float applied_volume = -1;  // (the output's own: a new one gets the volume again)
   std::unique_ptr<xe::threading::Semaphore> semaphore;
 #ifdef _WIN32
   std::unique_ptr<xe::apu::xaudio2::XAudio2AudioDriver> driver;
@@ -191,6 +194,7 @@ int OpenClient() {
     Client& cl = g_clients[i];
     std::lock_guard l(cl.lock);
     if (cl.driver) continue;
+    cl.applied_volume = -1;
     cl.semaphore = xe::threading::Semaphore::Create(kQueuedFrames, kQueuedFrames);
 #ifdef _WIN32
     cl.driver = std::make_unique<xe::apu::xaudio2::XAudio2AudioDriver>(cl.semaphore.get());
@@ -234,8 +238,8 @@ bool TakeFrameSlot(int index) {
   if (index < 0 || index >= kMaxClients) return false;
   std::lock_guard l(g_clients[index].lock);
 #if !defined(_WIN32) && defined(BF1943_CLIENT)
-  // Room while under kQueuedFrames' worth... kept to 8 frames (43 ms): the
-  // stream's queue is the device's latency.
+  // Room while fewer than 8 frames (43 ms) wait: the stream's queue is the
+  // device's latency.
   constexpr int kFrameBytes = 256 * 6 * 4;
   auto& d = g_clients[index].driver;
   return d && SDL_GetAudioStreamQueued(d->s) < 8 * kFrameBytes;
@@ -244,15 +248,23 @@ bool TakeFrameSlot(int index) {
   return sem && xe::threading::Wait(sem.get(), false, std::chrono::milliseconds(0)) ==
                     xe::threading::WaitResult::kSuccess;
 }
+std::atomic<float> g_output_volume{1.0f};
+void SetOutputVolume(float volume) { g_output_volume = std::clamp(volume, 0.0f, 1.0f); }
 void SubmitFrame(int index, uint32_t samples) {
   if (index < 0 || index >= kMaxClients) return;
   Client& cl = g_clients[index];
   std::lock_guard l(cl.lock);
 #ifdef _WIN32
-  if (cl.driver) cl.driver->SubmitFrame(reinterpret_cast<float*>(Ptr(samples)));
+  if (cl.driver) {
+    float v = g_output_volume;
+    if (cl.applied_volume != v) cl.applied_volume = v, cl.driver->SetVolume(v);
+    cl.driver->SubmitFrame(reinterpret_cast<float*>(Ptr(samples)));
+  }
 #elif defined(BF1943_CLIENT)
   if (cl.driver) {
     SDL_AudioStream* stream = cl.driver->s;
+    float v = g_output_volume;
+    if (cl.applied_volume != v) cl.applied_volume = v, SDL_SetAudioStreamGain(stream, v);
     // The guest's frame: 6 channels one after another, 256 big-endian floats
     // each -> interleaved, host order.
     const uint32_t* in = reinterpret_cast<const uint32_t*>(Ptr(samples));

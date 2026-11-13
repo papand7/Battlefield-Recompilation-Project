@@ -1,4 +1,5 @@
 #include "xenia/gpu/vulkan/scene_fx.h"
+#include "xenia/gpu/vulkan/bf_fsr3.h"
 #include "pbr_shaders.h"
 
 #include <algorithm>
@@ -30,6 +31,13 @@ namespace scenefx {
 namespace {
 Capture latest;
 bool fresh = false;
+// A lit draw of a farther depth slice, for frames with none in the nearest
+// (looking up or into the distance): the same camera and shadow constants;
+// the depth mapping stays the nearest slice's, as last seen.
+Capture latest_far;
+bool fresh_far = false;
+bool have_near = false;
+float near_z_scale = 1.0f, near_z_offset = 0.0f;
 
 // A lit main-view vertex shader: position from c12-c15, world position from
 // c16-c18 and the three shadow slice coordinates from c0-c10.
@@ -75,6 +83,69 @@ struct FlashLight {
   bool seen = false;
   float pos[3] = {}, color[3] = {};
 } flash;
+// Point lights drawn this frame away from the player's gun (other soldiers'
+// muzzle flashes, explosions), and those followed over frames: each new one
+// puffs gun smoke, one that stays lit at the same place is an explosion
+// (dust and debris, bf_gore.h AddEffect).
+struct SeenLight {
+  float pos[3], lum;
+};
+std::vector<SeenLight> frame_lights;
+struct TrackedLight {
+  float pos[3];
+  std::chrono::steady_clock::time_point first, last;
+  float max_lum = 0.0f;
+  bool exploded = false;
+};
+std::vector<TrackedLight> tracked_lights;
+void StepLights() {
+  // Gun smoke and explosions guessed from the game's lights only with
+  // BF_PARTICLE_LIGHTS (bullet hits light up too and took big clouds);
+  // explosions come from the game's explosion entities instead.
+  static const bool on = std::getenv("BF_PARTICLE_LIGHTS") != nullptr;
+  // BF_PARTICLES=1 forces them on (else the PC setting, EXPLOSION SMOKE).
+  static const bool effects_on = [] {
+    const char* e = std::getenv("BF_PARTICLES");
+    return e && e[0] == '1';
+  }();
+  static const bool log = std::getenv("BF_FX_LOG") != nullptr;
+  if (effects_on) bflook::effects = true;
+  auto now = std::chrono::steady_clock::now();
+  for (const SeenLight& l : frame_lights) {
+    TrackedLight* t = nullptr;
+    for (TrackedLight& x : tracked_lights) {
+      float dx = x.pos[0] - l.pos[0], dy = x.pos[1] - l.pos[1], dz = x.pos[2] - l.pos[2];
+      if (dx * dx + dy * dy + dz * dz < 1.5f * 1.5f) t = &x;
+    }
+    if (!t) {
+      TrackedLight n;
+      std::memcpy(n.pos, l.pos, sizeof(n.pos));
+      n.first = n.last = now;
+      tracked_lights.push_back(n);
+      t = &tracked_lights.back();
+      if (on) bflook::AddEffect(0, l.pos);
+    }
+    t->last = now;
+    t->max_lum = std::max(t->max_lum, l.lum);
+    if (!t->exploded && now - t->first > std::chrono::milliseconds(350)) {
+      t->exploded = true;
+      if (on) bflook::AddEffect(1, t->pos);
+      if (log) XELOGI("fx: explosion at {:.1f} {:.1f} {:.1f}, light {:.2f}", t->pos[0], t->pos[1], t->pos[2], t->max_lum);
+    }
+  }
+  frame_lights.clear();
+  for (auto it = tracked_lights.begin(); it != tracked_lights.end();) {
+    if (now - it->last > std::chrono::milliseconds(150)) {
+      if (log) {
+        XELOGI("fx: light at {:.1f} {:.1f} {:.1f} for {} ms, light {:.2f}", it->pos[0], it->pos[1], it->pos[2],
+               std::chrono::duration_cast<std::chrono::milliseconds>(it->last - it->first).count(), it->max_lum);
+      }
+      it = tracked_lights.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
 // Between the world depth copy and the scene resolve: the first-person
 // weapon, sky and particles.
 bool after_depth_copy = false;
@@ -133,6 +204,7 @@ Settings ParseSettings(const char* text_in) {
     else if (key == "shadow_map") s.ss_map = v;
     else if (key == "rt") s.rt = v;
     else if (key == "rt_distance") s.rt_distance = v;
+    else if (key == "sun_size") s.sun_size = std::max(v, 0.0f);
     else if (key == "gi") s.gi = v;
     else if (key == "gi_rays") s.gi_rays = std::clamp(int(v), 1, 16);
     else if (key == "gi_distance") s.gi_distance = v;
@@ -288,6 +360,22 @@ struct Pipeline {
   VkDeviceMemory refract_memory = VK_NULL_HANDLE;
   VkImageView refract_view = VK_NULL_HANDLE;
   bool refract_initialized = false;
+  // FSR 3's motion vectors (pass 9).
+  VkImage motion = VK_NULL_HANDLE;
+  VkDeviceMemory motion_memory = VK_NULL_HANDLE;
+  VkImageView motion_view = VK_NULL_HANDLE;
+  bool motion_initialized = false;
+  uint32_t motion_width = 0, motion_height = 0;
+  // The world's colour at the depth copy, before the game's particles.
+  VkImage world_color = VK_NULL_HANDLE;
+  VkDeviceMemory world_color_memory = VK_NULL_HANDLE;
+  VkImageView world_color_view = VK_NULL_HANDLE;
+  bool world_color_initialized = false;
+  // The haze at half resolution (pass 8).
+  VkImage haze = VK_NULL_HANDLE;
+  VkDeviceMemory haze_memory = VK_NULL_HANDLE;
+  VkImageView haze_view = VK_NULL_HANDLE;
+  bool haze_initialized = false;
   // Last frame's camera, for the light kept over frames.
   bool have_prev = false;
   float prev_view_proj[16] = {};
@@ -309,7 +397,7 @@ bool CreateStorageImage(const ui::vulkan::VulkanDevice* device, VkFormat format,
   image_info.arrayLayers = 1;
   image_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  image_info.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+  image_info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;  // sampled: FSR 3 reads some
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(
           device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
@@ -332,15 +420,25 @@ bool CreateSavedDepth(const ui::vulkan::VulkanDevice* device, uint32_t width,
     return false;
   vk.saved_width = width;
   vk.saved_height = height;
-  if (!CreateStorageImage(device, VK_FORMAT_R16G16B16A16_SFLOAT, (width + 1) / 2,
-                          (height + 1) / 2, vk.clouds, vk.clouds_memory, vk.clouds_view))
+  if (!CreateStorageImage(device, VK_FORMAT_R16G16B16A16_SFLOAT, (width + 3) / 4,
+                          (height + 3) / 4, vk.clouds, vk.clouds_memory, vk.clouds_view))
     return false;
-  if (!CreateStorageImage(device, VK_FORMAT_R16G16_SFLOAT, (width + 1) / 2,
+  if (!CreateStorageImage(device, VK_FORMAT_R16G16B16A16_SFLOAT, (width + 1) / 2,
                           (height + 1) / 2, vk.ao, vk.ao_memory, vk.ao_view))
     return false;
   if (!CreateStorageImage(device, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, vk.refract,
                           vk.refract_memory, vk.refract_view))
     return false;
+  if (!CreateStorageImage(device, VK_FORMAT_R16G16B16A16_SFLOAT, (width + 1) / 2,
+                          (height + 1) / 2, vk.haze, vk.haze_memory, vk.haze_view))
+    return false;
+  if (!CreateStorageImage(device, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, vk.world_color,
+                          vk.world_color_memory, vk.world_color_view))
+    return false;
+  if (!CreateStorageImage(device, VK_FORMAT_R16G16_SFLOAT, width, height, vk.motion,
+                          vk.motion_memory, vk.motion_view))
+    return false;
+  vk.motion_width = width, vk.motion_height = height;
   if (!vk.rt) return true;
   for (int i = 0; i < 2; ++i) {
     if (!CreateStorageImage(device, VK_FORMAT_R16G16B16A16_SFLOAT, (width + 1) / 2,
@@ -354,20 +452,36 @@ bool CreateSavedDepth(const ui::vulkan::VulkanDevice* device, uint32_t width,
   return true;
 }
 
-// Bindings 0-5, 14 (the clouds), 15 (the ambient occlusion) and 16 (the
-// refracted scene) always; 6-13
+// Bindings 0-5, 14 (the clouds), 15 (the ambient occlusion), 16 (the
+// refracted scene) and 17 (the half-resolution haze) always; 6-13
 // in the ray query variant: the TLAS, the triangle normals, the colour cache,
 // the light read (last frame's) and written, their distances read and
 // written, the --pbr materials (pbr::MaterialOutput).
-constexpr uint32_t kBindings = 17;
+constexpr uint32_t kBindings = 20;
+
+// BF_FX_TIMING: the GPU time of each step from timestamps (kSlots frames in a
+// ring, read back without waiting), logged every 120 frames. Ticks taken as
+// nanoseconds (NVIDIA's timestamp period).
+constexpr uint32_t kStamps = 10;
+struct Timing {
+  VkQueryPool pool = VK_NULL_HANDLE;
+  bool tried = false;
+  bool written[8] = {};
+  double sum[kStamps] = {};
+  uint32_t frames = 0;
+} timing;
 constexpr uint32_t kCloudBinding = 14;
 constexpr uint32_t kAoBinding = 15;
 constexpr uint32_t kRefractBinding = 16;
+constexpr uint32_t kHazeBinding = 17;
+constexpr uint32_t kWorldColorBinding = 18;
+constexpr uint32_t kMotionBinding = 19;
 // The bindings a variant has, in order.
 uint32_t BindingList(uint32_t out[kBindings]) {
   uint32_t n = 0;
   for (uint32_t i = 0; i < kBindings; ++i) {
-    if (vk.rt || i < 6 || i == kCloudBinding || i == kAoBinding || i == kRefractBinding)
+    if (vk.rt || i < 6 || i == kCloudBinding || i == kAoBinding || i == kRefractBinding ||
+        i == kHazeBinding || i == kWorldColorBinding || i == kMotionBinding)
       out[n++] = i;
   }
   return n;
@@ -381,7 +495,9 @@ const VkDescriptorType kBindingTypes[kBindings] = {
     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
 
 bool CreatePipeline(const ui::vulkan::VulkanDevice* device) {
   const auto& dfn = device->functions();
@@ -532,7 +648,7 @@ void CaptureDraw(const Shader* vertex_shader, const Shader* pixel_shader,
     UpdateEye(reinterpret_cast<const float*>(
         &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]));
   }
-  if (!(fx || bflook::gore) || !vertex_shader || !pixel_shader ||
+  if (!(fx || bflook::gore || bflook::effects) || !vertex_shader || !pixel_shader ||
       !depth_target || !color_target) {
     return;
   }
@@ -549,12 +665,27 @@ void CaptureDraw(const Shader* vertex_shader, const Shader* pixel_shader,
   // The scene depth is described by the nearest slice's draws (the
   // first-person weapon is drawn after the depth copy).
   float z_scale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE);
-  if (std::abs(z_scale) < 0.5f) return;
   if (!IsLitVertexShader(vertex_shader)) return;
   const auto* f = reinterpret_cast<const float*>(
       &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+  if (std::abs(z_scale) < 0.5f) {
+    if (!fx || fresh) return;
+    Capture& c = latest_far;
+    std::memcpy(c.vs, f, sizeof(c.vs));
+    std::memcpy(c.ps, f + 256 * 4, sizeof(c.ps));
+    std::memcpy(c.tf0, &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(c.tf0));
+    c.viewport_z_scale = near_z_scale;
+    c.viewport_z_offset = near_z_offset;
+    c.depth_target = depth_target;
+    c.color_target = color_target;
+    c.vs_hash = vertex_shader->ucode_data_hash();
+    c.slices_world = SlicesTakeWorld(vertex_shader);
+    c.ps_hash = pixel_shader->ucode_data_hash();
+    fresh_far = have_near;
+    return;
+  }
   // The camera for blood on hit (bf_gore.h).
-  if (bflook::gore) {
+  if (bflook::gore || bflook::effects) {
     bflook::SetCamera(reinterpret_cast<const float(*)[4]>(f));
   }
   if (!fx) return;
@@ -565,6 +696,9 @@ void CaptureDraw(const Shader* vertex_shader, const Shader* pixel_shader,
               sizeof(c.tf0));
   c.viewport_z_scale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE);
   c.viewport_z_offset = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET);
+  near_z_scale = c.viewport_z_scale;
+  near_z_offset = c.viewport_z_offset;
+  have_near = true;
   c.depth_target = depth_target;
   c.color_target = color_target;
   c.vs_hash = vertex_shader->ucode_data_hash();
@@ -582,18 +716,61 @@ bool TakeOverFlash(const Shader* pixel_shader, const RegisterFile& regs) {
       &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X]);
   const float* pos = c + 6 * 4;
   float dx = pos[0] - flash_eye[0], dy = pos[1] - flash_eye[1], dz = pos[2] - flash_eye[2];
-  // Only a light at the gun (explosions and others stay the game's).
-  if (dx * dx + dy * dy + dz * dz > 4.0f * 4.0f) return false;
+  // Only a light at the gun (explosions and others stay the game's, and
+  // make smoke and dust).
+  if (dx * dx + dy * dy + dz * dz > 4.0f * 4.0f) {
+    const float* col = c + 7 * 4;
+    float lum = 0.2126f * col[0] + 0.7152f * col[1] + 0.0722f * col[2];
+    bool known = false;
+    for (const SeenLight& l : frame_lights)
+      known |= std::abs(l.pos[0] - pos[0]) + std::abs(l.pos[1] - pos[1]) + std::abs(l.pos[2] - pos[2]) < 0.5f;
+    if (!known && frame_lights.size() < 64) frame_lights.push_back({{pos[0], pos[1], pos[2]}, lum});
+    return false;
+  }
+  // BF_FX_OWN: the player's own gun smokes too (testing the smoke).
+  static const bool own_smoke = std::getenv("BF_FX_OWN") != nullptr;
+  if (own_smoke && frame_lights.size() < 64 &&
+      (frame_lights.empty() || std::abs(frame_lights.back().pos[0] - pos[0]) > 0.5f)) {
+    frame_lights.push_back({{pos[0], pos[1], pos[2]}, 0.0f});
+  }
   flash.seen = true;
   std::memcpy(flash.pos, pos, sizeof(flash.pos));
   std::memcpy(flash.color, c + 7 * 4, sizeof(flash.color));
   return true;
 }
 
+bool AfterDepthCopy() { return after_depth_copy; }
+
+bool FsrInputs(VkImage& depth, VkImage& motion, uint32_t& width, uint32_t& height,
+               VkImageView* depth_view, VkImageView* motion_view) {
+  if (!vk.motion_initialized || !vk.saved_depth) return false;
+  if (depth_view) *depth_view = vk.saved_depth_view;
+  if (motion_view) *motion_view = vk.motion_view;
+  depth = vk.saved_depth;
+  motion = vk.motion;
+  width = vk.motion_width;
+  height = vk.motion_height;
+  return true;
+}
+
 bool TakeFresh(Capture& out) {
-  if (!fresh) return false;
-  fresh = false;
-  out = latest;
+  // Frames with no lit world draw at all (mostly sky) keep the last capture
+  // for a while, so the look does not switch off as the view turns.
+  static Capture last;
+  static int last_age = 1000;
+  if (fresh) {
+    out = latest;
+  } else if (fresh_far) {
+    out = latest_far;
+  } else if (++last_age <= 30) {
+    out = last;
+    return true;
+  } else {
+    return false;
+  }
+  fresh = fresh_far = false;
+  last = out;
+  last_age = 0;
   return true;
 }
 
@@ -627,12 +804,29 @@ void VulkanRenderTargetCache::ApplySceneFx(
     return;
   }
   Capture cap;
+  // Frames left without the effects, by reason, logged every 2 s when any
+  // (the look switching off at some view angles).
+  static uint32_t skipped[8] = {}, applied = 0;
+  static auto skip_log = std::chrono::steady_clock::now();
+  auto skip = [&](int why) {
+    ++skipped[why];
+    auto now = std::chrono::steady_clock::now();
+    if (now - skip_log > std::chrono::seconds(2)) {
+      skip_log = now;
+      XELOGI("scenefx: skipped (2 s): no fresh capture {}, no depth pass {}, rectangles {}, "
+             "targets {}, shadow map {}; applied {}",
+             skipped[0], skipped[1], skipped[2], skipped[3], skipped[4], applied);
+      std::fill(std::begin(skipped), std::end(skipped), 0u);
+      applied = 0;
+    }
+  };
   if (save_pass) {
     // Only the frame's first copy: the game copies the depth again after the
     // weapon is drawn.
-    if (pending.valid || !TakeFresh(cap)) return;
+    if (pending.valid) return;
+    if (!TakeFresh(cap)) return skip(0);
   } else {
-    if (!pending.valid) return;
+    if (!pending.valid) return skip(1);
     cap = pending.cap;
   }
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
@@ -640,7 +834,7 @@ void VulkanRenderTargetCache::ApplySceneFx(
   if (dump_rectangles_.size() != 1 ||
       dump_rectangles_[0].render_target !=
           (save_pass ? cap.depth_target : cap.color_target)) {
-    return;
+    return skip(2);
   }
   pending.valid = false;
   if (!save_pass) rt::ResumeRecording();
@@ -659,7 +853,7 @@ void VulkanRenderTargetCache::ApplySceneFx(
       color_key.msaa_samples != xenos::MsaaSamples::k1X ||
       depth_key.msaa_samples != xenos::MsaaSamples::k1X ||
       depth_key.pitch_tiles_at_32bpp != color_key.pitch_tiles_at_32bpp) {
-    return;
+    return skip(3);
   }
 
   // The shadow map: three stacked 24_8 slices in guest memory.
@@ -669,8 +863,9 @@ void VulkanRenderTargetCache::ApplySceneFx(
   if (tf.format != xenos::TextureFormat::k_24_8 || !tf.tiled || !tf.stacked ||
       tf.size_2d.stack_depth + 1 < 3 || slice_size != tf.size_2d.height + 1 ||
       (slice_size & 31) || (tf.pitch << 5) != slice_size) {
-    return;
+    return skip(4);
   }
+  if (!save_pass) ++applied;
   VkDeviceSize shadow_base = VkDeviceSize(tf.base_address) << 12;
   VkDeviceSize slice_bytes = VkDeviceSize(slice_size) * slice_size * 4;
 
@@ -752,13 +947,23 @@ void VulkanRenderTargetCache::ApplySceneFx(
   for (int r = 0; r < 4; ++r)
     for (int c = 0; c < 4; ++c)
       p.view_proj[c * 4 + r] = float(vp[r][c]);
+  // BF_FOV_LOG: the camera's field of view (from the rows' lengths: x and y
+  // scales over w's), now and then.
+  static const bool fov_log = getenv("BF_FOV_LOG") != nullptr;
+  if (fov_log && (vk.frame % 240) == 0) {
+    auto len = [&](int r) { return std::sqrt(vp[r][0] * vp[r][0] + vp[r][1] * vp[r][1] + vp[r][2] * vp[r][2]); };
+    double w = len(3);
+    XELOGI("scenefx: fov {:.1f} x {:.1f} degrees", 2.0 * std::atan(w / len(0)) * 57.29578,
+           2.0 * std::atan(w / len(1)) * 57.29578);
+  }
   p.ss[0] = s.ss_strength;
   p.ss[1] = s.ss_length;
-  p.ss[2] = float(s.ss_steps);
+  p.ss[2] = float(bffsr::enabled && bffsr::active ? std::max(8, s.ss_steps / 2) : s.ss_steps);
   p.ss[3] = s.ss_thickness;
   p.rt[0] = vk.rt ? 1.0f : 0.0f;
   p.rt[1] = s.rt_distance;
   p.rt[2] = float(vk.rt_instances);
+  p.rt[3] = s.sun_size;
   for (int r = 0; r < 4; ++r)
     for (int c = 0; c < 4; ++c)
       p.inv_view_proj[c * 4 + r] = float(r < 3 ? inv_vp[r][c] - eye[r] * inv_vp[3][c] : inv_vp[r][c]);
@@ -820,7 +1025,11 @@ void VulkanRenderTargetCache::ApplySceneFx(
   p.screen[3] = 1.0f / float(height);
   p.march[0] = s.max_distance;
   p.march[1] = float(s.steps);
-  p.march[3] = float(vk.frame & 63);
+  p.march[2] = s.steps > 0 ? 1.0f : 0.0f;  // the half-resolution haze (pass 8) is there
+  // Under DLSS / FSR 3 (+64: the shader's Temporal()): half the steps.
+  const bool temporal = bffsr::enabled && bffsr::active;
+  p.march[3] = float(vk.frame & 63) + (temporal ? 64.0f : 0.0f);
+  if (temporal && s.steps > 0) p.march[1] = float(std::max(8, s.steps / 2));
   p.strength[0] = s.shafts;
   p.strength[1] = s.ss_map;
   p.strength[2] = s.shadow_bias;
@@ -865,7 +1074,8 @@ void VulkanRenderTargetCache::ApplySceneFx(
   p.water[0] = s.eye_height;
   p.water[1] = zs < 0.0 ? 1.0f : 0.0f;
   p.water[2] = s.sky;
-  if (!save_pass && bflook::gore) {
+  if (!save_pass) StepLights();
+  if (!save_pass && (bflook::gore || bflook::effects)) {
     p.gore_info[0] = float(bflook::BuildGore(p.gore, kGoreMax));
     p.gore_info[1] = 0.35f;  // brightness of the blood in the air
   }
@@ -896,10 +1106,9 @@ void VulkanRenderTargetCache::ApplySceneFx(
   VkDescriptorBufferInfo cache_info = {vk.cache, 0, kCacheSize};
   // Without materials the cache stands in (and gloss is 0).
   VkBuffer materials = command_processor_.bf_material_buffer();
-  const VkDeviceSize materials_size =
-      VkDeviceSize(pbr::kMaterialPitch) * pbr::kMaterialRows * 4;
+  const VkDeviceSize materials_size = VkDeviceSize(pbr::kMaterialBufferBytes);
   VkDescriptorBufferInfo material_info = {materials ? materials : vk.cache, 0,
-                                          materials ? materials_size : kCacheSize};
+                                          materials ? VkDeviceSize(pbr::kMaterialBufferAllocBytes) : kCacheSize};
   // This frame writes one of the two light images and reads the other.
   uint32_t write_light = vk.light_parity, read_light = vk.light_parity ^ 1;
   VkDescriptorImageInfo light_infos[4] = {
@@ -913,6 +1122,10 @@ void VulkanRenderTargetCache::ApplySceneFx(
   VkDescriptorImageInfo ao_info = {VK_NULL_HANDLE, vk.ao_view, VK_IMAGE_LAYOUT_GENERAL};
   VkDescriptorImageInfo refract_info = {VK_NULL_HANDLE, vk.refract_view,
                                         VK_IMAGE_LAYOUT_GENERAL};
+  VkDescriptorImageInfo haze_info = {VK_NULL_HANDLE, vk.haze_view, VK_IMAGE_LAYOUT_GENERAL};
+  VkDescriptorImageInfo world_color_info = {VK_NULL_HANDLE, vk.world_color_view,
+                                            VK_IMAGE_LAYOUT_GENERAL};
+  VkDescriptorImageInfo motion_info = {VK_NULL_HANDLE, vk.motion_view, VK_IMAGE_LAYOUT_GENERAL};
   // Indexed by binding, then packed in the variant's order.
   VkWriteDescriptorSet writes[kBindings] = {};
   for (uint32_t i = 0; i < kBindings; ++i) {
@@ -925,6 +1138,9 @@ void VulkanRenderTargetCache::ApplySceneFx(
   writes[kCloudBinding].pImageInfo = &clouds_info;
   writes[kAoBinding].pImageInfo = &ao_info;
   writes[kRefractBinding].pImageInfo = &refract_info;
+  writes[kHazeBinding].pImageInfo = &haze_info;
+  writes[kWorldColorBinding].pImageInfo = &world_color_info;
+  writes[kMotionBinding].pImageInfo = &motion_info;
   writes[7].pBufferInfo = &normals_info;
   writes[8].pBufferInfo = &cache_info;
   for (int i = 0; i < 4; ++i) writes[9 + i].pImageInfo = &light_infos[i];
@@ -997,6 +1213,24 @@ void VulkanRenderTargetCache::ApplySceneFx(
       vk.refract_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
       VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
   vk.refract_initialized = true;
+  command_processor_.PushImageMemoryBarrier(
+      vk.haze, ui::vulkan::util::InitializeSubresourceRange(),
+      vk.haze_initialized ? stage : 0, stage, vk.haze_initialized ? rw : 0, rw,
+      vk.haze_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+  vk.haze_initialized = true;
+  command_processor_.PushImageMemoryBarrier(
+      vk.world_color, ui::vulkan::util::InitializeSubresourceRange(),
+      vk.world_color_initialized ? stage : 0, stage, vk.world_color_initialized ? rw : 0, rw,
+      vk.world_color_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+  vk.world_color_initialized = true;
+  command_processor_.PushImageMemoryBarrier(
+      vk.motion, ui::vulkan::util::InitializeSubresourceRange(),
+      vk.motion_initialized ? stage : 0, stage, vk.motion_initialized ? rw : 0, rw,
+      vk.motion_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+      VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+  vk.motion_initialized = true;
   if (vk.rt) {
     // The light images stay in the general layout (undefined the first time:
     // its history is not used then, prev_camera.w is 0).
@@ -1046,10 +1280,57 @@ void VulkanRenderTargetCache::ApplySceneFx(
     }
   }
   command_processor_.SubmitBarriers(true);
+  static const bool timing_on = std::getenv("BF_FX_TIMING") != nullptr;
+  const uint32_t ring = uint32_t(vk.frame % 8);
+  auto stamp = [&](uint32_t i) {
+    if (timing.pool) {
+      cb.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, timing.pool, ring * kStamps + i);
+    }
+  };
+  if (timing_on && save_pass) {
+    const auto& tdfn = device->functions();
+    if (!timing.tried) {
+      timing.tried = true;
+      VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      qi.queryCount = 8 * kStamps;
+      if (tdfn.vkCreateQueryPool(device->device(), &qi, nullptr, &timing.pool) != VK_SUCCESS) {
+        timing.pool = VK_NULL_HANDLE;
+      }
+    }
+    if (timing.pool && timing.written[ring]) {
+      uint64_t t[kStamps];
+      if (tdfn.vkGetQueryPoolResults(device->device(), timing.pool, ring * kStamps, kStamps,
+                                     sizeof(t), t, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) ==
+          VK_SUCCESS) {
+        // 0-1 the acceleration structures, 1-2 the game's draws between the
+        // depth copy and the resolve, then each pass.
+        for (uint32_t i = 0; i + 1 < kStamps; ++i) timing.sum[i] += double(t[i + 1] - t[i]) * 1e-6;
+        if (++timing.frames == 120) {
+          static const char* const kNames[kStamps - 1] = {"bvh", "game", "horizon", "gi", "clouds",
+                                                          "ao", "haze", "water", "main"};
+          std::string line;
+          for (uint32_t i = 0; i + 1 < kStamps; ++i) {
+            line += fmt::format(" {} {:.2f}", kNames[i], timing.sum[i] / 120.0);
+            timing.sum[i] = 0.0;
+          }
+          XELOGI("scenefx timing (ms):{}", line);
+          timing.frames = 0;
+        }
+      }
+    }
+    if (timing.pool) {
+      cb.CmdVkResetQueryPool(timing.pool, ring * kStamps, kStamps);
+      timing.written[ring] = true;
+    }
+  }
+  if (save_pass) stamp(0);
   // The world's acceleration structures, for this frame's fog pass.
   if (save_pass && vk.rt) {
     vk.rt_instances = rt::BuildFrame(command_processor_, cap.depth_target, vp, world_from_clip);
   }
+  if (save_pass) stamp(1);
+  if (!save_pass) stamp(2);
 
   command_processor_.BindExternalComputePipeline(vk.pipeline);
   cb.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, vk.layout, 0, 1,
@@ -1061,6 +1342,12 @@ void VulkanRenderTargetCache::ApplySceneFx(
   };
   if (save_pass) {
     dispatch(0, (width + 7) / 8, (height + 7) / 8);
+    if (vk.rt && materials) {
+      // The scene depth for the soft particles drawn next.
+      command_processor_.PushBufferMemoryBarrier(
+          materials, 0, materials_size, stage, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+          VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
   } else {
     // Measure the horizon colour (each screen column in its own workgroup,
     // then the azimuth bins), then fog towards it.
@@ -1072,31 +1359,48 @@ void VulkanRenderTargetCache::ApplySceneFx(
     dispatch(2, 1, 1);
     cb.CmdVkPipelineBarrier(stage, stage, 0, 1, &barrier, 0, nullptr, 0,
                             nullptr);
+    stamp(3);
     if (traced_light) {
       // The ray-traced light at half resolution, then everything else.
       dispatch(4, ((width + 1) / 2 + 7) / 8, ((height + 1) / 2 + 7) / 8);
       cb.CmdVkPipelineBarrier(stage, stage, 0, 1, &barrier, 0, nullptr, 0,
                               nullptr);
     }
+    stamp(4);
     if (s.clouds > 0.0f) {
-      // The clouds at half resolution.
-      dispatch(5, ((width + 1) / 2 + 7) / 8, ((height + 1) / 2 + 7) / 8);
+      // The clouds at quarter resolution.
+      dispatch(5, ((width + 3) / 4 + 7) / 8, ((height + 3) / 4 + 7) / 8);
       cb.CmdVkPipelineBarrier(stage, stage, 0, 1, &barrier, 0, nullptr, 0,
                               nullptr);
     }
+    stamp(5);
     if (s.ao > 0.0f) {
       // The ambient occlusion at half resolution.
       dispatch(6, ((width + 1) / 2 + 7) / 8, ((height + 1) / 2 + 7) / 8);
       cb.CmdVkPipelineBarrier(stage, stage, 0, 1, &barrier, 0, nullptr, 0,
                               nullptr);
     }
+    stamp(6);
+    if (s.steps > 0) {
+      // The haze at half resolution.
+      dispatch(8, ((width + 1) / 2 + 7) / 8, ((height + 1) / 2 + 7) / 8);
+      cb.CmdVkPipelineBarrier(stage, stage, 0, 1, &barrier, 0, nullptr, 0,
+                              nullptr);
+    }
+    stamp(7);
     if (s.water_refract > 0.0f) {
       // What is seen through the sea, bent, into a copy pass 1 reads.
       dispatch(7, (width + 7) / 8, (height + 7) / 8);
       cb.CmdVkPipelineBarrier(stage, stage, 0, 1, &barrier, 0, nullptr, 0,
                               nullptr);
     }
+    stamp(8);
     dispatch(1, (width + 7) / 8, (height + 7) / 8);
+    stamp(9);
+    if (bffsr::enabled) {
+      // FSR 3's motion vectors.
+      dispatch(9, (width + 7) / 8, (height + 7) / 8);
+    }
     if (vk.rt && materials) {
       // Cleared for the next frame's draws.
       command_processor_.PushBufferMemoryBarrier(
@@ -1121,6 +1425,17 @@ void VulkanRenderTargetCache::ApplySceneFx(
     if (traced_light) {
       vk.light_initialized = true;
       vk.light_parity ^= 1;
+    }
+  }
+  // BF_EYE_LOG: the eye every quarter second (wall clock), for speed tests.
+  {
+    static const bool eye_log = getenv("BF_EYE_LOG") != nullptr;
+    static auto last = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (eye_log && !save_pass && now - last >= std::chrono::milliseconds(250)) {
+      last = now;
+      XELOGI("eye: {:.3f} {:.2f} {:.2f} {:.2f}",
+             std::chrono::duration<double>(now.time_since_epoch()).count(), eye[0], eye[1], eye[2]);
     }
   }
   static int eye_logs = 0;

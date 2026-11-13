@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "xenia/ui/vulkan/vulkan_instance.h"
@@ -20,6 +21,11 @@
 namespace xe {
 namespace ui {
 namespace vulkan {
+
+// bf1943: more device extensions to enable where supported (DLSS asks for
+// its own), set before the device is created.
+inline std::vector<std::string> (*bf_extra_device_extensions)(VkInstance instance,
+                                                              VkPhysicalDevice physical_device) = nullptr;
 
 class VulkanDevice {
  public:

@@ -75,19 +75,52 @@ uint32_t ResolveVariableImport(const char* module, const char* name, uint32_t or
   return a;
 }
 
+// The guest's clocks at --speed: from when first read, g_time_speed times as
+// fast as the host's.
+uint64_t GuestFileTime() {
+  static const uint64_t ft0 = [] {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+  }();
+  static const double g0 = GuestSeconds();
+  return ft0 + uint64_t((GuestSeconds() - g0) * 1e7);
+}
+uint64_t GuestTickCount64() {
+  static const uint64_t ms0 = GetTickCount64();
+  static const double g0 = GuestSeconds();
+  return ms0 + uint64_t((GuestSeconds() - g0) * 1000.0);
+}
+
+// --speed: g_time_speed_target once a level has loaded (open 20 s, no file
+// opened for 8 s), 1x from the next level's open (its load) on.
+static void SpeedControl() {
+  if (g_time_speed_target == 1.0) return;
+  int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+  static int64_t fast_since = 0;
+  int64_t level = g_level_open_ms.load();
+  if (g_time_speed != 1.0) {
+    if (g_in_menus || level > fast_since) SetTimeSpeed(1.0);
+  } else if (!g_in_menus && level && now - level > 20000 && now - g_file_open_ms.load() > 8000) {
+    fast_since = now;
+    SetTimeSpeed(g_time_speed_target);
+  }
+}
+
 void StartKernelServices() {
   std::thread([] {
     SetThreadDescription(GetCurrentThread(), L"kernel timestamp");
     auto start = std::chrono::steady_clock::now();
     for (;;) {
       if (g_timestamp_bundle) {
-        auto up = std::chrono::steady_clock::now() - start;
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
+        auto up = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(GuestSeconds()));
         St64(g_timestamp_bundle + 0, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(up).count() / 100));
-        St64(g_timestamp_bundle + 8, (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);
+        St64(g_timestamp_bundle + 8, GuestFileTime());
         St32(g_timestamp_bundle + 16, uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(up).count()));
       }
+      static int tick = 0;
+      if (++tick % 250 == 0) SpeedControl();
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }).detach();
@@ -580,9 +613,7 @@ GUEST_IMPORT(HalReturnToFirmware) {
 // ---- time ---------------------------------------------------------------------------
 GUEST_IMPORT(KeQueryPerformanceFrequency) { RETURN(kGuestTimebase); }
 GUEST_IMPORT(KeQuerySystemTime) {
-  FILETIME ft;
-  GetSystemTimeAsFileTime(&ft);
-  St64(ARG32(3), (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);
+  St64(ARG32(3), GuestFileTime());
   RETURN(0);
 }
 

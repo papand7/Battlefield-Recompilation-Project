@@ -263,16 +263,22 @@ uint64_t frame = 0;
 uint32_t decoded_this_frame = 0;
 bool recording = true;  // off from the depth copy to the scene resolve
 
-// The terrain: one heightmap, as tiles of kTerrainTile cells each way.
+// The terrain: every heightmap patch drawn (the level's and the coarser ones
+// around it), each as tiles of kTerrainTile cells each way. One slot for all
+// of them rebuilt the big one whenever a small one was drawn, so the traced
+// world mostly had a patch of distant terrain in it and no island.
 constexpr uint32_t kTerrainTile = 128;
+// Patches not drawn for this many frames are dropped (another level).
+constexpr uint64_t kTerrainKeepFrames = 600;
 struct Terrain {
   uint32_t base = 0, width = 0, height = 0, pitch = 0, endian = 0;
   // world x = sx * texel x + ox, z likewise, y = sy * value + oy.
   float sx = 0, ox = 0, sz = 0, oz = 0, sy = 0, oy = 0;
   uint64_t sample = 0;
-  uint64_t checked_frame = 0;
+  uint64_t checked_frame = 0, seen_frame = 0;
   std::vector<uint32_t> tiles;  // mesh ids
-} terrain;
+};
+std::vector<Terrain> terrains;
 uint64_t total_triangles = 0;
 // Draws left out, by reason (logged with the frame stats).
 uint32_t skipped_alpha = 0, skipped_kill = 0, skipped_position = 0,
@@ -574,8 +580,13 @@ const PositionFetch& GetPositionFetch(const Shader& shader) {
     } else {
       // (a, b, c) taken as (b, c, a), from the fetch as it is.
       int a = SwizzleIndex(end[1]), b = SwizzleIndex(end[2]), c = SwizzleIndex(end[3]);
+      // Nothing may change the source before the select (which itself may
+      // write it: `cndeq r1, c255.xxxy, r1.zxyy, c255.yyyy`, the destructible
+      // buildings).
+      size_t select_line = d.rfind(char(10), s);
+      select_line = select_line == std::string::npos ? 0 : select_line;
       if (end[0] != '.' || a < 0 || b < 0 || c < 0 || std::strncmp(end + 5, ", c255.yyyy", 11) ||
-          AluWrites(d, reg, s)) {
+          AluWrites(d, reg, select_line)) {
         return reject("other cndeq");
       }
       pf.reg_components[0] = uint8_t(b);
@@ -681,7 +692,9 @@ const AlphaSource& GetAlphaSource(const Shader& vertex_shader, const Shader& pix
   };
   // The pixel shader's first fetch writing w (all four components, or one
   // into w) from two components of an untouched interpolator, past the
-  // shadow map's point-sampled ones.
+  // shadow map's point-sampled ones. (Alpha written as the constant 1 is
+  // left out too: those are the ground decals, which traced shadowed the
+  // ground they lie on.)
   const std::string& p = pixel_shader.ucode_disassembly();
   static const char kFetch[] = "tfetch2D r";
   uint32_t interpolator = UINT32_MAX;
@@ -693,6 +706,14 @@ const AlphaSource& GetAlphaSource(const Shader& vertex_shader, const Shader& pix
     std::strtoul(p.c_str() + f + sizeof(kFetch) - 1, &e, 10);
     int texel = 3;  // the texel component written to w
     if (!std::strncmp(e, ".___", 4)) {
+      texel = SwizzleIndex(e[4]);
+      e += 5;
+    } else if (std::getenv("BF_RT_GRASS") && e[0] == '.' && SwizzleIndex(e[1]) >= 0 &&
+               SwizzleIndex(e[2]) >= 0 && SwizzleIndex(e[3]) >= 0 && SwizzleIndex(e[4]) >= 0) {
+      // All four written in another order (`tfetch2D r1.yxzw`): w gets the
+      // texel's component named last. Only with BF_RT_GRASS: that is the
+      // grass, thousands of alpha-tested blades that took the frame rate
+      // below 5.
       texel = SwizzleIndex(e[4]);
       e += 5;
     }
@@ -1147,7 +1168,7 @@ bool IsTerrainVertexShader(const Shader& vertex_shader) {
 }
 
 namespace {
-uint64_t SampleTerrain(Memory& memory) {
+uint64_t SampleTerrain(const Terrain& terrain, Memory& memory) {
   const uint8_t* data = memory.TranslatePhysical(terrain.base);
   uint64_t h = 14695981039346656037ull;
   for (uint32_t y = 0; y < terrain.height; y += 64) {
@@ -1157,7 +1178,7 @@ uint64_t SampleTerrain(Memory& memory) {
 }
 
 // Builds the terrain's tiles: every step-th texel, triangles facing up.
-void BuildTerrain(Memory& memory) {
+void BuildTerrain(Terrain& terrain, Memory& memory) {
   for (uint32_t id : terrain.tiles) Retire(id);
   terrain.tiles.clear();
   static const uint32_t step = [] {
@@ -1251,25 +1272,38 @@ void RecordTerrain(const RegisterFile& regs, Memory& memory) {
   t.sy = scale[1];
   t.oy = offset[1];
   auto close = [](float a, float b) { return std::abs(a - b) <= 0.01f + 1e-4f * std::abs(a); };
-  bool same = t.base == terrain.base && t.width == terrain.width && t.height == terrain.height &&
-              t.pitch == terrain.pitch && close(t.sx, terrain.sx) && close(t.ox, terrain.ox) &&
-              close(t.sz, terrain.sz) && close(t.oz, terrain.oz) && close(t.sy, terrain.sy) &&
-              close(t.oy, terrain.oy);
-  if (same) {
+  auto same = [&](const Terrain& o) {
+    return t.base == o.base && t.width == o.width && t.height == o.height &&
+           t.pitch == o.pitch && close(t.sx, o.sx) && close(t.ox, o.ox) && close(t.sz, o.sz) &&
+           close(t.oz, o.oz) && close(t.sy, o.sy) && close(t.oy, o.oy);
+  };
+  // Patches no longer drawn.
+  for (auto it = terrains.begin(); it != terrains.end();) {
+    if (frame - it->seen_frame > kTerrainKeepFrames) {
+      for (uint32_t id : it->tiles) Retire(id);
+      it = terrains.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  auto found = std::find_if(terrains.begin(), terrains.end(), same);
+  if (found != terrains.end()) {
+    Terrain& terrain = *found;
+    terrain.seen_frame = frame;
     // Changed heights (another level in the same memory): checked now and then.
     if (frame - terrain.checked_frame < 120) return;
     terrain.checked_frame = frame;
-    uint64_t sample = SampleTerrain(memory);
+    uint64_t sample = SampleTerrain(terrain, memory);
     if (sample == terrain.sample) return;
     terrain.sample = sample;
-  } else {
-    if (t.pitch < t.width || t.width < 2 || t.height < 2) return;
-    t.tiles = std::move(terrain.tiles);
-    terrain = std::move(t);
-    terrain.checked_frame = frame;
-    terrain.sample = SampleTerrain(memory);
+    BuildTerrain(terrain, memory);
+    return;
   }
-  BuildTerrain(memory);
+  if (t.pitch < t.width || t.width < 2 || t.height < 2) return;
+  Terrain& terrain = terrains.emplace_back(std::move(t));
+  terrain.checked_frame = terrain.seen_frame = frame;
+  terrain.sample = SampleTerrain(terrain, memory);
+  BuildTerrain(terrain, memory);
 }
 
 namespace {
@@ -1352,6 +1386,17 @@ void RecordDraw(const Shader& vertex_shader, const Shader& pixel_shader,
   if ((colorcontrol.alpha_test_enable &&
        colorcontrol.alpha_func != xenos::CompareFunction::kAlways) ||
       colorcontrol.alpha_to_mask_enable) {
+    // Decals (oil stains, scorch marks) lie on the ground they mark: traced,
+    // the ground under them shadowed itself in a dark, speckled stain. They
+    // write no depth, or are pushed towards the camera by a polygon offset.
+    // Only alpha-tested draws: solid ground meshes (Guadalcanal's airfield)
+    // use a polygon offset too, and left out of the traced world, ground at
+    // the sea's height was taken for the sea (waves and reflections in shade).
+    if (!regs.Get<reg::RB_DEPTHCONTROL>().z_write_enable ||
+        regs.Get<reg::PA_SU_SC_MODE_CNTL>().poly_offset_front_enable) {
+      ++skipped_alpha;
+      return;
+    }
     alpha = &GetAlphaSource(vertex_shader, pixel_shader);
     if (alpha->ok && alpha->fetch_constant == pf.fetch_constant) {
       mask = GetMask(regs, alpha->texture, alpha->texel_component, memory);
@@ -1859,6 +1904,7 @@ uint32_t BuildFrame(vulkan::VulkanCommandProcessor& command_processor,
 
   // The terrain, always; its back faces (seen from under the ground, where a
   // coarser drawn patch lies below the heightmap) can be culled.
+  for (const Terrain& terrain : terrains)
   for (uint32_t id : terrain.tiles) {
     const Mesh& mesh = meshes[id];
     if (mesh.dead || !mesh.address || count >= kMaxInstances) continue;

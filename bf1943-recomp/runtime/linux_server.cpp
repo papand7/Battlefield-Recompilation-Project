@@ -33,6 +33,8 @@ int MenuRows(float (*)[4], int, int* selected) {
   return 0;
 }
 void AddBackIcon(uint32_t, uint32_t, uint32_t, float, float, float, float) {}
+void SetFullscreen(bool) {}
+void ExplosionAt(const float*) {}
 bool OnBackPrompt(float, float) { return false; }
 void SetGore(bool, uint32_t, uint32_t) {}
 void GoreHit(const float*, float) {}
@@ -81,5 +83,14 @@ bool Update(HWND__*, bool) { return false; }
 bool ControlsPad() { return false; }
 uint16_t PuppetButtons() { return 0; }
 }  // namespace rt::pcset
+
+// ---- the mouse's aiming in vehicles (xam.cpp's, the game's): no mouse here -------
+namespace rt {
+bool (*g_vehicle_mouse_stick)(float* x, float* y) = nullptr;
+bool TakeVehicleMouse(double& dx, double& dy, double& idle) {
+  dx = dy = 0, idle = 1e9;
+  return false;
+}
+}  // namespace rt
 
 #endif  // !_WIN32 && !BF1943_CLIENT

@@ -67,14 +67,13 @@ bool Deadline(uint32_t timeout_ptr, std::chrono::steady_clock::time_point* out) 
   if (!timeout_ptr) return false;
   int64_t t = int64_t(Ld64(timeout_ptr));
   auto now = std::chrono::steady_clock::now();
+  // (--speed: guest time passes g_time_speed times as fast)
   if (t <= 0) {
-    *out = now + std::chrono::nanoseconds(-t * 100);
+    *out = now + std::chrono::nanoseconds(int64_t(double(-t) * 100 / g_time_speed));
   } else {
-    // Absolute FILETIME: compare against the host system time.
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    int64_t host = (int64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-    *out = now + std::chrono::nanoseconds(std::max<int64_t>(0, t - host) * 100);
+    // Absolute FILETIME: compare against the guest's system time.
+    int64_t guest = int64_t(GuestFileTime());
+    *out = now + std::chrono::nanoseconds(int64_t(double(std::max<int64_t>(0, t - guest)) * 100 / g_time_speed));
   }
   return true;
 }
@@ -209,7 +208,8 @@ void TimerThread() {
       if (t.due <= now) {
         SetState(obj, 1);
         Wake(obj);
-        if (t.period_ms > 0) t.due += std::chrono::milliseconds(t.period_ms);
+        if (t.period_ms > 0)  // (--speed: the period in the guest's time)
+          t.due += std::chrono::microseconds(int64_t(t.period_ms * 1000.0 / g_time_speed));
         else t.generation = 0;
       }
       if (t.generation && t.due < next) next = t.due;

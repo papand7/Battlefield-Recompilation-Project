@@ -45,6 +45,12 @@ struct KeyHasher {
 };
 
 std::unordered_map<Key, Replacement, KeyHasher> g_entries;
+// Entries told apart by a second hash, of the first <bytes> of the base level
+// ("<hash>:<hash2>@<bytes>" in replacements.txt): textures whose first 4 KB
+// are the same (the levels' particle atlases share large empty areas).
+// Keyed by the first key with hash replaced by hash2.
+std::unordered_map<Key, Replacement, KeyHasher> g_entries_mid;
+std::unordered_map<Key, uint32_t, KeyHasher> g_mid_offset;  // first key -> bytes hashed
 bool g_log_misses = false;
 std::mutex g_log_mutex;
 std::set<Key, bool (*)(const Key&, const Key&)> g_logged(
@@ -110,6 +116,8 @@ uint64_t Hash(const uint8_t* data, size_t size) {
 
 size_t SetDirectory(const std::filesystem::path& dir) {
   g_entries.clear();
+  g_entries_mid.clear();
+  g_mid_offset.clear();
   std::ifstream in(dir / "replacements.txt");
   if (!in) {
     XELOGE("textures: no replacements.txt in {}", dir.string());
@@ -123,6 +131,13 @@ size_t SetDirectory(const std::filesystem::path& dir) {
     Key k{};
     if (!(s >> hash >> k.width >> k.height) || !std::getline(s >> std::ws, file)) continue;
     k.hash = std::stoull(hash, nullptr, 16);
+    uint64_t hash2 = 0;
+    uint32_t mid = 0;
+    if (size_t colon = hash.find(':'); colon != std::string::npos) {
+      // "<hash>:<hash2>@<bytes>"
+      hash2 = std::stoull(hash.substr(colon + 1), nullptr, 16);
+      if (size_t at = hash.find('@'); at != std::string::npos) mid = uint32_t(std::stoul(hash.substr(at + 1)));
+    }
     Replacement r{};
     r.file = dir / file;
 #ifdef _WIN32
@@ -139,21 +154,31 @@ size_t SetDirectory(const std::filesystem::path& dir) {
     r.height = hdr[2];
     r.levels = hdr[3];
     r.pbr = file.size() > 9 && file.compare(file.size() - 9, 9, ".pbr.rtex") == 0;
+    if (hash2) {
+      g_mid_offset[k] = mid;
+      g_entries_mid[Key{hash2, k.width, k.height}] = std::move(r);
+      continue;
+    }
     g_entries[k] = std::move(r);
   }
-  XELOGI("textures: {} replacements from {}", g_entries.size(), dir.string());
+  XELOGI("textures: {} replacements from {}", g_entries.size() + g_entries_mid.size(), dir.string());
   std::vector<const Replacement*> entries;
   for (auto& [k, r] : g_entries) entries.push_back(&r);
+  for (auto& [k, r] : g_entries_mid) entries.push_back(&r);
   if (!entries.empty()) std::thread(PrefetchThread, std::move(entries)).detach();
-  return g_entries.size();
+  return g_entries.size() + g_entries_mid.size();
 }
 
-bool Enabled() { return !g_entries.empty() || g_log_misses; }
+bool Enabled() { return !g_entries.empty() || !g_entries_mid.empty() || g_log_misses; }
 void SetLogMisses(bool log) { g_log_misses = log; }
 
 const Replacement* Find(const uint8_t* guest, uint32_t width, uint32_t height,
                         uint32_t guest_format) {
   Key k{Hash(guest, kHashBytes), width, height};
+  if (auto m = g_mid_offset.find(k); m != g_mid_offset.end()) {
+    auto mid = g_entries_mid.find(Key{Hash(guest, m->second), width, height});
+    if (mid != g_entries_mid.end()) return &mid->second;
+  }
   auto it = g_entries.find(k);
   if (g_log_misses) {
     std::lock_guard<std::mutex> lock(g_log_mutex);

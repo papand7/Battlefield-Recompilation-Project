@@ -42,6 +42,7 @@ struct Atlas {
   uint32_t width, height;
   uint64_t hash;  // FNV-1a 64 of the texture data as loaded from the game files
   std::vector<Icon> icons;
+  bool dxt5 = false;  // DXT4/5 (format 20) instead of 8888
 };
 
 // Labels: key names, arrows, or "@x" for a mouse picture (see RenderMouse).
@@ -77,6 +78,10 @@ const std::vector<Atlas>& Atlases() {
         {82, 106, 102, 143, L"@L"}, {3, 145, 41, 164, L"1"},    {45, 172, 74, 201, L"SPACE"}}},
       {"bc_hud", 1024, 512, 0x91558f3fb6ca83f2ull,
        {{2, 418, 31, 447, L"F"}, {70, 418, 99, 447, L"SPACE"}, {322, 217, 351, 246, L"E"}}},
+      // Its in-game menu's atlas (DXT5): the kit screen's LB (gadgets, the
+      // grenade key as in bc_buttons) and RB (weapons).
+      {"bc_igm_mp", 512, 1024, 0xb435962dbb34535aull,
+       {{401, 529, 439, 549, L"G"}, {445, 490, 483, 510, L"1"}}, true},
   };
   return kAtlases;
 }
@@ -423,16 +428,109 @@ void DumpTexture(uint32_t physical, uint32_t size, uint32_t width, uint32_t heig
   if (FILE* f = fopen(path, "wb")) fwrite(out.data(), 1, out.size(), f), fclose(f);
 }
 
+// DXT5 atlases: a tiled block (16 bytes, big endian in 16-bit words) to and
+// from 16 ARGB pixels of a tiled 8888 copy, where the icons are drawn as in
+// the 8888 atlases.
+uint8_t* DxtBlock(uint8_t* tex, uint32_t width, uint32_t bx, uint32_t by) {
+  return tex + TiledOffset(bx, by, width / 4, 4);
+}
+void DecodeDxt5(const uint8_t* block, uint8_t* argb, uint32_t width, uint32_t bx, uint32_t by) {
+  uint8_t b[16];
+  for (int i = 0; i < 16; i += 2) b[i] = block[i + 1], b[i + 1] = block[i];
+  uint8_t alpha[8] = {b[0], b[1]};
+  for (int i = 0; i < 6; ++i)
+    alpha[2 + i] = b[0] > b[1] ? uint8_t(((6 - i) * b[0] + (i + 1) * b[1]) / 7)
+                   : i < 4 ? uint8_t(((4 - i) * b[0] + (i + 1) * b[1]) / 5) : uint8_t(i == 4 ? 0 : 255);
+  uint64_t abits = 0;
+  for (int i = 0; i < 6; ++i) abits |= uint64_t(b[2 + i]) << (8 * i);
+  uint16_t c[2] = {uint16_t(b[8] | b[9] << 8), uint16_t(b[10] | b[11] << 8)};
+  int rgb[4][3];
+  for (int k = 0; k < 2; ++k)
+    rgb[k][0] = (c[k] >> 11) * 255 / 31, rgb[k][1] = ((c[k] >> 5) & 63) * 255 / 63, rgb[k][2] = (c[k] & 31) * 255 / 31;
+  for (int j = 0; j < 3; ++j) rgb[2][j] = (2 * rgb[0][j] + rgb[1][j]) / 3, rgb[3][j] = (rgb[0][j] + 2 * rgb[1][j]) / 3;
+  uint32_t cbits = b[12] | b[13] << 8 | b[14] << 16 | uint32_t(b[15]) << 24;
+  for (int i = 0; i < 16; ++i) {
+    uint8_t* p = argb + TiledOffset(bx * 4 + (i & 3), by * 4 + (i >> 2), width, 2);
+    const int* col = rgb[(cbits >> (2 * i)) & 3];
+    p[0] = alpha[(abits >> (3 * i)) & 7], p[1] = uint8_t(col[0]), p[2] = uint8_t(col[1]), p[3] = uint8_t(col[2]);
+  }
+}
+void EncodeDxt5(const uint8_t* argb, uint32_t width, uint32_t bx, uint32_t by, uint8_t* block) {
+  uint8_t px[16][4];
+  for (int i = 0; i < 16; ++i) memcpy(px[i], argb + TiledOffset(bx * 4 + (i & 3), by * 4 + (i >> 2), width, 2), 4);
+  // Alpha: the block's lowest and highest, 8 steps between.
+  uint8_t amax = 0, amin = 255;
+  for (auto& p : px) amax = std::max(amax, p[0]), amin = std::min(amin, p[0]);
+  uint8_t b[16] = {amax, amin};
+  int alpha[8] = {amax, amin};
+  for (int i = 0; i < 6; ++i) alpha[2 + i] = amax > amin ? ((6 - i) * amax + (i + 1) * amin) / 7 : amax;
+  uint64_t abits = 0;
+  for (int i = 0; i < 16; ++i) {
+    int best = 0;
+    for (int k = 1; k < 8; ++k) if (std::abs(alpha[k] - px[i][0]) < std::abs(alpha[best] - px[i][0])) best = k;
+    abits |= uint64_t(best) << (3 * i);
+  }
+  for (int i = 0; i < 6; ++i) b[2 + i] = uint8_t(abits >> (8 * i));
+  // Colour: the corners of the visible pixels' box (all if none are).
+  int lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0};
+  bool any = false;
+  for (auto& p : px) any |= p[0] > 8;
+  for (auto& p : px)
+    if (!any || p[0] > 8)
+      for (int j = 0; j < 3; ++j) lo[j] = std::min(lo[j], int(p[1 + j])), hi[j] = std::max(hi[j], int(p[1 + j]));
+  auto pack = [](const int* c) { return uint16_t((c[0] * 31 / 255) << 11 | (c[1] * 63 / 255) << 5 | (c[2] * 31 / 255)); };
+  uint16_t c0 = pack(hi), c1 = pack(lo);
+  int rgb[4][3];
+  for (int k = 0; k < 2; ++k) {
+    uint16_t c = k ? c1 : c0;
+    rgb[k][0] = (c >> 11) * 255 / 31, rgb[k][1] = ((c >> 5) & 63) * 255 / 63, rgb[k][2] = (c & 31) * 255 / 31;
+  }
+  for (int j = 0; j < 3; ++j) rgb[2][j] = (2 * rgb[0][j] + rgb[1][j]) / 3, rgb[3][j] = (rgb[0][j] + 2 * rgb[1][j]) / 3;
+  uint32_t cbits = 0;
+  if (c0 != c1) {  // c0 > c1: the 4-colour mode (equal: every pixel c0)
+    for (int i = 0; i < 16; ++i) {
+      int best = 0, best_d = 1 << 30;
+      for (int k = 0; k < 4; ++k) {
+        int d = 0;
+        for (int j = 0; j < 3; ++j) d += (rgb[k][j] - px[i][1 + j]) * (rgb[k][j] - px[i][1 + j]);
+        if (d < best_d) best_d = d, best = k;
+      }
+      cbits |= uint32_t(best) << (2 * i);
+    }
+  }
+  b[8] = uint8_t(c0), b[9] = uint8_t(c0 >> 8), b[10] = uint8_t(c1), b[11] = uint8_t(c1 >> 8);
+  for (int i = 0; i < 4; ++i) b[12 + i] = uint8_t(cbits >> (8 * i));
+  for (int i = 0; i < 16; i += 2) block[i] = b[i + 1], block[i + 1] = b[i];
+}
+
 void OnTextureLoad(uint32_t physical, uint32_t size, uint32_t width, uint32_t height,
                    uint32_t format, bool tiled) {
-  constexpr uint32_t k_8_8_8_8 = 6;
+  constexpr uint32_t k_8_8_8_8 = 6, k_DXT4_5 = 20;
   static const bool dump = getenv("BF_UI_DUMP") != nullptr;
   if (dump) DumpTexture(physical, size, width, height, format, tiled);
-  if (format != k_8_8_8_8 || !tiled) return;
+  if ((format != k_8_8_8_8 && format != k_DXT4_5) || !tiled) return;
   for (const Atlas& a : Atlases()) {
-    if (a.width != width || a.height != height || size < width * height * 4) continue;
+    size_t bytes = size_t(width) * height * (a.dxt5 ? 1 : 4);
+    if (a.width != width || a.height != height || a.dxt5 != (format == k_DXT4_5) || size < bytes) continue;
     uint8_t* tex = G<uint8_t>(0xA0000000u + (physical & 0x1FFFFFFF));
-    if (Fnv1a(tex, size_t(width) * height * 4) != a.hash) continue;
+    if (Fnv1a(tex, bytes) != a.hash) continue;
+    if (a.dxt5) {
+      // Through a tiled 8888 copy of the icons' blocks: drawn there, encoded back.
+      const Style style = ResolvedStyle();
+      if (style == kXbox360) return;
+      std::vector<uint8_t> argb(size_t(width) * height * 4);
+      for (const Icon& icon : a.icons) {
+        for (uint32_t by = icon.y0 / 4; by <= icon.y1 / 4u; ++by)
+          for (uint32_t bx = icon.x0 / 4; bx <= icon.x1 / 4u; ++bx) DecodeDxt5(DxtBlock(tex, width, bx, by), argb.data(), width, bx, by);
+        const char* button = style == kKeys ? nullptr : PadButton(icon.label);
+        if (button) DrawPadIcon(argb.data(), width, icon, style, button);
+        else DrawKeyCap(argb.data(), width, icon);
+        for (uint32_t by = icon.y0 / 4; by <= icon.y1 / 4u; ++by)
+          for (uint32_t bx = icon.x0 / 4; bx <= icon.x1 / 4u; ++bx) EncodeDxt5(argb.data(), width, bx, by, DxtBlock(tex, width, bx, by));
+      }
+      RT_INFO("ui: button icons drawn into %s atlas (DXT5, %08X)", a.name, physical);
+      return;
+    }
     const Style style = ResolvedStyle();
     if (style == kXbox360) {  // the game's own pictures
       RT_INFO("ui: %s atlas left with the Xbox 360's buttons", a.name);
@@ -556,10 +654,13 @@ void PatchPcText(uint8_t* data, size_t size) {
   for (size_t i = 0; i < size; ++i) {
     if (data[i] != 0) continue;
     if (bounded && i > start) {
-      auto it = text.find(std::string_view(reinterpret_cast<const char*>(data + start), i - start));
-      if (it != text.end()) {
+      std::string_view s(reinterpret_cast<const char*>(data + start), i - start), pc;
+      if (auto it = text.find(s); it != text.end()) pc = it->second;
+      for (const char* const* g = g_game_pc_text; pc.empty() && g[0] && g[1]; g += 2)
+        if (s == g[0] && strlen(g[1]) <= s.size()) pc = g[1];
+      if (!pc.empty()) {
         memset(data + start, 0, i - start);
-        memcpy(data + start, it->second.data(), it->second.size());
+        memcpy(data + start, pc.data(), pc.size());
         ++count;
       }
     }

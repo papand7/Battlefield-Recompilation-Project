@@ -98,7 +98,37 @@ extern uint32_t g_vblank_hz;  // --vblank-hz: guest vsync rate (the game present
 extern std::string g_gamertag;       // --gamertag: profile name (default "Player")
 extern float g_mouse_sensitivity;  // --mouse-sens (1 = default)
 extern bool g_mouse_invert;        // --invert-mouse
+extern float g_aim_mouse_sensitivity;    // PC settings: times the mouse sensitivity while aiming
+extern std::atomic<bool> g_aiming;        // game_patches.cpp: the infantry camera zoomed in (sights)
 extern float g_plane_mouse_sensitivity;  // PC settings: mouse in planes (1 = default)
+extern int g_prompt_style;               // PC settings: button prompts (0 auto, 1 keys, 2 Xbox 360, 3 Xbox Series, 4 PS3, 5 PS5, 6 Steam Deck)
+extern bool g_present_vsync;              // --present-vsync (or the VSYNC setting)
+extern int g_fps_overlay;                // PC settings / F2: 0 off, 1 FPS, 2 FULL (fps_overlay.cpp)
+void FrameSwapped();                      // fps_overlay.cpp: a frame shown (VdSwap)
+extern std::atomic<uint64_t> g_frame_count;  // frames shown so far (fps_overlay.cpp)
+extern bool g_skip_intro;                 // PC settings: the startup logos and cards fast-forwarded
+extern std::atomic<int> g_disconnect_reason;  // the last closed connection's reason (-1 none; 4 kicked)
+extern std::atomic<int64_t> g_disconnect_ms;  // when (steady clock, ms; game_patches.cpp)
+extern std::atomic<int64_t> g_press_a_until;  // A held until then (steady clock, ms): a game dialog dismissed
+extern bool g_smooth_players;            // PC settings: other players drawn between their updates
+extern float g_camera_shake;              // PC settings: the camera's shake from hits and blasts (1 = the game's, 0 none)
+extern bool g_motion_blur;                // PC settings: the game's screen blur (explosions, low health)
+extern bool g_aim_toggle;                 // PC settings: aim (zoom) switches on and off with a press
+extern bool g_sprint_toggle;              // PC settings: sprint likewise
+extern uint32_t g_background_fps;         // PC settings: frame cap while the window is not in front (0: none)
+extern bool g_background_mute;            // PC settings: no sound while the window is not in front
+extern std::atomic<bool> g_window_focused;  // the game window is in front (pc_settings.cpp)
+extern float g_master_volume, g_music_volume, g_voice_volume;  // PC settings, 0...1
+// Run on the audio thread before each mixer pass, with its guest context
+// (bf1943's game_patches.cpp: the game's own music and voice volumes).
+extern void (*g_audio_tick)(PPCContext& ctx);
+// Vehicle guns and turrets aimed by the mouse (game_patches.cpp): the mouse's
+// counts since the last take (raw: x right, y down) and seconds since it last
+// moved; false when the mouse doesn't look (menus, Alt, another window).
+bool TakeVehicleMouse(double& dx, double& dy, double& idle);
+// The right stick the turret aiming wants (-1...1 as the game reads it), or
+// false (game_patches.cpp sets it; null in Bad Company).
+extern bool (*g_vehicle_mouse_stick)(float* x, float* y);
 extern bool g_plane_mouse_invert;        // PC settings: mouse forward pulls up in planes
 // The local player's vehicle (bots.cpp; none in games without the probe).
 enum LocalVehicleKind { kOnFoot = 0, kDriving = 1, kFlying = 2, kGunner = 3 };
@@ -107,9 +137,31 @@ bool SimulatedKeyDown(int vk);  // xam.cpp: a key held by BF_TEST_KEY (tests)
 // The PC main and pause menus replace the game's (game_patches.cpp; false in
 // games without them), and the game's dialogs up now (-1 before it said).
 bool CustomMenus();
+// This game's own PC wording (pc_ui.cpp's PatchPcText): console text, PC text,
+// ..., ending with null (game_patches.cpp, bfbc1_game.cpp).
+extern const char* const g_game_pc_text[];
+// --blood (gpu.cpp): a game's soldier objects. The health float is at +0x3C,
+// after its health part's vtable at +0x34 (00011100 at +0x2C, the part's
+// vtable - 0xC at +0x40). feet: their position (x, y up, z); the last hit's
+// and the killing blow's impulse (0: not known).
+struct SoldierLayout {
+  uint32_t vtable, part, feet, hit_impulse, death_impulse;
+};
+extern const SoldierLayout g_blood_server, g_blood_client;  // game_patches.cpp, bfbc1_game.cpp
 // --dedicated: a console server (no window, GPU or menus) that hosts
 // g_host_map, then each map of --maps in turn when a round ends.
 extern bool g_dedicated;
+// --train: a server only its own bots play on (nobody joins, 16 bots), asking
+// the bots' advisor (bot_llm.h) about medium situations too.
+extern bool g_training;
+// The guest's time runs this many times as fast (1: real time). --speed sets
+// g_time_speed_target: reached once a level has loaded, 1x again while the
+// next one loads (bots' connections, with no traffic, would time out during
+// a load, which the game doesn't get over). SetTimeSpeed (guest.h) changes it.
+extern double g_time_speed, g_time_speed_target;
+extern std::atomic<int64_t> g_level_open_ms, g_file_open_ms;  // files.cpp: when (steady clock ms)
+uint64_t GuestFileTime();     // the guest's system time (FILETIME), at --speed
+uint64_t GuestTickCount64();  // milliseconds at --speed (the bots' clock)
 extern bool g_auto_start;  // main.cpp: dedicated server: Start, dialogs and loading screen pressed by xam.cpp
 extern std::vector<std::string> g_map_rotation;
 int GameDialogs();
@@ -132,6 +184,9 @@ extern uint32_t g_shadow_size;           // --shadowmap (0 = the game's 1024)
 extern float g_shadow_distance;          // --shadow-distance (default 300; 0 = the game's 100 m)
 extern float g_lod;                      // --lod N: N times the vegetation detail (default 4, 1 = the game's)
 extern std::string g_overgrowth;         // --overgrowth "Field=value,..." (all OvergrowthSettings copies)
+extern float g_fov;                      // --fov: horizontal degrees at 16:9 (0: the game's 85.6)
+extern std::string g_emitter;            // --emitter "Field=value,..." (EmitterSystemSettings)
+void ApplyEmitterNow();                   // g_emitter to the EmitterSystemSettings now (a setting changed)
 extern std::string g_worldrender;         // --worldrender "Field=value,..." (all WorldRender copies)
 void ApplyShadowSettings();               // game_patches.cpp: to every WorldRender copy
 extern std::atomic<bool> g_in_menus;     // files.cpp: front-end menus (not in a level)
@@ -159,6 +214,7 @@ struct ScriptedPress {
 extern std::vector<ScriptedPress> g_scripted_presses;  // save frames/frame_NNN.png this often (0 = off)
 extern std::atomic<bool> g_title_passed;      // xam.cpp: Start taken at the title screen (profile read)
 extern std::atomic<int64_t> g_pad_t0_ns;  // xam.cpp: time of the first pad read (ns, steady clock)
+extern std::atomic<bool> g_level_files;     // files.cpp: a level's file opened (since StartingGame)
 extern std::atomic<bool> g_mainmenu_open;    // files.cpp: the main menu file has been opened
 extern std::atomic<uint16_t> g_auto_buttons;  // xam.cpp: buttons held by automation, added to pad 0
 

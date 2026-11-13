@@ -91,6 +91,11 @@ std::string GuestFormatVa(uint32_t fmt, uint32_t va_list);
 std::string ReadAnsiString(uint32_t ansi_string_ptr);  // ANSI_STRING*
 std::string ReadCString(uint32_t ptr);
 uint64_t HostTicksPerSecond();  // host rdtsc rate; also sets the mftb scale
+// --speed: the guest's clocks (mftb, the kernel's) run this many times as
+// fast from now on, carrying on from where they are; GuestSeconds: the
+// guest's time since the start, at those speeds.
+void SetTimeSpeed(double speed);
+double GuestSeconds();
 constexpr uint64_t kGuestTimebase = 49875000;  // console mftb / KeQueryPerformanceFrequency rate
 
 constexpr uint32_t STATUS_SUCCESS = 0;

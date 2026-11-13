@@ -18,5 +18,9 @@ void Block(const float at[3]);  // a polygon a bot can't get onto: off for route
 // The main piece: the one most of these places (the flags) are on, not the
 // biggest (on an island map that is the sea floor). Once per map.
 void ChooseMain(const float* points, int count);
+// For the bots' advisor (bot_llm.h): whether a soldier can stand there, and
+// up to max places (x y z each) r0 to r1 m around `at`, one in each direction.
+bool Walkable(float x, float y, float z);
+int Places(const float at[3], float r0, float r1, float* out, int max);
 
 }  // namespace rt::nav

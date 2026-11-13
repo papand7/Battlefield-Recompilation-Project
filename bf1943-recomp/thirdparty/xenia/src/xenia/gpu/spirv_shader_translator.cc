@@ -2383,7 +2383,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     }
   }
 
-  if (pbr_ && pbr::MaterialOutput()) {
+  if (pbr_ && (!pbr_tonemap_only_ || pbr_->soft > 0.0f || (pbr_->tonemap.valid() && pbr::FsrCapture())) &&
+      pbr::MaterialOutput()) {
     // bf1943: the --pbr materials uint[], binding 3.
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeRuntimeArray(type_uint_));

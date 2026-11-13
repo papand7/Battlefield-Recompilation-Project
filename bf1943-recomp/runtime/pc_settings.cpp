@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <list>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -41,9 +42,9 @@ namespace {
 // ---- the settings ------------------------------------------------------------
 
 enum class Kind { kChoice, kKey, kText, kButton };
-enum Category { kGraphics, kEffects, kControls, kKeys, kProfile, kCategoryCount };
-const wchar_t* const kCategoryNames[kCategoryCount] = {L"GRAPHICS", L"EFFECTS", L"MOUSE",
-                                                       L"KEYS", L"PROFILE"};
+enum Category { kGraphics, kEffects, kControls, kKeys, kSound, kProfile, kCategoryCount };
+const wchar_t* const kCategoryNames[kCategoryCount] = {L"GRAPHICS", L"EFFECTS", L"CONTROLS",
+                                                       L"KEYS", L"SOUND", L"PROFILE"};
 
 struct Setting {
   Category category;
@@ -111,24 +112,62 @@ void Build() {
   auto& v = g_settings;
   // Graphics.
   v.push_back(Choice(kGraphics, "preset", L"LOOK",
-                     L"Enhanced: every effect. Toon, Noir and WW2 are enhanced with a film look. "
+                     L"Enhanced: every effect. Vivid is enhanced, brighter and more colourful; Toon, Noir and WW2 are enhanced with a film look. "
                      L"Stock: the game as it was (from stock or to it on the next start).",
-                     {L"STOCK", L"ENHANCED", L"TOON", L"NOIR", L"WW2"},
-                     {"stock", "enhanced", "toon", "noir", "ww2"}, 1, false, "preset"));
+                     {L"STOCK", L"ENHANCED", L"VIVID", L"TOON", L"NOIR", L"WW2"},
+                     {"stock", "enhanced", "vivid", "toon", "noir", "ww2"}, 1, false, "preset"));
   v.push_back(Choice(kGraphics, "resolution", L"RESOLUTION SCALE",
                      L"The game drawn at 1, 2 or 3 times its own 1280x720.",
                      {L"1X (720P)", L"2X (1440P)", L"3X (2160P)"}, {"1", "2", "3"}, 1, true,
                      "resolution"));
-  v.push_back(Choice(kGraphics, "upscaling", L"UPSCALING", L"How the frame is fitted to the window.",
-                     {L"FSR", L"CAS SHARPEN", L"BILINEAR"}, {"fsr", "cas", "none"}, 0, true,
+  v.push_back(Choice(kGraphics, "upscaling", L"UPSCALING",
+                     L"How the frame is fitted to the window. FSR 3 and DLSS (NVIDIA RTX; AUTO picks): "
+                     L"temporal, from the resolution scale up to a larger window (1X to 1440P or 4K).",
+                     {L"FSR", L"CAS SHARPEN", L"BILINEAR", L"FSR 3", L"DLSS", L"AUTO (DLSS / FSR 3)"},
+                     {"fsr", "cas", "none", "fsr3", "dlss", "auto"}, 0, true,
                      "upscaling"));
+  v.push_back(Choice(kGraphics, "upscale_quality", L"UPSCALE QUALITY",
+                     L"With FSR 3, DLSS or AUTO: picks the resolution scale for your window or screen. "
+                     L"QUALITY renders about 1.5x smaller, PERFORMANCE about 2x. OFF: the RESOLUTION SCALE above.",
+                     {L"OFF", L"QUALITY", L"BALANCED", L"PERFORMANCE"}, {"off", "quality", "balanced", "performance"}, 0,
+                     true, "upscaleQuality"));
   v.push_back(Choice(kGraphics, "window", L"WINDOW SIZE", L"The game window's size.",
                      {L"1280 x 720", L"1600 x 900", L"1920 x 1080", L"2560 x 1440", L"3840 x 2160"},
                      {"1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160"}, 2, true,
                      "window"));
+  v.push_back(Choice(kGraphics, "display", L"DISPLAY MODE",
+                     L"Borderless fullscreen on the window's monitor, or a window. Alt+Enter switches.",
+                     {L"WINDOWED", L"FULLSCREEN"}, {"windowed", "fullscreen"}, 0, false, "display"));
+  v.push_back(Choice(kGraphics, "fov", L"FIELD OF VIEW",
+                     L"How wide you see, in degrees across a 16:9 screen (the game's own: 86). "
+                     L"Aiming and vehicles zoom as before.",
+                     {L"86 (GAME)", L"90", L"95", L"100", L"105", L"110"}, {"0", "90", "95", "100", "105", "110"}, 0,
+                     false, "fov"));
+  v.push_back(Choice(kGraphics, "camera_shake", L"CAMERA SHAKE",
+                     L"How hard the view shakes from blasts and hits.",
+                     {L"OFF", L"25%", L"50%", L"75%", L"100%", L"150%", L"200%"},
+                     {"0", "0.25", "0.5", "0.75", "1", "1.5", "2"}, 4));
+  v.push_back(Choice(kGraphics, "motion_blur", L"MOTION BLUR",
+                     L"The game's blur from explosions, gunfire and low health.", kOffOn, {"0", "1"}, 1));
   v.push_back(Choice(kGraphics, "fps", L"FRAME RATE LIMIT", L"Most frames a second.",
-                     {L"30", L"60", L"120", L"144", L"165", L"240", L"UNLIMITED"},
-                     {"30", "60", "120", "144", "165", "240", "0"}, 2, false, "frameRate"));
+                     {L"30", L"60", L"90", L"120", L"144", L"150", L"165", L"180", L"240", L"UNLIMITED"},
+                     {"30", "60", "90", "120", "144", "150", "165", "180", "240", "0"}, 3, false, "frameRate"));
+  v.push_back(Choice(kGraphics, "skip_intro", L"SKIP INTRO",
+                     L"Fast-forwards the logos and cards before the title screen.", kOffOn, {"0", "1"}, 1));
+  v.push_back(Choice(kGraphics, "fps_overlay", L"FPS COUNTER",
+                     L"In the top-left corner: the frame rate, or FULL with frame times and the 1% low. F2 switches.",
+                     {L"OFF", L"FPS", L"FULL"}, {"0", "1", "2"}, 0));
+  v.push_back(Choice(kGraphics, "vsync", L"VSYNC",
+                     L"Frames wait for the screen's refresh: no tearing, a little more delay. Off: as fast as the "
+                     L"frame rate limit (a G-SYNC / FreeSync screen avoids tearing anyway).",
+                     kOffOn, {"0", "1"}, 0, true));
+  v.push_back(Choice(kGraphics, "brightness", L"BRIGHTNESS", L"Lifts or darkens the whole picture.",
+                     {L"-30%", L"-20%", L"-10%", L"0", L"+10%", L"+20%", L"+30%"},
+                     {"-0.3", "-0.2", "-0.1", "0", "0.1", "0.2", "0.3"}, 3));
+  v.push_back(Choice(kGraphics, "gamma", L"GAMMA",
+                     L"Brightens or darkens the midtones, keeping black and white (the game's own: 1.0).",
+                     {L"0.7", L"0.8", L"0.9", L"1.0", L"1.1", L"1.2", L"1.3"},
+                     {"0.7", "0.8", "0.9", "1", "1.1", "1.2", "1.3"}, 3));
   v.push_back(Choice(kGraphics, "hdr", L"HDR",
                      L"HDR10 output. Needs HDR on in the Windows display settings.", kOffOn,
                      {"0", "1"}, 0, true, "hdr"));
@@ -145,6 +184,11 @@ void Build() {
   v.push_back(Choice(kGraphics, "blood", L"BLOOD", L"Blood on hits, bodies torn apart by explosions.",
                      kOffOn, {"0", "1"}, 0, true, "blood"));
   // Effects (the scene effects, live).
+  v.push_back(Choice(kEffects, "quality", L"QUALITY PRESET",
+                     L"Sets every effect below at once. LOW: the game's own look with a few extras; "
+                     L"ULTRA: more rays and steps. Changing an effect makes it CUSTOM.",
+                     {L"LOW", L"MEDIUM", L"HIGH", L"ULTRA", L"CUSTOM"}, {"low", "medium", "high", "ultra", "custom"},
+                     2));
   v.push_back(Choice(kEffects, "rt", L"RAY-TRACED SHADOWS",
                      L"Sun shadows from every object, on screen or not.", kOffOn, {"0", "1"}, 1));
   v.push_back(Choice(kEffects, "shadows", L"SCREEN SHADOWS", L"Contact shadows from the depth.",
@@ -175,6 +219,14 @@ void Build() {
   v.push_back(Choice(kEffects, "detail", L"SURFACE DETAIL",
                      L"Pebbles, cracks and grime on the ground.", {L"OFF", L"ON", L"STRONG"},
                      {"0", "1", "1.5"}, 1));
+  v.push_back(Choice(kEffects, "particle_quality", L"PARTICLE QUALITY",
+                     L"The game's smoke, dust and sparks. High: full resolution, finer shading.",
+                     {L"GAME", L"HIGH"}, {"0", "1"}, 1));
+  v.push_back(Choice(kEffects, "soft_particles", L"SOFT PARTICLES",
+                     L"Smoke fades where it meets the ground and walls (next start).", kOffOn,
+                     {"0", "1"}, 1, true));
+  v.push_back(Choice(kEffects, "explosion_smoke", L"EXPLOSION SMOKE",
+                     L"Lingering, lit smoke and bouncing debris at explosions.", kOffOn, {"0", "1"}, 0));
   v.push_back(Choice(kEffects, "flash", L"MUZZLE FLASH LIGHT",
                      L"On: a short, shadowed light at the gun. Off: the game's own.", kOffOn,
                      {"0", "1"}, 1));
@@ -192,6 +244,10 @@ void Build() {
     v.push_back(Choice(kControls, "mouse_sens", L"MOUSE SENSITIVITY", L"How far the view turns.",
                        names, values, 3));
   }
+  v.push_back(Choice(kControls, "aim_sens", L"AIM SENSITIVITY",
+                     L"The mouse sensitivity while aiming down the sights, as a share of the one above.",
+                     {L"25%", L"50%", L"60%", L"70%", L"80%", L"90%", L"100%", L"120%", L"150%"},
+                     {"0.25", "0.5", "0.6", "0.7", "0.8", "0.9", "1", "1.2", "1.5"}, 6));
   v.push_back(Choice(kControls, "invert_mouse", L"INVERT MOUSE", L"Mouse forward looks down.", kOffOn,
                      {"0", "1"}, 0));
   {
@@ -207,6 +263,50 @@ void Build() {
     v.push_back(Choice(kControls, "plane_sens", L"PLANE MOUSE SENSITIVITY",
                        L"How fast the mouse pitches and rolls a plane.", names, values, 3));
   }
+  // What the effects cost (measured at 2X, 1440p, on an RTX 5060).
+  {
+    struct Cost { const char* key; const wchar_t* text; };
+    const Cost kCosts[] = {
+        {"rt", L" The biggest cost: most of the main pass (about 3.4 ms in all)."},
+        {"gi", L" About 0.8 ms."}, {"ao", L" About 1 ms."},
+        {"density", L" The haze: about 0.6 ms."}, {"shafts", L" Part of the haze (0.6 ms)."},
+        {"clouds", L" About 0.2 ms."}, {"water_foam", L" The water: about 0.3 ms in all."},
+        {"water_refract", L" The water: about 0.3 ms in all."}, {"water_shallow", L" The water: about 0.3 ms in all."},
+    };
+    static std::list<std::wstring> texts;  // (desc points into these)
+    for (Setting& s : v)
+      for (const Cost& c : kCosts)
+        if (s.key && !std::strcmp(s.key, c.key)) s.desc = texts.emplace_back(std::wstring(s.desc) + c.text).c_str();
+  }
+  // Sound, and the window in the background.
+  {
+    std::vector<std::wstring> names;
+    std::vector<std::string> values;
+    for (int i = 0; i <= 10; ++i) {
+      names.push_back(std::to_wstring(i * 10) + L"%");
+      values.push_back(i == 10 ? "1" : "0." + std::to_string(i));
+    }
+    v.push_back(Choice(kSound, "master_volume", L"MASTER VOLUME", L"Everything the game plays.", names, values, 10));
+    v.push_back(Choice(kSound, "music_volume", L"MUSIC VOLUME", L"The game's music.", names, values, 10));
+    v.push_back(Choice(kSound, "voice_volume", L"VOICE VOLUME", L"The soldiers' and the narrator's voices.", names,
+                       values, 10));
+  }
+  v.push_back(Choice(kSound, "background_mute", L"MUTE IN BACKGROUND",
+                     L"No sound while another window is in front.", kOffOn, {"0", "1"}, 1));
+  v.push_back(Choice(kSound, "background_fps", L"BACKGROUND FRAME RATE",
+                     L"Most frames a second while another window is in front (saves power and heat).",
+                     {L"15", L"30", L"60", L"AS IN FRONT"}, {"15", "30", "60", "0"}, 1));
+  v.push_back(Choice(kControls, "prompts", L"BUTTON PROMPTS",
+                     L"The buttons the game shows. AUTO: your keys, or the Xbox 360's with a controller plugged in. "
+                     L"Shows from the next menu or map.",
+                     {L"AUTO", L"KEYBOARD", L"XBOX 360", L"XBOX SERIES", L"PLAYSTATION 3", L"PLAYSTATION 5",
+                      L"STEAM DECK"},
+                     {"0", "1", "2", "3", "4", "5", "6"}, 0));
+  v.push_back(Choice(kControls, "aim_toggle", L"AIM", L"Hold the aim key, or press it to aim and again to stop.",
+                     {L"HOLD", L"TOGGLE"}, {"0", "1"}, 0));
+  v.push_back(Choice(kControls, "sprint_toggle", L"SPRINT",
+                     L"Hold the sprint key, or press it to sprint until you stop or press it again.",
+                     {L"HOLD", L"TOGGLE"}, {"0", "1"}, 0));
   v.push_back(Choice(kControls, "plane_invert", L"INVERT PLANE MOUSE",
                      L"On: mouse forward pulls the nose up. Off: it pushes it down, like a stick.", kOffOn,
                      {"0", "1"}, 0));
@@ -341,20 +441,61 @@ int g_running_look = -1;  // the look this run started with (stock needs a resta
 void ApplyLive() {
   std::string fx;
   for (const Setting& s : g_settings) {
-    if (s.category != kEffects) continue;
+    if (s.category != kEffects || !std::strcmp(s.key, "quality")) continue;
     fx += std::string(fx.empty() ? "" : ",") + s.key + "=" + s.values[s.index];
   }
+  // The preset's rays and steps (no rows of their own).
+  {
+    const std::string& q = Value("quality");
+    fx += q == "low"      ? ",gi_rays=1,steps=16,cloud_steps=12,shadow_steps=24"
+          : q == "medium" ? ",gi_rays=2,steps=24,cloud_steps=16,shadow_steps=32"
+          : q == "ultra"  ? ",gi_rays=4,steps=48,cloud_steps=32,shadow_steps=64"
+                          : ",gi_rays=2,steps=32,cloud_steps=24,shadow_steps=48";
+  }
   xgpu::ApplySceneFx(fx.c_str());
+  // Particles: the game's renderer settings, ours.
+  {
+    // (Not in the stock look: the game as it was.)
+    static std::string last_emitter;
+    if (g_running_look != 0) {
+      g_emitter = Value("particle_quality") == "0" ? "QuadHalfResEnable=1,QuadSimpleRenderingEnable=1"
+                                                   : "QuadHalfResEnable=0,QuadSimpleRenderingEnable=0";
+      if (g_emitter != last_emitter) last_emitter = g_emitter, ApplyEmitterNow();
+    }
+    xgpu::SetExplosionEffects(Value("explosion_smoke") == "1");
+    xgpu::SetSoftParticles(Value("soft_particles") != "0");
+  }
   const std::string& look = Value("preset");
   if (g_running_look != 0 && look != "stock") {
-    xgpu::SetLook(look == "toon" ? 1 : look == "noir" ? 2 : look == "ww2" ? 3 : 0);
+    xgpu::SetLook(look == "toon" ? 1 : look == "noir" ? 2 : look == "ww2" ? 3 : look == "vivid" ? 4 : 0);
   }
   g_max_fps = uint32_t(std::atoi(Value("fps").c_str()));
+  xgpu::SetPicture(float(std::atof(Value("brightness").c_str())), float(std::atof(Value("gamma").c_str())));
+  xgpu::SetVsync(Value("vsync") == "1" || g_present_vsync);
+  xgpu::SetFullscreen(Value("display") == "fullscreen");
+  {
+    static const float command_line_fov = g_fov;  // --fov, when the setting is the game's
+    float fov = float(std::atof(Value("fov").c_str()));
+    g_fov = fov > 0.0f ? fov : command_line_fov;
+  }
   xgpu::SetHdrWhite(float(std::atof(Value("hdr_white").c_str())));
   g_mouse_sensitivity = float(std::atof(Value("mouse_sens").c_str()));
   g_mouse_invert = Value("invert_mouse") == "1";
   g_plane_mouse_sensitivity = float(std::atof(Value("plane_sens").c_str()));
+  g_aim_mouse_sensitivity = float(std::atof(Value("aim_sens").c_str()));
   g_plane_mouse_invert = Value("plane_invert") == "1";
+  g_aim_toggle = Value("aim_toggle") == "1";
+  g_camera_shake = float(std::atof(Value("camera_shake").c_str()));
+  g_fps_overlay = std::atoi(Value("fps_overlay").c_str());
+  g_skip_intro = Value("skip_intro") != "0";
+  g_prompt_style = std::atoi(Value("prompts").c_str());
+  g_motion_blur = Value("motion_blur") != "0";
+  g_sprint_toggle = Value("sprint_toggle") == "1";
+  g_background_fps = uint32_t(std::atoi(Value("background_fps").c_str()));
+  g_background_mute = Value("background_mute") == "1";
+  g_master_volume = float(std::atof(Value("master_volume").c_str()));
+  g_music_volume = float(std::atof(Value("music_volume").c_str()));
+  g_voice_volume = float(std::atof(Value("voice_volume").c_str()));
 }
 
 // ---- screens -----------------------------------------------------------------
@@ -372,7 +513,9 @@ int g_button = 0;   // main / pause menu entry
 int g_page = 0;     // a new page slides in
 Mode g_back_to = kModeSettings;  // Back from a list: to the main or pause menu (kModeSettings: close)
 bool g_pad_used = false;
-bool g_suppress_main = false;    // a game is starting: no main menu until the next front end
+bool g_suppress_main = false;
+bool g_show_failure = false;
+bool g_lost_notice = false;   // the main menu tells why the last match ended (the connection closed)  // the main menu came back because the game did not start    // a game is starting: no main menu until the next front end
 // The game's own pause menu, worked by pad presses under a STAND BY screen
 // (suicide, quit): its rows My Squad, Scoreboard, Help & Options,
 // Leaderboards, Achievements, Exit Game, Suicide; Exit and Suicide ask
@@ -479,6 +622,13 @@ pcmenu::View BuildView() {
     v.buttons = main ? kMainButtons : kPauseButtons;
     v.button = g_button;
     v.desc = (main ? kMainNotes : kPauseNotes)[g_button];
+    // A notice (why the last game ended or didn't start) in place of the
+    // button's note, until another button is chosen.
+    static int notice_button = -1;
+    if (g_status.empty()) notice_button = -1;
+    else if (notice_button < 0) notice_button = g_button;
+    if (!g_status.empty() && g_button != notice_button) g_status.clear(), notice_button = -1;
+    if (main && !g_status.empty()) v.desc = g_status;
     v.prompts = {{sel, L"SELECT"}};
     if (!main) v.prompts.push_back({back, L"RESUME"});
     return v;
@@ -528,13 +678,44 @@ bool g_prev[256] = {};
 bool g_wait_release = false;
 POINT g_last_mouse{-1, -1};
 
-bool Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0 || SimulatedKeyDown(vk); }
+bool Down(int vk) {
+  if (vk == VK_RETURN && (GetAsyncKeyState(VK_MENU) & 0x8000)) return false;  // Alt+Enter: fullscreen
+  return (GetAsyncKeyState(vk) & 0x8000) != 0 || SimulatedKeyDown(vk);
+}
+
+// The QUALITY PRESET's effect values (key, value; the rest keep theirs).
+struct PresetValue { const char* key; const char* low; const char* medium; const char* high; const char* ultra; };
+const PresetValue kPresets[] = {
+    {"rt", "0", "0", "1", "1"},                   {"shadows", "0", "1", "1", "1"},
+    {"gi", "0", "0", "1", "1"},                   {"ao", "0", "0.5", "1", "1"},
+    {"clouds", "0.3", "0.45", "0.45", "0.45"},    {"cloud_shadows", "0", "0.85", "0.85", "0.85"},
+    {"shafts", "0", "0.6", "0.6", "0.6"},         {"reflect", "0", "1", "1", "1"},
+    {"gloss", "0", "0", "1", "1"},                {"water_foam", "0", "0", "1", "1"},
+    {"water_refract", "0", "1", "1", "1"},        {"water_shallow", "0", "1", "1", "1"},
+    {"detail", "0", "1", "1", "1.5"},             {"particle_quality", "0", "1", "1", "1"},
+    {"soft_particles", "0", "1", "1", "1"},       {"explosion_smoke", "0", "0", "0", "1"},
+};
+void ApplyPreset(const std::string& q) {
+  for (const PresetValue& p : kPresets) {
+    Setting* s = Find(p.key);
+    if (!s) continue;
+    Select(*s, q == "low" ? p.low : q == "medium" ? p.medium : q == "ultra" ? p.ultra : p.high);
+    s->touched = true;
+  }
+}
 
 void Change(Setting& s, int dir) {
   if (s.kind != Kind::kChoice) return;
   int n = int(s.values.size());
   s.index = (s.index + dir + n) % n;
   s.touched = true;
+  // The preset sets the effects; an effect changed by hand makes it CUSTOM.
+  if (!std::strcmp(s.key, "quality")) {
+    if (s.values[s.index] == "custom") s.index = (s.index + dir + n) % n;  // (not picked, only shown)
+    ApplyPreset(s.values[s.index]);
+  } else if (s.category == kEffects) {
+    if (Setting* q = Find("quality")) Select(*q, "custom");
+  }
   if (g_mode == kModeSettings) {
     ApplyLive();
     Save();
@@ -558,24 +739,46 @@ const std::string& PageText(const char* key) {
   return none;
 }
 
+// What was last started, for the message if it never does.
+std::wstring g_start_failed;
+
 // A game is starting: the menus give way to the game's loading screen.
 void StartingGame() {
   g_suppress_main = true;
+  g_level_files = false;
   Close();
 }
 
 void Activate(Setting& s) {
   if (s.kind == Kind::kButton) {
     if (s.button == kHostStart) {
+      std::wstring problem = lan::HostProblem();
+      if (!problem.empty()) {
+        g_status = problem;
+        g_dirty = true;
+        return;
+      }
+      lan::SetPublish(PageValue("online") == "1");
       lan::Host(PageValue("host_map"), std::atoi(PageValue("bots").c_str()));
+      g_start_failed = L"Hosting " + Wide(PageValue("host_map")) +
+                       L" did not start: the map did not load. Try again, or another map.";
       StartingGame();
     } else if (s.button == kJoinServer) {
-      lan::Join(s.address, s.map);
-      StartingGame();
+      if (lan::Join(s.address, s.map)) {
+        g_start_failed = L"No answer from the game at " + Wide(s.address) +
+                         L". Check it is still running, on the same network, and that its firewall lets the game through.";
+        StartingGame();
+      }
     } else if (s.button == kJoinAddress) {
       if (!PageText("address").empty()) {
-        lan::Join(PageText("address"), PageValue("join_map"));
-        StartingGame();
+        if (lan::Join(PageText("address"), PageValue("join_map"))) {
+          g_start_failed = L"No answer from " + Wide(PageText("address")) +
+                           L". Check the address, that the game there is hosting, and its firewall.";
+          StartingGame();
+        } else {
+          g_status = L"That is not an address: type one like 192.168.1.20 (or 192.168.1.20:1003).";
+          g_dirty = true;
+        }
       }
     } else if (s.button == kRefresh) {
       lan::Refresh();
@@ -739,7 +942,8 @@ void BuildJoinRows() {
     labels[k] = Wide(sv.name);
     for (wchar_t& c : labels[k]) c = towupper(c);
     descs[k] = L"Join " + Wide(sv.name) + L"'s game on " + MapName(sv.map) + L" at " + Wide(sv.address) +
-               L" (" + std::to_wstring(sv.ping_ms) + L" ms).";
+               (sv.online ? L" (on the internet)." : L" (" + std::to_wstring(sv.ping_ms) + L" ms).");
+    if (sv.online) labels[k] += L"  [INTERNET]";
     s.label = labels[k].c_str();
     s.desc = descs[k].c_str();
     s.names = {MapName(sv.map)};
@@ -788,6 +992,13 @@ void OpenMode(Mode mode, Mode back_to) {
                                  L"Computer players in your game, half on each team.",
                                  {L"NONE", L"2", L"4", L"6", L"8", L"12", L"15"},
                                  {"0", "2", "4", "6", "8", "12", "15"}, 0));
+    {
+      Setting online = Choice(kGraphics, "online", L"LIST ON THE INTERNET",
+                              L"Shows your game in everyone's JOIN GAME list (the master server). Your router must "
+                              L"pass UDP ports 1003 and 19430 to this PC. Your IP address is shown in the list.",
+                              {L"NO", L"YES"}, {"0", "1"}, lan::Publish() ? 1 : 0);
+      g_host_rows.push_back(online);
+    }
     Setting start;
     start.category = kGraphics, start.kind = Kind::kButton, start.key = "start", start.button = kHostStart;
     start.label = L"START SERVER";
@@ -799,7 +1010,7 @@ void OpenMode(Mode mode, Mode back_to) {
     lan::Refresh();
     BuildJoinRows();
     g_focus = 1;
-    g_status = L"Looking for games on your network...";
+    g_status = L"Looking for games on your network and the internet...";
   } else {
     g_button = 0;
   }
@@ -859,8 +1070,21 @@ bool Update(HWND__* window, bool title_passed) {
   using namespace std::chrono;
   double now = duration<double>(steady_clock::now().time_since_epoch()).count();
   bool pressed[256] = {};
+  // Alt+Enter switched fullscreen: the setting follows (and is saved).
+  static int toggles = 0;
+  if (int t = xgpu::FullscreenToggles(); t != toggles) {
+    toggles = t;
+    if (Setting* s = Find("display")) {
+      Select(*s, xgpu::IsFullscreen() ? "fullscreen" : "windowed");
+      s->touched = true;
+      Save();
+      g_dirty = true;
+    }
+  }
+  const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
   for (int vk = 1; vk < 256; ++vk) {
     bool d = (window && (GetAsyncKeyState(vk) & 0x8000) != 0) || SimulatedKeyDown(vk);
+    if (vk == VK_RETURN && alt) d = false;  // Alt+Enter: fullscreen
     pressed[vk] = d && !g_prev[vk];
     g_prev[vk] = d;
   }
@@ -904,9 +1128,64 @@ bool Update(HWND__* window, bool title_passed) {
   if (title_passed && title_at == 0) title_at = now;
   int dialogs = GameDialogs();
   if (dialogs < 0 && title_at > 0 && now - title_at > 6) dialogs = 0;  // never asked: none
-  if (CustomMenus() && !g_open && g_in_menus && title_passed && dialogs == 0 && !g_suppress_main) {
+  // The connection to the server closed in a match and the game, back in its
+  // front end, shows its notice (it says "kicked" whatever happened): OK is
+  // pressed for the player, and our main menu says what happened instead.
+  bool notice_wait = false;  // a connection just closed: the game's notice may still come
+  {
+    static bool pending = false;
+    static int64_t next_press = 0;
+    static int presses = 0;
+    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock::now().time_since_epoch()).count();
+    int64_t at = g_disconnect_ms.load();
+    notice_wait = (at && now_ms - at < 8000) || pending;
+    if (at && now_ms - at < 20000 && g_in_menus && dialogs > 0 && !pending && g_disconnect_reason.load() >= 0) {
+      pending = true;
+      g_disconnect_ms = 0;
+      next_press = now_ms + 1000, presses = 0;  // once it has come in
+    }
+    // OK held 150 ms, again every 1.5 s until the dialog is gone (5 tries).
+    if (pending && dialogs > 0 && now_ms >= next_press && presses < 5) {
+      g_press_a_until = now_ms + 150;
+      next_press = now_ms + 1500, ++presses;
+      RT_INFO("menus: OK on the game's connection notice (reason %d)", g_disconnect_reason.load());
+    }
+    if (pending && (dialogs == 0 || presses >= 5) && now_ms >= next_press - 1300) {
+      pending = false;
+      g_lost_notice = true;
+    }
+  }
+  // A game that never started (the join failed, the host could not be
+  // reached): still in the front end with no dialog up for a while and no
+  // level file opened, the main menu comes back instead of leaving the
+  // game's own on screen. (Once a level's files load, a slow load is left
+  // alone.)
+  static double idle_since = -1;
+  if (CustomMenus() && g_suppress_main && g_in_menus && !g_level_files && title_passed && dialogs == 0 && !g_open) {
+    if (idle_since < 0) idle_since = now;
+    if (now - idle_since > (g_host_map.empty() ? 15.0 : 25.0)) {
+      RT_INFO("menus: the game did not start, back to the main menu");
+      g_suppress_main = false;
+      g_show_failure = true;
+    }
+  } else {
+    idle_since = -1;
+  }
+  if (CustomMenus() && !g_open && g_in_menus && title_passed && dialogs == 0 && !g_suppress_main && !notice_wait) {
     OpenMode(kModeMain, kModeSettings);
     g_wait_release = false;
+    RT_INFO("menus: our main menu shown");
+    // Back from a game whose connection was lost: why.
+    if (g_lost_notice) {
+      int reason = g_disconnect_reason.exchange(-1);
+      g_status = reason == 4 ? L"You were kicked from the server."
+                             : L"The connection to the server was lost: the host left, or the network dropped.";
+      g_show_failure = false;
+      g_lost_notice = false;
+    }
+    // Back from a game that never started: why.
+    if (g_show_failure && !g_start_failed.empty()) g_status = g_start_failed;
+    g_show_failure = false;
   }
   // A level loading under the main menu (or its pages): the game takes over.
   if (g_open && !g_in_menus && g_mode != kModePause && g_back_to != kModePause && g_mode != kModeSettings) Close();
@@ -923,6 +1202,16 @@ bool Update(HWND__* window, bool title_passed) {
 
   if (!g_open) {
     if (pressed[VK_F10]) OpenMode(kModeSettings, kModeSettings);
+    // F2: the FPS counter off, FPS, FULL.
+    if (pressed[VK_F2]) {
+      if (Setting* s = Find("fps_overlay")) {
+        s->index = (s->index + 1) % int(s->values.size());
+        s->touched = true;
+        ApplyLive();
+        Save();
+        g_dirty = true;
+      }
+    }
     if (!g_open) {
       // After closing: nothing until the keys and buttons are let go.
       if (g_wait_release) {

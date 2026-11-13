@@ -312,7 +312,10 @@ std::string ReadAnsiString(uint32_t p) {
 }
 
 }  // namespace rt
-extern "C" double g_bf_timebase_scale = 0;
+extern "C" double g_bf_timebase_scale = 0;  // 49.875 MHz / host TSC rate (at 1x)
+struct BfClock { double scale; int64_t offset; };  // (as ppc_overrides.h)
+static BfClock g_bf_clocks[256];  // (never freed: a reader may still hold an old one)
+extern "C" const BfClock* g_bf_clock = &g_bf_clocks[0];
 namespace rt {
 
 uint64_t HostTicksPerSecond() {
@@ -325,9 +328,46 @@ uint64_t HostTicksPerSecond() {
     double secs = std::chrono::duration<double>(b - a).count();
     uint64_t r = uint64_t(double(t1 - t0) / secs);
     g_bf_timebase_scale = double(kGuestTimebase) / double(r);
+    g_bf_clocks[0].scale = g_bf_timebase_scale;
     return r;
   }();
   return rate;
+}
+
+extern double g_time_speed;  // (kernel.h)
+
+// The kernel's clocks: guest seconds at host time t0, and the speed since.
+struct HostClock {
+  std::chrono::steady_clock::time_point t0;
+  double guest0, speed;
+};
+static HostClock g_host_clocks[256] = {{std::chrono::steady_clock::now(), 0.0, 1.0}};
+static std::atomic<const HostClock*> g_host_clock{&g_host_clocks[0]};
+
+double GuestSeconds() {
+  const HostClock* c = g_host_clock.load(std::memory_order_acquire);
+  return c->guest0 + std::chrono::duration<double>(std::chrono::steady_clock::now() - c->t0).count() * c->speed;
+}
+
+void SetTimeSpeed(double speed) {
+  static std::mutex m;
+  static int n = 0;
+  std::lock_guard lock(m);
+  if (speed == g_time_speed) return;
+  HostTicksPerSecond();
+  ++n;
+  uint64_t tsc = __rdtsc();
+  const BfClock* c = g_bf_clock;
+  int64_t guest = int64_t(double(tsc) * c->scale) + c->offset;
+  BfClock& next = g_bf_clocks[n % 256];
+  next.scale = g_bf_timebase_scale * speed;
+  next.offset = guest - int64_t(double(tsc) * next.scale);
+  __atomic_store_n(&g_bf_clock, &next, __ATOMIC_RELEASE);
+  HostClock& h = g_host_clocks[n % 256];
+  h.t0 = std::chrono::steady_clock::now(), h.guest0 = GuestSeconds(), h.speed = speed;
+  g_host_clock.store(&h, std::memory_order_release);
+  g_time_speed = speed;
+  RT_INFO("game speed %.2fx", speed);
 }
 
 }  // namespace rt

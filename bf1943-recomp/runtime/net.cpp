@@ -355,8 +355,10 @@ GUEST_IMPORT(NetDll_select) {
   FdsToHost(ARG32(7), &e);
   timeval tv, *ptv = nullptr;
   if (ARG32(8)) {
-    tv.tv_sec = long(Ld32(ARG32(8)));
-    tv.tv_usec = long(Ld32(ARG32(8) + 4));
+    // (--speed: in the guest's time, which passes g_time_speed times as fast)
+    int64_t us = int64_t(double(int64_t(Ld32(ARG32(8))) * 1000000 + int64_t(Ld32(ARG32(8) + 4))) / g_time_speed);
+    tv.tv_sec = long(us / 1000000);
+    tv.tv_usec = long(us % 1000000);
     ptv = &tv;
   }
   int n = 0;
@@ -450,13 +452,37 @@ void NetStat(uint32_t s, const sockaddr_in& a, bool out, int bytes) {
   }
 }
 
+// --train: only this machine's packets (its own bots and client); others' are
+// dropped as they come.
+bool Foreign(const sockaddr_in& a) {
+  if (!g_training) return false;
+  uint32_t ip = a.sin_addr.s_addr;
+  if ((ntohl(ip) >> 24) == 127 || ip == 0 || ip == g_lan_ip) return false;
+  static const std::set<uint32_t> mine = [] {
+    std::set<uint32_t> out;
+    char name[256] = {};
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    if (gethostname(name, sizeof(name)) == 0 && getaddrinfo(name, nullptr, &hints, &res) == 0) {
+      for (addrinfo* p = res; p; p = p->ai_next) out.insert(reinterpret_cast<sockaddr_in*>(p->ai_addr)->sin_addr.s_addr);
+      freeaddrinfo(res);
+    }
+    return out;
+  }();
+  return !mine.count(ip);
+}
+
 // recvfrom(caller, s, buf, len, flags, from, fromlen*)
 GUEST_IMPORT(NetDll_recvfrom) {
   sockaddr_in a{};
   int len = sizeof(a);
   bool vdp = IsVdp(ARG32(4)) && ARG32(6) > 2;
   uint8_t* buf = G(ARG32(5)) + (vdp ? 2 : 0);
-  int r = ::recvfrom(Host(ARG32(4)), (char*)buf, int(ARG32(6)) - (vdp ? 2 : 0), int(ARG32(7)), (sockaddr*)&a, &len);
+  int r;
+  do {
+    len = sizeof(a);
+    r = ::recvfrom(Host(ARG32(4)), (char*)buf, int(ARG32(6)) - (vdp ? 2 : 0), int(ARG32(7)), (sockaddr*)&a, &len);
+  } while (r >= 0 && Foreign(a));
   if (vdp && r >= 0) {
     St16(ARG32(5), uint16_t(r));  // game data only, no voice
     r += 2;
@@ -667,8 +693,12 @@ int RecvInto(SOCKET s, uint32_t bufs, uint32_t count, uint32_t from, uint32_t fr
   DWORD got = 0, flags = 0;
   sockaddr_in a{};
   int alen = sizeof(a);
-  int r = from ? WSARecvFrom(s, host.data(), DWORD(host.size()), &got, &flags, (sockaddr*)&a, &alen, nullptr, nullptr)
-               : WSARecv(s, host.data(), DWORD(host.size()), &got, &flags, nullptr, nullptr);
+  int r;
+  do {
+    flags = 0, alen = sizeof(a);
+    r = from ? WSARecvFrom(s, host.data(), DWORD(host.size()), &got, &flags, (sockaddr*)&a, &alen, nullptr, nullptr)
+             : WSARecv(s, host.data(), DWORD(host.size()), &got, &flags, nullptr, nullptr);
+  } while (r == 0 && from && Foreign(a));
   if (r != 0) {
     *err = WSAGetLastError();
     return -1;

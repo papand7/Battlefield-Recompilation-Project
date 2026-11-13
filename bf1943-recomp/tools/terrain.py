@@ -3,6 +3,11 @@ terrain-00.fbrb, extracted with tools/fbrb.py) and writes the ground as
 triangles, for the navigation generator.
 
   python tools/terrain.py <Heightfield-000.res> <out.obj> [x0 z0 x1 z1] [--step N]
+  python tools/terrain.py <Heightfield-000.res> --hf <out.hf>
+
+--hf: the heights for the bots' line of sight and their ways out of water
+(Bad Company, nav/<map>.hf): "BFHF", little-endian x0, y0, z0, x1, y1, z1
+(floats), the samples per side (u32), then the samples as in the tile.
 
 The tile: a bounding box (6 big-endian floats: min x, y, z, max x, y, z), five
 big-endian u32 (the first its samples per side, the second its level), then
@@ -48,7 +53,17 @@ def write_obj(hf, path, x0, z0, x1, z1, step):
     return (len(xs) - 1) * (len(zs) - 1) * 2
 
 
+def write_hf(hf, path):
+    with open(path, 'wb') as f:
+        f.write(b'BFHF' + struct.pack('<6fI', hf.x0, hf.y0, hf.z0, hf.x1, hf.y1, hf.z1, hf.n))
+        f.write(hf.d[DATA:DATA + 2 * hf.n * hf.n])
+    print(f'{hf.n} x {hf.n} heights to {path}')
+
+
 def main():
+    if '--hf' in sys.argv:
+        write_hf(Heightfield(sys.argv[1]), sys.argv[sys.argv.index('--hf') + 1])
+        return
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     if len(args) < 2:
         sys.exit(__doc__)

@@ -93,6 +93,25 @@ struct ShaderConfig {
   uint32_t show_fetch = UINT32_MAX;
   float show_width = 2560.0f, show_height = 1440.0f, show_y0 = 0.0f, show_x0 = 0.0f;
   uint32_t c_light = 1, c_up = 2, c_sky = 3, c_ground = 4, c_sun = 5;
+  // The game's tone mapping pass (a line with only these): tonemap=r1.xyz@11
+  // is the exposed HDR colour, which the game only clips; after this
+  // instruction it goes through a filmic curve (highlights roll off), then on
+  // through the game's own gamma, colour matrix and vignette. tm_exposure=
+  // scales it first, tm_saturation= moves it away from (> 1) or towards its
+  // grey before the curve.
+  Tap tonemap;
+  float tm_exposure = 1.0f;
+  // A particle shader (a line with only this): soft=<metres> fades its
+  // output where it comes that close to the scene behind it (no hard line
+  // where smoke meets the ground or a wall).
+  float soft = 0.0f;
+  // camv=1: no view vector in the shader (the point-light variants): the
+  // camera from the scene effects (kMaterialCameraOffset) minus wp. pl=1: the
+  // shader's two point lights (position c6, colour c7; c9, c8) added to the
+  // PBR light, as the game does (colour over the distance, no shadow).
+  bool cam_from_buffer = false;
+  bool point_lights = false;
+  float tm_saturation = 1.0f;
 };
 
 // Reads the shader table. Returns the number of shaders.
@@ -106,6 +125,18 @@ const ShaderConfig* Find(uint64_t pixel_shader_hash);
 // each) into the storage buffer in the shared memory and EDRAM set, binding 3;
 // the nearest pixel wins. Set by the command processor before translation.
 constexpr uint32_t kMaterialPitch = 4096, kMaterialRows = 2560;
+// After the materials (uints from kMaterialDepthOffset, same pitch): the
+// scene's view depth (clip w, as float bits) for each pixel, written by the
+// scene effects at the world's depth copy, read by the soft particles.
+constexpr uint32_t kMaterialDepthOffset = kMaterialPitch * kMaterialRows;
+constexpr uint64_t kMaterialBufferBytes = uint64_t(kMaterialDepthOffset) * 2 * 4;
+// After both (not cleared each frame): the camera position (3 floats, last
+// frame's), for lit shaders without a view vector of their own (camv=1).
+constexpr uint32_t kMaterialCameraOffset = kMaterialDepthOffset * 2;
+// Then (FSR 3): the frame right after the game's tone mapping pass, before the
+// HUD, as RGBA8 per pixel (same pitch), written by that pass.
+constexpr uint32_t kMaterialColorOffset = kMaterialCameraOffset + 64;
+constexpr uint64_t kMaterialBufferAllocBytes = (uint64_t(kMaterialColorOffset) + kMaterialDepthOffset) * 4;
 void SetMaterialOutput(bool on);
 // Parallax depth multiplier for shaders translated from now on (the PC
 // settings page: 0 off, 1 the table's pom=).
@@ -119,5 +150,23 @@ bool MaterialOutput();
 // starts.
 void SetGameShadowsOff(bool off);
 bool GameShadowsOff();
+// The filmic tone mapping's strength (0 the game's clipping, 1 the curve;
+// BF_TONEMAP), for shaders translated from now on.
+void SetTonemap(float strength);
+// Soft particles (the soft= entries) for shaders translated from now on.
+void SetSoftParticles(bool on);
+bool SoftParticles();
+// FSR 3: the tone mapping pass also writes its output to the buffer
+// (kMaterialColorOffset), for shaders translated from now on.
+void SetFsrCapture(bool on);
+bool FsrCapture();
+float Tonemap();
+// Whether the table has the game's tone mapping pass and the curve is on (the
+// HDR10 output then undoes the curve to get the highlights back).
+bool Filmic();
+// A hash of everything here that changes the translated shaders (the table
+// file, the switches above): the driver's pipeline cache is kept per key, so
+// entries for an older table do not pile up in it.
+uint64_t TranslationKey();
 
 }  // namespace xe::gpu::pbr

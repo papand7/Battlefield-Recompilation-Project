@@ -10,7 +10,7 @@
 
 namespace botapi {
 
-constexpr int kVersion = 6;      // bump when a struct here changes
+constexpr int kVersion = 7;      // bump when a struct here changes
 constexpr int kMaxBots = 16;
 constexpr int kMemSize = 1024;   // per-bot brain state
 constexpr float kPi = 3.14159265f;
@@ -25,6 +25,7 @@ struct Soldier {
   Vec pos;
   float yaw, pitch;  // radians; forward = (sin yaw, cos yaw) in x/z
   uint32_t vehicle;  // the vehicle it sits in (its seat), 0 on foot
+  float health;      // 0-100
 };
 struct Point { uint32_t obj; int owner; Vec pos; };
 struct Vehicle { uint32_t obj; char kind[32]; Vec pos; };
@@ -72,6 +73,16 @@ struct World {
   // radius of `at` of what (0 where players of that team went, 1 where they
   // died, 2 where they killed from). Null without it.
   float (*learned)(int what, int team, Vec at, float radius);
+  // The advisor (bot_llm.h, --bot-llm; else what it learned on this map): a
+  // small vision model shown the bot's surroundings with places around it to
+  // walk to, asked which one solves the situation (kind 1: stuck, 2: cover,
+  // 4: standing idle; true: asked, one question at a time). Its answer comes later: true once,
+  // with the place. The host judges what came of it and learns from that.
+  bool (*ask)(int slot, int kind, const char* situation);
+  bool (*answer)(int slot, Vec* place);
+  // --train: a server only bots play on; asking about medium situations too
+  // (kind 5: where to fight a new enemy from).
+  bool training;
 };
 
 using ThinkFn = void (*)(World*);

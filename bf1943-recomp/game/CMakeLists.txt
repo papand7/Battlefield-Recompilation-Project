@@ -100,3 +100,10 @@ add_custom_command(TARGET bf1943 POST_BUILD
 # What the bots learned of each map (runtime/bot_knowledge.h, tools/bot_knowledge.py).
 add_custom_command(TARGET bf1943 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${ROOT}/data/bot_knowledge $<TARGET_FILE_DIR:bf1943>/bot_knowledge)
+# FSR 3 (bf_fsr3.cc loads them at run time; AMD's licence: thirdparty/fidelityfx/license.md).
+add_custom_command(TARGET bf1943 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ROOT}/thirdparty/fidelityfx/bin/amd_fidelityfx_loader_vk.dll
+          ${ROOT}/thirdparty/fidelityfx/bin/amd_fidelityfx_upscaler_vk.dll $<TARGET_FILE_DIR:bf1943>)
+# DLSS (NGX loads it from the exe's folder; NVIDIA's licence: thirdparty/dlss/LICENSE.txt).
+add_custom_command(TARGET bf1943 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ROOT}/thirdparty/dlss/bin/nvngx_dlss.dll $<TARGET_FILE_DIR:bf1943>)

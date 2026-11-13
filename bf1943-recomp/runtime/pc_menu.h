@@ -53,6 +53,10 @@ Rect LeftArrowRect(int visible_index);
 Rect RightArrowRect(int visible_index);
 Rect PromptRect(int i);
 
+// Bad Company's menu look (white condensed type over the darkened game, the
+// title on its side) instead of bf1943's field orders; before the first Show.
+void SetBadCompanyLook();
+
 // Show (or update) the menu; Hide takes it away.
 void Show(const View& view);
 void Hide();

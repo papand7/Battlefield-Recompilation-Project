@@ -43,11 +43,23 @@ namespace rt::pcmenu {
 // ---- layout ------------------------------------------------------------------
 
 constexpr int kBand = 700;         // the olive band's width (button screens)
-constexpr int kRowTop = 330, kRowH = 52;
-constexpr int kListL = 110, kListR = 1810;
+// Bad Company's look (SetBadCompanyLook) moves the list right of its title.
+bool g_bc = false;
+int kRowTop = 330, kRowH = 52;
+int kListL = 110, kListR = 1810;
+int kTabT = 236, kTabB = 300, kTabStep = 286, kPromptT = 985;
 
-Rect ButtonRect(int i) { return {60, 470 + i * 92, 660, 470 + i * 92 + 80}; }
-Rect TabRect(int i) { return {kListL + i * 286, 236, kListL + i * 286 + 274, 300}; }
+void SetBadCompanyLook() {
+  g_bc = true;
+  kRowTop = 262, kRowH = 50, kListL = 340, kListR = 1800;
+  kTabT = 168, kTabB = 216, kTabStep = (kListR - kListL + 12) / 6, kPromptT = 930;
+}
+
+Rect ButtonRect(int i) {
+  if (g_bc) return {kListL, 420 + i * 80, kListL + 720, 420 + i * 80 + 66};
+  return {60, 470 + i * 92, 660, 470 + i * 92 + 80};
+}
+Rect TabRect(int i) { return {kListL + i * kTabStep, kTabT, kListL + i * kTabStep + kTabStep - 12, kTabB}; }
 Rect RowRect(int i) { return {kListL, kRowTop + i * kRowH, kListR, kRowTop + i * kRowH + kRowH - 4}; }
 Rect LeftArrowRect(int i) {
   Rect r = RowRect(i);
@@ -57,7 +69,7 @@ Rect RightArrowRect(int i) {
   Rect r = RowRect(i);
   return {r.r - 70, r.t, r.r, r.b};
 }
-Rect PromptRect(int i) { return {kListL + i * 330, 985, kListL + i * 330 + 310, 1041}; }
+Rect PromptRect(int i) { return {kListL + i * 330, kPromptT, kListL + i * 330 + 310, kPromptT + 56}; }
 
 namespace {
 
@@ -398,6 +410,289 @@ void DrawBusy(Graphics& g, const View& v, double now) {
   Stamp(g, L"IN TRANSIT", kW / 2.0f, 760, -6, 0.7f);
 }
 
+// ---- Bad Company's look ---------------------------------------------------------------------
+// As the game's own menus (and bc_mp_menu.cpp): the game darkened behind,
+// the page title worn white on its side left of a white rule, white
+// condensed capitals with the game's wide spacing, the selected row on a
+// white bar, key caps for the prompts. The type is Bahnschrift (a DIN face
+// that comes with Windows, close to the game's), else Arial Narrow.
+
+struct BcFonts {
+  std::unique_ptr<FontFamily> body, bold, title;
+};
+BcFonts* g_bc_fonts = nullptr;
+std::unique_ptr<FontFamily> BcFamily(std::initializer_list<const wchar_t*> names) {
+  for (const wchar_t* n : names) {
+    auto f = std::make_unique<FontFamily>(n);
+    if (f->IsAvailable()) return f;
+  }
+  return std::make_unique<FontFamily>(L"Arial");
+}
+void LoadBcFonts() {
+  g_bc_fonts = new BcFonts;
+  g_bc_fonts->body = BcFamily({L"Bahnschrift SemiCondensed", L"Bahnschrift Condensed", L"Arial Narrow"});
+  g_bc_fonts->bold = BcFamily({L"Bahnschrift SemiBold SemiConden", L"Bahnschrift SemiBold Condensed", L"Arial Narrow"});
+  g_bc_fonts->title = BcFamily({L"Bahnschrift SemiBold Condensed", L"Bahnschrift Condensed", L"Impact"});
+}
+Font BcBody(float px) { return Font(g_bc_fonts->body.get(), px, FontStyleRegular, UnitPixel); }
+Font BcBold(float px) { return Font(g_bc_fonts->bold.get(), px, FontStyleRegular, UnitPixel); }
+
+const Color kBcWhite(255, 240, 240, 236), kBcBlack(255, 12, 12, 12), kBcGrey(255, 160, 160, 155);
+
+// Text with the game's wide letter spacing (GDI+ has none): one character at a time.
+float BcWidth(Graphics& g, const std::wstring& s, const Font& font, float tracking) {
+  const StringFormat* fmt = StringFormat::GenericTypographic();
+  float w = 0;
+  for (wchar_t c : s) {
+    RectF box;
+    wchar_t one[2] = {c, 0};
+    g.MeasureString(one, 1, &font, PointF(0, 0), fmt, &box);
+    w += (c == L' ' ? font.GetSize() * 0.28f : box.Width) + tracking;
+  }
+  return s.empty() ? 0 : w - tracking;
+}
+void BcText(Graphics& g, const std::wstring& s, const Font& font, const Color& color, float x, float y,
+            float tracking, float max_w = 1e9f) {
+  const StringFormat* fmt = StringFormat::GenericTypographic();
+  SolidBrush brush(color);
+  float x0 = x;
+  for (wchar_t c : s) {
+    RectF box;
+    wchar_t one[2] = {c, 0};
+    g.MeasureString(one, 1, &font, PointF(0, 0), fmt, &box);
+    float step = (c == L' ' ? font.GetSize() * 0.28f : box.Width) + tracking;
+    if (x + step - x0 > max_w) break;
+    if (c != L' ') g.DrawString(one, 1, &font, PointF(x, y), fmt, &brush);
+    x += step;
+  }
+}
+// Centred vertically in a row from top to bottom.
+void BcRowText(Graphics& g, const std::wstring& s, const Font& f, const Color& c, float x, float top, float bottom,
+               float tracking, float max_w = 1e9f) {
+  BcText(g, s, f, c, x, top + (bottom - top - f.GetSize() * 1.18f) / 2, tracking, max_w);
+}
+
+// Value noise for the worn title.
+float BcHash(int x, int y) {
+  uint32_t h = uint32_t(x) * 374761393u + uint32_t(y) * 668265263u;
+  h = (h ^ (h >> 13)) * 1274126177u;
+  return float((h ^ (h >> 16)) & 0xFFFF) / 65535.0f;
+}
+float BcNoise(float x, float y) {
+  int ix = int(std::floor(x)), iy = int(std::floor(y));
+  float fx = x - ix, fy = y - iy;
+  fx = fx * fx * (3 - 2 * fx), fy = fy * fy * (3 - 2 * fy);
+  float a = BcHash(ix, iy), b = BcHash(ix + 1, iy), c = BcHash(ix, iy + 1), d = BcHash(ix + 1, iy + 1);
+  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+}
+// The title, worn like the game's: white type eaten by noise, made once per text.
+Bitmap* BcTitle(const std::wstring& text) {
+  // (Never freed: the render thread can still be drawing at exit.)
+  static std::wstring& made_for = *new std::wstring;
+  static std::unique_ptr<Bitmap>& bmp = *new std::unique_ptr<Bitmap>;
+  if (bmp && made_for == text) return bmp.get();
+  made_for = text;
+  Font font(g_bc_fonts->title.get(), 170, FontStyleRegular, UnitPixel);
+  Bitmap probe(8, 8, PixelFormat32bppARGB);
+  Graphics pg(&probe);
+  int w = int(BcWidth(pg, text, font, 4)) + 40, h = 190;
+  bmp = std::make_unique<Bitmap>(w, h, PixelFormat32bppARGB);
+  {
+    Graphics g(bmp.get());
+    g.Clear(Color(0, 0, 0, 0));
+    g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+    BcText(g, text, font, Color(255, 245, 245, 242), 10, 2, 4);
+  }
+  BitmapData data;
+  Gdiplus::Rect all(0, 0, w, h);
+  bmp->LockBits(&all, ImageLockModeRead | ImageLockModeWrite, PixelFormat32bppARGB, &data);
+  for (int y = 0; y < h; ++y) {
+    uint32_t* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(data.Scan0) + size_t(y) * data.Stride);
+    for (int x = 0; x < w; ++x) {
+      float a = float(row[x] >> 24) / 255.0f;
+      if (a <= 0) continue;
+      // Blotches, scratches across, and fine specks.
+      float m = BcNoise(x * 0.07f, y * 0.07f) * 0.45f + BcNoise(x * 0.3f, y * 0.3f) * 0.35f +
+                BcNoise(x * 0.9f, y * 0.25f) * 0.2f;
+      float keep = std::clamp((m - 0.24f) * 9.0f, 0.0f, 1.0f);
+      if (BcHash(x * 3 + 1, y * 7 + 5) < 0.05f) keep *= 0.1f;
+      row[x] = (uint32_t(a * keep * 255.0f) << 24) | (row[x] & 0xFFFFFF);
+    }
+  }
+  bmp->UnlockBits(&data);
+  return bmp.get();
+}
+// The game darkened behind (more at the edges and on the left), with grain.
+std::vector<uint32_t> MakeBcBackdrop() {
+  std::vector<uint32_t> px(size_t(kW) * kH);
+  for (int y = 0; y < kH; ++y)
+    for (int x = 0; x < kW; ++x) {
+      float dx = (x - kW * 0.62f) / kW, dy = (y - kH * 0.45f) / kH;
+      // Nearly black: the game's menu under it must not show through, only
+      // a hint of the picture behind.
+      // Solid where the game draws its own menus (left, and the prompts along
+      // the bottom), easing to 0.93 towards the top right.
+      float a = 0.93f + 0.05f * std::min(1.0f, (dx * dx + dy * dy) * 1.6f);
+      float solid = std::max(std::clamp((1000.0f - x) / 150.0f, 0.0f, 1.0f), std::clamp((y - 880.0f) / 80.0f, 0.0f, 1.0f));
+      a += (1.0f - a) * solid;
+      int v = std::clamp(int(9 + (BcHash(x, y) - 0.5f) * 10.0f), 0, 255);
+      px[size_t(y) * kW + x] = (uint32_t(std::min(a, 1.0f) * 255) << 24) | (v << 16) | (v << 8) | v;
+    }
+  return px;
+}
+
+constexpr float kBcRuleX = 292;
+
+void BcTitleAndRule(Graphics& g, const std::wstring& title, float fade) {
+  if (!title.empty()) {
+    Bitmap* bmp = BcTitle(title);
+    GraphicsState st = g.Save();
+    // On its side, reading upwards, its foot near the bottom.
+    g.TranslateTransform(kBcRuleX - 196, 905 + 6);
+    g.RotateTransform(-90);
+    ColorMatrix cm = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, fade, 0}, {0, 0, 0, 0, 1}}};
+    ImageAttributes ia;
+    ia.SetColorMatrix(&cm);
+    g.DrawImage(bmp, Gdiplus::Rect(0, 0, int(bmp->GetWidth()), int(bmp->GetHeight())), 0, 0,
+                int(bmp->GetWidth()), int(bmp->GetHeight()), UnitPixel, &ia);
+    g.Restore(st);
+  }
+  SolidBrush rule(Color(235, 240, 240, 236));
+  g.FillRectangle(&rule, kBcRuleX - 2, 0.0f, 4.0f, float(kH));
+}
+
+// A prompt: the key in a white-ringed rounded cap, its label in capitals.
+void BcPrompt(Graphics& g, const Rect& r, const std::wstring& key, const std::wstring& label) {
+  Font kf = BcBold(22), lf = BcBody(32);
+  float kw = std::max(42.0f, BcWidth(g, key, kf, 1) + 22), top = float(r.t) + 7, h = 42;
+  GraphicsPath cap;
+  float rr = 10;
+  cap.AddArc(float(r.l), top, rr * 2, rr * 2, 180, 90);
+  cap.AddArc(r.l + kw - rr * 2, top, rr * 2, rr * 2, 270, 90);
+  cap.AddArc(r.l + kw - rr * 2, top + h - rr * 2, rr * 2, rr * 2, 0, 90);
+  cap.AddArc(float(r.l), top + h - rr * 2, rr * 2, rr * 2, 90, 90);
+  cap.CloseFigure();
+  SolidBrush dark(Color(255, 22, 22, 22));
+  Pen ring(kBcWhite, 3);
+  g.FillPath(&dark, &cap);
+  g.DrawPath(&ring, &cap);
+  BcText(g, key, kf, kBcWhite, r.l + (kw - BcWidth(g, key, kf, 1)) / 2, top + 8, 1);
+  BcText(g, label, lf, kBcWhite, r.l + kw + 16, top + 2, 4, float(r.r - r.l) - kw - 16);
+}
+
+void DrawBcList(Graphics& g, const View& v, Anim& a, double now, float dt) {
+  float in = Ease(float((now - a.page_at) / 0.22));
+  BYTE fa = BYTE(255 * in);
+  auto faded = [&](const Color& c, float k = 1.0f) { return Color(BYTE(fa * k), c.GetR(), c.GetG(), c.GetB()); };
+  BcTitleAndRule(g, v.title, std::min(1.0f, float((now - a.open_at) / 0.22)));
+  // Tabs: capitals in a row, the open one on a white bar (sliding), a line under.
+  if (!v.tabs.empty()) {
+    float target = float(TabRect(v.tab).l);
+    if (a.tab < 0) a.tab = target;
+    a.tab += (target - a.tab) * std::min(1.0f, dt * 18);
+    Rect t0 = TabRect(0);
+    SolidBrush bar(kBcWhite);
+    g.FillRectangle(&bar, a.tab, float(t0.t), float(t0.r - t0.l), float(t0.b - t0.t));
+    Font tf = BcBold(30);
+    for (size_t i = 0; i < v.tabs.size(); ++i) {
+      Rect r = TabRect(int(i));
+      bool on = std::abs(a.tab - r.l) < (r.r - r.l) * 0.5f;
+      float w = BcWidth(g, v.tabs[i], tf, 3);
+      BcRowText(g, v.tabs[i], tf, on ? kBcBlack : kBcWhite, r.l + (r.r - r.l - w) / 2, float(r.t), float(r.b), 3);
+    }
+    if (v.tab_focus) {
+      Rect r = TabRect(v.tab);
+      Pen p(kBcWhite, 3);
+      g.DrawRectangle(&p, a.tab - 5, float(r.t) - 5, float(r.r - r.l) + 10, float(r.b - r.t) + 10);
+    }
+    SolidBrush line(Color(200, 240, 240, 236));
+    g.FillRectangle(&line, float(kListL), float(t0.b) + 18, float(kListR - kListL), 2.0f);
+  }
+  // Rows: the selected one on a white bar that slides to it.
+  if (v.row >= 0) {
+    float target = float(RowRect(v.row).t);
+    if (a.sel < 0) a.sel = target;
+    a.sel += (target - a.sel) * std::min(1.0f, dt * 20);
+    SolidBrush bar(faded(kBcWhite));
+    g.FillRectangle(&bar, float(kListL), a.sel + 2, float(kListR - kListL), float(kRowH - 6));
+  }
+  Font rf = BcBody(32), vf = BcBold(32), tagf = BcBody(22);
+  for (size_t i = 0; i < v.rows.size(); ++i) {
+    Rect r = RowRect(int(i));
+    bool on = v.row >= 0 && std::abs(a.sel - r.t) < kRowH * 0.5f;
+    Color ink = on ? faded(kBcBlack) : faded(kBcWhite, 0.92f);
+    const Row& row = v.rows[i];
+    float top = float(r.t) + 2, bottom = float(r.b) - 4;
+    BcRowText(g, row.label, rf, ink, r.l + 20.0f, top, bottom, 3, 760);
+    if (!row.tag.empty()) {
+      float w = BcWidth(g, row.tag, tagf, 2);
+      BcRowText(g, row.tag, tagf, on ? faded(Color(255, 150, 20, 16)) : faded(Color(255, 225, 90, 70)),
+                r.r - 580.0f - w, top, bottom, 2);
+    }
+    Rect la = LeftArrowRect(int(i)), ra = RightArrowRect(int(i));
+    if (row.choice) {
+      BcRowText(g, L"<", vf, ink, la.l + 24.0f, top, bottom, 0);
+      BcRowText(g, L">", vf, ink, ra.l + 30.0f, top, bottom, 0);
+    }
+    float vw = BcWidth(g, row.value, vf, 3);
+    float span = float(ra.l - la.r);
+    BcRowText(g, row.value, vf, ink, la.r + std::max(0.0f, (span - vw) / 2), top, bottom, 3, span);
+  }
+  if (v.more_above) BcText(g, L"▲", BcBody(24), faded(kBcWhite), kListR - 40.0f, kRowTop - 34.0f, 0);
+  if (v.more_below) BcText(g, L"▼", BcBody(24), faded(kBcWhite), kListR - 40.0f, float(kRowTop + kVisibleRows * kRowH) + 2, 0);
+  // The note under the rows, on up to two lines.
+  float note_y = float(kRowTop + kVisibleRows * kRowH) + 30;
+  Font nf = BcBody(28);
+  std::wstring line, word;
+  int lines = 0;
+  auto put = [&](bool last) {
+    if (lines < 2 && !line.empty()) BcText(g, line, nf, faded(kBcGrey), float(kListL) + 4, note_y + lines * 36.0f, 2, float(kListR - kListL));
+    ++lines, line.clear();
+    (void)last;
+  };
+  for (size_t i = 0; i <= v.desc.size(); ++i) {
+    wchar_t c = i < v.desc.size() ? v.desc[i] : L' ';
+    if (c != L' ') { word += c; continue; }
+    if (word.empty()) continue;
+    std::wstring t = line.empty() ? word : line + L" " + word;
+    if (!line.empty() && BcWidth(g, t, nf, 2) > kListR - kListL - 8) put(false), t = word;
+    line = t, word.clear();
+  }
+  put(true);
+  for (size_t i = 0; i < v.prompts.size(); ++i) BcPrompt(g, PromptRect(int(i)), v.prompts[i].first, v.prompts[i].second);
+}
+
+void DrawBcButtons(Graphics& g, const View& v, Anim& a, double now, float dt) {
+  float in = Ease(float((now - a.open_at) / 0.22));
+  BcTitleAndRule(g, v.title.empty() ? L"PC" : v.title, in);
+  if (!v.subtitle.empty()) BcText(g, v.subtitle, BcBody(32), kBcGrey, float(kListL), 330, 4);
+  float target = float(ButtonRect(v.button).t);
+  if (a.sel < 0) a.sel = target;
+  a.sel += (target - a.sel) * std::min(1.0f, dt * 20);
+  Rect b0 = ButtonRect(0);
+  SolidBrush bar(kBcWhite);
+  g.FillRectangle(&bar, float(b0.l), a.sel, float(b0.r - b0.l), float(b0.b - b0.t));
+  Font bf = BcBold(46);
+  for (size_t i = 0; i < v.buttons.size(); ++i) {
+    Rect r = ButtonRect(int(i));
+    bool on = std::abs(a.sel - r.t) < (r.b - r.t) * 0.5f;
+    BcRowText(g, v.buttons[i], bf, on ? kBcBlack : kBcWhite, r.l + 24.0f, float(r.t), float(r.b), 4);
+  }
+  if (!v.desc.empty()) BcText(g, v.desc, BcBody(30), kBcGrey, 1100, 420, 2, 760);
+  for (size_t i = 0; i < v.prompts.size(); ++i) BcPrompt(g, PromptRect(int(i)), v.prompts[i].first, v.prompts[i].second);
+}
+
+void DrawBcBusy(Graphics& g, const View& v, double now) {
+  RectF box(kW / 2.0f - 380, 380, 760, 260);
+  SolidBrush black(Color(250, 0, 0, 0));
+  Pen border(kBcWhite, 3.5f);
+  g.FillRectangle(&black, box);
+  g.DrawRectangle(&border, box);
+  BcText(g, L"PLEASE WAIT", BcBold(40), kBcWhite, box.X + 26, box.Y + 26, 3);
+  int dots = int(now * 3) % 4;
+  BcText(g, v.desc + std::wstring(dots, L'.'), BcBody(34), kBcWhite, box.X + 26, box.Y + 86, 2, box.Width - 52);
+}
+
 // ---- the thread ---------------------------------------------------------------------------
 
 void RenderThread() {
@@ -405,9 +700,10 @@ void RenderThread() {
   ULONG_PTR token;
   GdiplusStartup(&token, &input, nullptr);
   LoadFonts();
-  std::vector<uint32_t> paper = MakePaper();
+  if (g_bc) LoadBcFonts();
+  std::vector<uint32_t> paper = g_bc ? MakeBcBackdrop() : MakePaper();
   std::vector<uint32_t> banded = paper;
-  PaintOlive(banded, 0, kBand);
+  if (!g_bc) PaintOlive(banded, 0, kBand);
   Bitmap canvas(kW, kH, PixelFormat32bppARGB);
   std::vector<uint8_t> rgba(size_t(kW) * kH * 4);
   Anim anim;
@@ -459,7 +755,7 @@ void RenderThread() {
     for (int y = 0; y < kH; ++y) {
       uint32_t* dst = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(data.Scan0) + size_t(y) * data.Stride);
       const uint32_t* src = &bg[size_t(y) * kW];
-      if (v.opaque || v.screen != Screen::kButtons) {
+      if (g_bc || v.opaque || v.screen != Screen::kButtons) {
         std::memcpy(dst, src, kW * 4);
       } else {
         // Over the game: the band, then the game darkened behind it.
@@ -473,9 +769,17 @@ void RenderThread() {
       g.SetSmoothingMode(SmoothingModeAntiAlias);
       g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
       g.SetCompositingQuality(CompositingQualityHighQuality);
-      if (v.screen == Screen::kButtons) DrawButtons(g, v, anim, now, dt);
-      else if (v.screen == Screen::kList) DrawList(g, v, anim, now, dt);
-      else DrawBusy(g, v, now);
+      if (g_bc) {
+        if (v.screen == Screen::kButtons) DrawBcButtons(g, v, anim, now, dt);
+        else if (v.screen == Screen::kList) DrawBcList(g, v, anim, now, dt);
+        else DrawBcBusy(g, v, now);
+      } else if (v.screen == Screen::kButtons) {
+        DrawButtons(g, v, anim, now, dt);
+      } else if (v.screen == Screen::kList) {
+        DrawList(g, v, anim, now, dt);
+      } else {
+        DrawBusy(g, v, now);
+      }
     }
     // To RGBA, through the HDR curve when the output is HDR10.
     float white = xgpu::HdrWhite();

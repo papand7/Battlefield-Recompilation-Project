@@ -5,6 +5,9 @@
   float2_xe look_pixel = float2_xe(pixel_index) + 0.5f;
   float2_xe look_uv = look_pixel * push_const_xe(bf_size).zw;
   float look_mode = push_const_xe(bf_look).x;
+  // +16: the scene went through the filmic curve (HDR10 below undoes it).
+  bool look_filmic = look_mode > 15.5f;
+  if (look_filmic) look_mode -= 16.0f;
   if (look_mode > 0.5f && look_mode < 1.5f) {
     // Toon: flat colour bands with the hue kept, and dark outlines where the
     // brightness changes sharply.
@@ -26,6 +29,64 @@
     float edge = abs(l_r - l_l) + abs(l_d - l_u);
     float line_amount = smoothstep(0.12f, 0.3f, edge);
     look_color = flat_color * (1.0f - 0.85f * line_amount);
+  } else if (look_mode > 3.5f) {
+    // Vivid: bright and colourful (bf1943's sunny look on any game). The
+    // film grain smoothed away where the picture is flat (edges kept), the
+    // midtones lifted, dull colours made stronger more than already strong
+    // ones (vibrance), a grey sky turned blue, a gentle S curve for punch,
+    // highlights a touch warm.
+    // The neighbourhood's average (the grain smoothed out): the sky is found
+    // and coloured from it, so grain cannot flicker in and out of it.
+    float3_xe look_smooth = look_color;
+    {
+      int2_xe size_max = int2_xe(push_const_xe(bf_size).xy) - 1;
+      int2_xe p = int2_xe(pixel_index);
+      float3_xe c0 = texel_fetch_2d_xe(xe_apply_gamma_source, p, 0).rgb;
+      // A cross 2 pixels each way (the grain is coarser than a pixel at the
+      // game's scaled resolutions).
+      float3_xe n = c0;
+      for (int k = 1; k <= 2; ++k) {
+        n += texel_fetch_2d_xe(xe_apply_gamma_source, clamp(p + int2_xe(-k, 0), int2_xe(0, 0), size_max), 0).rgb +
+             texel_fetch_2d_xe(xe_apply_gamma_source, clamp(p + int2_xe(k, 0), int2_xe(0, 0), size_max), 0).rgb +
+             texel_fetch_2d_xe(xe_apply_gamma_source, clamp(p + int2_xe(0, -k), int2_xe(0, 0), size_max), 0).rgb +
+             texel_fetch_2d_xe(xe_apply_gamma_source, clamp(p + int2_xe(0, k), int2_xe(0, 0), size_max), 0).rgb;
+      }
+      float3_xe avg = n / 9.0f;
+      look_smooth = saturate_xe(look_color + (avg - c0));
+      // Small differences are grain; large ones are edges and detail.
+      float diff = abs(BfLuma(c0) - BfLuma(avg));
+      look_color += (avg - c0) * (1.0f - smoothstep(0.04f, 0.12f, diff));
+    }
+    float3_xe c = pow(saturate_xe(look_color), float3_xe(0.82f, 0.82f, 0.82f));
+    {
+      // The sky: bright, low in colour (grey haze and overcast) or already
+      // bluish, in the upper part of the picture. Towards a clear blue that
+      // keeps the clouds' shading; the brightest (cloud tops) stay white.
+      float3_xe sm = pow(look_smooth, float3_xe(0.82f, 0.82f, 0.82f));
+      float l = BfLuma(sm);
+      float s = max(max(sm.r, sm.g), sm.b) - min(min(sm.r, sm.g), sm.b);
+      float bluish = saturate_xe((sm.b - sm.r) * 6.0f);
+      float sky = (1.0f - smoothstep(0.3f, 0.62f, look_uv.y)) * smoothstep(0.2f, 0.36f, l) *
+                  max(1.0f - smoothstep(0.08f, 0.2f, s), bluish);
+      float cloud = smoothstep(0.78f, 0.95f, l);
+      // Deeper blue up high, paler towards the horizon.
+      float3_xe pale = float3_xe(0.62f, 0.78f, 0.98f), deep = float3_xe(0.36f, 0.58f, 0.95f);
+      float3_xe blue = pale + (deep - pale) * saturate_xe(1.0f - look_uv.y * 2.2f);
+      // Dark, overcast skies brightened most.
+      float3_xe clear = blue * (0.85f + 0.35f * l);
+      float3_xe white = float3_xe(1.0f, 1.0f, 1.0f) * min(1.0f, l * 1.12f);
+      float3_xe sky_color = clear + (white - clear) * cloud;
+      c += (sky_color - c) * (sky * 0.75f);
+    }
+    float luma = BfLuma(c);
+    float sat = max(max(c.r, c.g), c.b) - min(min(c.r, c.g), c.b);
+    float boost = 1.25f + 0.45f * (1.0f - saturate_xe(sat * 2.0f));
+    float3_xe grey = float3_xe(luma, luma, luma);
+    c = saturate_xe(grey + (c - grey) * boost);
+    float3_xe curve = c * c * (3.0f - 2.0f * c);
+    c = c + (curve - c) * 0.3f;
+    c *= float3_xe(1.0f, 1.0f, 1.0f) + float3_xe(0.03f, 0.01f, -0.02f) * smoothstep(0.4f, 1.0f, luma);
+    look_color = saturate_xe(c);
   } else if (look_mode > 2.5f) {
     // WW2: 1940s colour newsreel film. Muted warm colour (reds and skin kept,
     // greens and blues faded), soft contrast with lifted blacks and rolled-off
@@ -77,6 +138,15 @@
     float3_xe red = float3_xe(saturate_xe(0.22f + luma * 1.7f), 0.02f, 0.03f) * vignette;
     look_color = saturate_xe(grey + (red - grey) * red_amount);
   }
+  // BRIGHTNESS and GAMMA (bf_look.h): the midtones bent by the gamma, then
+  // the whole frame lifted or darkened (more in the shadows when lifted).
+  {
+    float bright = push_const_xe(bf_adjust).x, gamma = push_const_xe(bf_adjust).y;
+    if (gamma > 0.0f && abs(gamma - 1.0f) > 0.001f)
+      look_color = pow(saturate_xe(look_color), float3_xe(1.0f, 1.0f, 1.0f) / gamma);
+    if (abs(bright) > 0.001f)
+      look_color = saturate_xe(look_color * (1.0f + 0.5f * bright) + float3_xe(0.08f, 0.08f, 0.08f) * bright);
+  }
   // HDR10 output (xenia/ui/vulkan/bf_hdr.h): y the game's white in nits (0 when
   // the swapchain is SDR), w the peak. The frame is taken as gamma 2.2, its
   // top end (brightest component above 0.55 linear) stretched smoothly up to
@@ -86,9 +156,25 @@
     float3_xe lin = pow(max(look_color, float3_xe(0.0f, 0.0f, 0.0f)),
                         float3_xe(2.2f, 2.2f, 2.2f));
     float top = max(max(lin.r, lin.g), lin.b);
-    float t = saturate_xe((top - 0.55f) / 0.45f);
-    float stretch = 1.0f + (push_const_xe(bf_look).w / hdr_white - 1.0f) * (t * t * t);
-    lin *= max(stretch, 1.0f);
+    float hdr_peak = push_const_xe(bf_look).w / hdr_white;
+    if (look_filmic && hdr_peak > 1.0f) {
+      // The filmic curve's shoulder (the ACES fit y = x (2.51 x + 0.03) /
+      // (x (2.43 x + 0.59) + 0.14)) undone for the brightest component: the
+      // scene's real highlight. Up to y = 0.5 the SDR frame as it is; above,
+      // towards the scene value (slope matched at 0.5), up to the peak.
+      float y = min(top, 0.99f);
+      float qa = 2.51f - 2.43f * y, qb = 0.03f - 0.59f * y;
+      float x = (-qb + sqrt(qb * qb + 4.0f * qa * 0.14f * y)) / (2.0f * qa);
+      float hdr_l = min(x * 1.404f, hdr_peak);
+      float t = saturate_xe((top - 0.5f) / 0.45f);
+      t = t * t * (3.0f - 2.0f * t);
+      float target = top + (hdr_l - top) * t;
+      lin *= top > 1e-4f ? max(target / top, 1.0f) : 1.0f;
+    } else {
+      float t = saturate_xe((top - 0.55f) / 0.45f);
+      float stretch = 1.0f + (hdr_peak - 1.0f) * (t * t * t);
+      lin *= max(stretch, 1.0f);
+    }
     float3_xe wide = float3_xe(
         dot(lin, float3_xe(0.6274f, 0.3293f, 0.0433f)),
         dot(lin, float3_xe(0.0691f, 0.9195f, 0.0114f)),

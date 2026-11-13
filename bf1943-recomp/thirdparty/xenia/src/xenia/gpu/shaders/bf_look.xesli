@@ -8,6 +8,8 @@ push_const_begin_xe(b0, space0)
   float4_xe bf_look;
   // xy: frame size, zw: 1 / size.
   float4_xe bf_size;
+  // x: brightness (0 the game's), y: gamma (1 the game's).
+  float4_xe bf_adjust;
 push_const_end_xe
 
 float BfHash(float2_xe p) {

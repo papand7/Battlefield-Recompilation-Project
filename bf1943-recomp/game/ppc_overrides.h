@@ -5,9 +5,15 @@
 #include <immintrin.h>  // _cvtsh_ss for vupkd3d128 half floats
 
 // mftb: the recompiler emits __rdtsc(). Guest code expects the console's
-// 49.875 MHz timebase (some code hard-codes it), so scale the host TSC.
-extern "C" double g_bf_timebase_scale;  // 49.875 MHz / host TSC rate, set at startup
-inline uint64_t BfMftb() { return uint64_t(double(__builtin_ia32_rdtsc()) * g_bf_timebase_scale); }
+// 49.875 MHz timebase (some code hard-codes it), so scale the host TSC. The
+// scale and offset are swapped together (one pointer): --speed changes the
+// rate while the game runs, without a jump (memory.cpp, SetTimeSpeed).
+struct BfClock { double scale; int64_t offset; };
+extern "C" const BfClock* g_bf_clock;
+inline uint64_t BfMftb() {
+  const BfClock* c = __atomic_load_n(&g_bf_clock, __ATOMIC_ACQUIRE);
+  return uint64_t(int64_t(double(__builtin_ia32_rdtsc()) * c->scale) + c->offset);
+}
 #define __rdtsc() BfMftb()
 struct PPCContext;
 extern "C" [[noreturn]] void PPCBadIndirectCall(PPCContext& ctx, uint32_t target);

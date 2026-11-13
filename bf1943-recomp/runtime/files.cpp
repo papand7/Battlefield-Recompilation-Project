@@ -22,6 +22,7 @@ namespace rt {
 std::filesystem::path g_game_root;
 std::filesystem::path g_user_root;
 std::atomic<bool> g_in_menus{true};
+std::atomic<bool> g_level_files{false};
 std::atomic<bool> g_mainmenu_open{false};  // set once the main menu (mainmenu-00) file is opened
 std::atomic<bool> g_level_menu{false};
 }  // namespace rt
@@ -189,9 +190,15 @@ uint32_t OpenFile(uint32_t handle_out, uint32_t access, uint32_t attrs, uint32_t
   // The front end's menus load mainmenu-00, a level loads reduced-level-00
   // (bf1943) or levels\<name>\level-00 (bfbc1).
   std::string low = Lower(guest);
+  // (--speed: when a level and any file were last opened, xboxkrnl.cpp)
+  int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count();
+  g_file_open_ms = now_ms;
   if (low.find("\\menu\\main\\mainmenu-00.fbrb") != std::string::npos) g_in_menus = true, g_mainmenu_open = true;
+  if (low.find("\\levels\\") != std::string::npos) g_level_files = true;
   if (low.find("reduced-level-00.fbrb") != std::string::npos || low.find("\\level-00.fbrb") != std::string::npos) {
     g_in_menus = false;
+    g_level_open_ms = now_ms;
     ApplyShadowSettings();
   }
   static bool logged = true;

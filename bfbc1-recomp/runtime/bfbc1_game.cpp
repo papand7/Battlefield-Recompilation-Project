@@ -3,9 +3,16 @@
 // yet; the settings keep their defaults and bots are not supported.
 #include "kernel.h"
 
+#ifdef _WIN32
 #include <windows.h>
 #include <Xinput.h>
+#else
+#include "posix_input.h"
+#endif
+#include "bc_compat.h"
 #include "bc_mp_menu.h"
+#include "pc_settings.h"
+#include "pc_menu.h"
 #include "xenia_bridge.h"
 
 #include <algorithm>
@@ -21,8 +28,10 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32) || defined(BF1943_CLIENT)  // (a window: not the Linux server's)
 extern "C" const char* g_window_title;  // xenia_shims/bridge.cc
 static const bool g_title_set = (g_window_title = "Battlefield: Bad Company", true);
+#endif
 
 namespace rt {
 uint32_t g_max_fps = 120;    // --max-fps (0 = no limit), applied in VdSwap
@@ -55,6 +64,10 @@ static std::atomic<uint8_t> g_auto_rt{0};
 std::atomic<int16_t> g_pilot_lx{0}, g_pilot_ly{0}, g_pilot_rx{0}, g_pilot_ry{0};
 std::atomic<uint16_t> g_pilot_buttons{0};
 std::atomic<uint8_t> g_pilot_rt{0}, g_pilot_lt{0};
+// PC SETTINGS was chosen on the main menu (the menu callback hook below): the
+// page to open (on the input thread, where it runs), and the DEV page the game
+// went to, to leave once it is closed.
+std::atomic<bool> g_open_pc_settings{false}, g_back_out_of_dev{false};
 // The pad, every poll: our Multiplayer menu (bc_mp_menu.cpp) takes it while open.
 bool AddBotInput(XINPUT_GAMEPAD& pad) {
   // SKIP INTRO: the startup movies (the EA and Dolby logos, the intro) end on
@@ -78,15 +91,72 @@ bool AddBotInput(XINPUT_GAMEPAD& pad) {
   if (uint8_t v = g_pilot_rt.load()) pad.bRightTrigger = v;
   if (uint8_t v = g_pilot_lt.load()) pad.bLeftTrigger = v;
   if (bcmp::Update(pad)) pad = {};
+  if (g_open_pc_settings.exchange(false) && !pcset::IsOpen()) pcset::Open();
+  // The PC settings page, opened by PC SETTINGS, is closed and has let go of
+  // the pad: B for 0.15 s takes the game from the DEV page (where its A went)
+  // back to the main menu.
+  {
+    static uint64_t back_until = 0;
+    uint64_t now = GetTickCount64();
+    if (g_back_out_of_dev && !pcset::IsOpen() && !pcset::ControlsPad()) {
+      g_back_out_of_dev = false, back_until = now + 150;
+      RT_INFO("menu: PC settings closed, B to the main menu");
+    }
+    if (now < back_until) pad.wButtons |= XINPUT_GAMEPAD_B;
+  }
   return false;
 }
 bool CustomMenus() { return false; }
+// The PC settings page in Bad Company's menu look (pc_menu.cpp).
+#if defined(_WIN32) || defined(BF1943_CLIENT)  // (the server has no PC menus)
+static const bool g_bc_menu_look = (pcmenu::SetBadCompanyLook(), true);
+#endif
+// --blood (gpu.cpp): the server soldier (ServerSoldierEntity, its feet at
+// +0x200) and the client soldier (feet at +0x370); their health parts found
+// with BF_SOLDIER_DUMP (bc_bots.cpp). The blows' impulses are not known here.
+const SoldierLayout g_blood_server = {0x820118D0u, 0x820118A4u, 0x200, 0, 0};
+const SoldierLayout g_blood_client = {0x82008D48u, 0x82008D20u, 0x370, 0, 0};
+// PC wording. The OPTIONS screen's storage device prompt (Xbox only) opens
+// the PC settings page instead (changeStorageDevice, the menu callback hook below).
+const char* const g_game_pc_text[] = {
+    "CHANGE STORAGE DEVICE", "PC SETTINGS",
+    "STORAGE DEVICE", "PC SETTINGS",
+    "When you see this icon, the game is autosaving. Do not turn off the Xbox 360 console or remove the Xbox 360 "
+    "Memory Unit while the game is autosaving.",
+    "When you see this icon, the game is autosaving. Do not close the game or turn off your computer while the "
+    "game is autosaving.",
+    "Deleting player profile data. Please do not turn off your Xbox 360 console.",
+    "Deleting player profile data. Please do not close the game.",
+    "Loading player profile data. Please do not turn off your Xbox 360 console.",
+    "Loading player profile data. Please do not close the game.",
+    "Saving player profile data. Please do not turn off your Xbox 360 console.",
+    "Saving player profile data. Please do not close the game.",
+    "Please reconnect the Xbox 360 Controller", "Please reconnect the controller",
+    "READING XBOX 360 MEMORY CARD UNIT", "READING SAVE DATA",
+    "You are not signed in with an active gamer profile. You will not be able to save or load files to your Xbox "
+    "360 console without an active gamer profile.",
+    "You are not signed in with an active profile. You will not be able to save or load files without an active "
+    "profile.",
+    "You did not choose a gamer profile. Singleplayer progress saving and playing on Xbox LIVE will not be "
+    "available.",
+    "You did not choose a profile. Singleplayer progress saving and playing online will not be available.",
+    "Your Gamer Profile does not have the correct permissions to access Xbox LIVE functionality.",
+    "Your profile does not have the correct permissions to access online functionality.",
+    "Connection to Xbox LIVE has been lost", "Connection to the server was lost",
+    "Failed to connect to Xbox LIVE", "Failed to connect to server",
+    "You were disconnected from Xbox LIVE", "Disconnected from the server",
+    "The Xbox LIVE service is busy.", "The online service is busy.",
+    "XBOX LIVE", "ONLINE",
+    nullptr};
 bool g_dedicated = false;
 std::vector<std::string> g_map_rotation;
 std::string g_emitter;  // --emitter: the particle settings (ApplyEmitter below)
 float g_fov = 0.0f;  // --fov, the FIELD OF VIEW setting (the camera hooks below)
 std::atomic<bool> g_aiming{false};  // the infantry camera zoomed in (sights), for AIM SENSITIVITY
-int GameDialogs() { return 0; }
+// The game's dialogs up now (its menus' numDialogs(n) callback, the hook
+// below; -1 before the first): a dedicated server presses A on them (xam.cpp).
+std::atomic<int> g_game_dialogs{-1};
+int GameDialogs() { return g_game_dialogs.load(); }
 }  // namespace rt
 
 
@@ -360,6 +430,9 @@ GAME_PATCH(8236DED8) {
 GAME_PATCH(8242F698) {
   g_menu_manager = ctx.r3.u32;
   g_menu_thread = GetCurrentThreadId();
+  static const bool trace = getenv("BF_MENU_TRACE") != nullptr;
+  if (trace) RT_INFO("menu: callback %s(%s)", G<char>(ctx.r4.u32), ctx.r5.u32 ? G<char>(ctx.r5.u32) : "");
+  if (!strcmp(G<char>(ctx.r4.u32), "numDialogs") && ctx.r5.u32) g_game_dialogs = atoi(G<char>(ctx.r5.u32));
   if (!strcmp(G<char>(ctx.r4.u32), "startBackgroundMovie")) {
     RT_INFO("menu: main menu up");
     if (!g_menu_up_ms) g_menu_up_ms = GetTickCount64();
@@ -368,9 +441,37 @@ GAME_PATCH(8242F698) {
   // game's online menu: ours (bc_mp_menu.cpp, LAN host/join) opens instead.
   // The game also asks by itself some minutes after a match, which only opens
   // ours when the player has just pressed A (or Enter, or clicked).
+  // OPTIONS (main menu and pause menus): its storage device prompt reads PC
+  // SETTINGS (g_game_pc_text) and opens that page.
+  if (!g_internal_call && !strcmp(G<char>(ctx.r4.u32), "changeStorageDevice")) {
+    RT_INFO("menu: PC SETTINGS (options)");
+    g_open_pc_settings = true;  // opened on the input thread (AddBotInput), where the page runs
+    return;
+  }
+  // PC SETTINGS, the main menu's fifth row (tools/bc_menu_patch.py: the
+  // retail-hidden DEV row), sends presenceRequestOnline("0") when chosen: the
+  // PC settings page opens over the DEV page the game goes to (closed again
+  // with B once the PC page is, AddBotInput). The menu also sends it when it
+  // comes up (its row number not set yet): only just after an A press counts.
+  // Only with the patched menu (else "0" is the game's own sign-out) and
+  // offline (signed in, it stays the game's).
+  static const bool patched_menu = std::filesystem::is_regular_file(
+      g_user_root / "override" / "dist" / "xenon" / "menu" / "main" / "mainmenu-00.fbrb");
+  if (!g_internal_call && patched_menu && g_online_server.empty() &&
+      !strcmp(G<char>(ctx.r4.u32), "presenceRequestOnline") && ctx.r5.u32 && !strcmp(G<char>(ctx.r5.u32), "0")) {
+    int64_t accepted = int64_t(g_last_accept_ms.load());
+    int64_t now = int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (now - accepted < 1000 && !pcset::IsOpen()) {
+      RT_INFO("menu: PC SETTINGS");
+      g_open_pc_settings = true;
+      g_back_out_of_dev = true;
+    }
+    return;
+  }
   if (!g_internal_call && g_online_server.empty() && !strcmp(G<char>(ctx.r4.u32), "presenceRequestOnline")) {
-    uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-    if (now - g_last_accept_ms.load() < 3000) bcmp::Open();
+    int64_t accepted = int64_t(g_last_accept_ms.load());
+    int64_t now = int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (now - accepted < 3000) bcmp::Open();
     else RT_INFO("mp menu: not opened (the game asked, no A press)");
     return;
   }
@@ -533,6 +634,19 @@ GAME_PATCH(824BBB10) {
 GAME_PATCH(8292C5B8) {
   __imp__sub_8292C5B8(ctx, base);
   if (!g_guest_args.empty()) St32(0x82E5E760, 1);
+}
+
+// An explosion entity's destructor (vtables 82007F8C / 82007EB8; bf1943's
+// 82205B20): its world position (+0x10), where the scene effects add smoke,
+// dust and debris.
+GAME_PATCH(821D9E28) {
+  // Read before the destructor runs (the object is freed after).
+  float pos[3];
+  for (int i = 0; i < 3; ++i) pos[i] = GuestFloat(ctx.r3.u32 + 0x10 + 4 * i);
+  __imp__sub_821D9E28(ctx, base);
+  if (std::isfinite(pos[0]) && std::isfinite(pos[1]) && std::isfinite(pos[2]) &&
+      (std::abs(pos[0]) > 1.0f || std::abs(pos[2]) > 1.0f) && std::abs(pos[0]) < 5000 && std::abs(pos[2]) < 5000)
+    xgpu::ExplosionAt(pos);
 }
 
 // The game's own music and voice volumes (PC settings; bf1943's AudioTick):
@@ -792,13 +906,13 @@ void rt::ApplyShadowSettings() {
 // (a ClientVehicleEntity, vtable 820082E8, when in one) and its seat at player
 // +118 (0 the driver's). The vehicle's data +14, its name at data +C: AH60
 // flies; Howitzer and KORD are guns; a passenger's seat is a gunner's too.
-// Read with ReadProcessMemory: a level can be unloaded under this thread.
+// Read with SafeRead (bc_compat.h): a level can be unloaded under this thread.
 namespace {
 std::atomic<int> g_local_vehicle{rt::kOnFoot};
 std::atomic<int64_t> g_vehicle_asked{0};
 bool SafeLd32(uint32_t a, uint32_t& v) {
   uint32_t raw;
-  if (!ReadProcessMemory(GetCurrentProcess(), g_base + a, &raw, 4, nullptr)) return false;
+  if (!SafeRead(&raw, g_base + a, 4)) return false;
   v = _byteswap_ulong(raw);
   return true;
 }
@@ -810,8 +924,8 @@ bool SafeLdF(uint32_t a, float& f) {
 }
 std::string SafeString(uint32_t a) {
   char buf[33] = {};
-  SIZE_T got = 0;
-  ReadProcessMemory(GetCurrentProcess(), g_base + a, buf, 32, &got);
+  size_t got = 0;
+  while (got < 32 && SafeRead(buf + got, g_base + a + got, 1)) ++got;
   return std::string(buf, strnlen(buf, got));
 }
 std::vector<uint32_t> SafeScan(uint32_t vtable) {
@@ -821,7 +935,7 @@ std::vector<uint32_t> SafeScan(uint32_t vtable) {
   for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
     if (page >= 0x80000000 && page < 0xA0000000) continue;
     if (!IsCommitted(uint32_t(page))) continue;
-    if (!ReadProcessMemory(GetCurrentProcess(), g_base + page, page_words, 0x1000, nullptr)) continue;
+    if (!SafeRead(page_words, g_base + page, 0x1000)) continue;
     for (int i = 0; i < 1024; ++i)
       if (page_words[i] == want) out.push_back(uint32_t(page) + i * 4);
   }
@@ -842,11 +956,17 @@ void WatchVehicle() {
     auto now = std::chrono::steady_clock::now();
     int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     float eye[3];
-    if (now_ms - g_vehicle_asked.load() > 1000 || !xgpu::CameraEye(eye)) {
+    // No camera for a moment (some frames have none) keeps what was seen;
+    // for over a second (or no one asking: out of a level), on foot.
+    static int64_t eye_seen = 0;
+    bool eye_ok = xgpu::CameraEye(eye);
+    if (eye_ok) eye_seen = now_ms;
+    if (now_ms - g_vehicle_asked.load() > 1000 || now_ms - eye_seen > 1000) {
       g_local_vehicle = rt::kOnFoot;
       soldiers.clear();
       continue;
     }
+    if (!eye_ok) continue;
     bool stale = false;
     for (uint32_t c : soldiers) {
       uint32_t vt = 0;
@@ -858,14 +978,19 @@ void WatchVehicle() {
       soldiers = SafeScan(kClientSoldier);
       last_scan = now;
     }
+    // The one seen last stays ours while within 15 m of the eye (a vehicle's
+    // camera sits behind it, where another soldier can be nearer).
+    static uint32_t last_mine = 0;
     uint32_t mine = 0;
     float best = 60.0f;
     for (uint32_t c : soldiers) {
       float x, y, z;
       if (!SafeLdF(c + 0x370, x) || !SafeLdF(c + 0x374, y) || !SafeLdF(c + 0x378, z)) continue;
       float d = std::sqrt((x - eye[0]) * (x - eye[0]) + (y - eye[1]) * (y - eye[1]) + (z - eye[2]) * (z - eye[2]));
+      if (c == last_mine && d < 15.0f) d = 0.0f;
       if (d < best) best = d, mine = c;
     }
+    last_mine = mine;
     int kind_class = rt::kOnFoot;
     std::string kind;
     uint32_t player = 0, v = 0, vt = 0, seat = 0, data = 0, name = 0;

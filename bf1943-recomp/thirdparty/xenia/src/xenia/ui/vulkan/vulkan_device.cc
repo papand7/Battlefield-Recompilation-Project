@@ -232,6 +232,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION
 
   std::vector<const char*> enabled_extensions;
+  // bf1943: the extra extensions (bf_extra_device_extensions), each enabled if
+  // supported and not already requested.
+  static std::vector<std::string> extra_extensions;
+  std::vector<bool> extra_enabled;
+  if (bf_extra_device_extensions) {
+    extra_extensions = bf_extra_device_extensions(vulkan_instance->instance(), physical_device);
+    extra_enabled.assign(extra_extensions.size(), false);
+  }
   {
     uint32_t supported_extension_count = 0;
     const VkResult get_supported_extension_count_result =
@@ -259,6 +267,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         const auto requested_extension_it =
             requested_extensions.find(supported_extension.extensionName);
         if (requested_extension_it == requested_extensions.cend()) {
+          for (size_t i = 0; i < extra_extensions.size(); ++i) {
+            if (!extra_enabled[i] && extra_extensions[i] == supported_extension.extensionName) {
+              extra_enabled[i] = true;
+              enabled_extensions.emplace_back(extra_extensions[i].c_str());
+              XELOGI("Vulkan device: extension {} enabled for bf1943", extra_extensions[i]);
+            }
+          }
           continue;
         }
         assert_not_null(requested_extension_it->second);

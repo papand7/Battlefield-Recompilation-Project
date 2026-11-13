@@ -16,6 +16,8 @@
 
 #include <chrono>
 #include <map>
+#include <cstdlib>
+#include <mutex>
 #include <set>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +42,7 @@
 #include "xenia/gpu/xenos.h"
 #include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/gpu/vulkan/scene_fx.h"
+#include "xenia/gpu/vulkan/bf_fsr3.h"
 #include "pbr_shaders.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
@@ -465,8 +468,7 @@ bool VulkanCommandProcessor::SetupContext() {
     XELOGE("Failed to create the ZPD counter sink buffer");
     return false;
   }
-  const VkDeviceSize bf_material_size =
-      VkDeviceSize(pbr::kMaterialPitch) * pbr::kMaterialRows * 4;
+  const VkDeviceSize bf_material_size = VkDeviceSize(pbr::kMaterialBufferAllocBytes);
   if (bf_material_used &&
       !ui::vulkan::util::CreateDedicatedAllocationBuffer(
           vulkan_device, bf_material_size,
@@ -925,7 +927,7 @@ bool VulkanCommandProcessor::SetupContext() {
       swap_apply_gamma_descriptor_set_layouts.data();
   // bf1943: the looks' parameters (shaders/bf_look.xesli, two float4).
   VkPushConstantRange swap_apply_gamma_push_constants = {
-      VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 8};
+      VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 12};
   swap_apply_gamma_pipeline_layout_create_info.pushConstantRangeCount = 1;
   swap_apply_gamma_pipeline_layout_create_info.pPushConstantRanges =
       &swap_apply_gamma_push_constants;
@@ -1625,6 +1627,21 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     return;
   }
 
+  // bf1943: FSR 3 (bf_fsr3.h) upscales the frame to the window's size; the
+  // gamma pass then reads its result.
+  {
+    VkImageView upscaled = bffsr::enabled ? bffsr::Record(*this, swap_texture_view,
+                                                          frontbuffer_width_scaled,
+                                                          frontbuffer_height_scaled)
+                                          : VK_NULL_HANDLE;
+    if (upscaled != VK_NULL_HANDLE) {
+      swap_texture_view = upscaled;
+    } else {
+      bffsr::jitter_x = bffsr::jitter_y = 0.0f;
+    }
+    bffsr::past_tonemap = false;
+  }
+
   auto aspect = graphics_system_->GetScaledAspectRatio();
 
   presenter->RefreshGuestOutput(
@@ -1921,8 +1938,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         {
           static const auto look_start = std::chrono::steady_clock::now();
           bool hdr = ui::bfhdr::active.load(std::memory_order_relaxed);
-          float look[8] = {
-              float(bflook::look.load(std::memory_order_relaxed)),
+          // +16: the scene went through the filmic curve (pbr::Filmic).
+          static const bool filmic = pbr::Filmic();
+          float look[12] = {
+              float(bflook::look.load(std::memory_order_relaxed)) + (filmic ? 16.0f : 0.0f),
               // The front end (full-screen bright clouds) at 65 % of the
               // game's white.
               hdr ? ui::bfhdr::paper_white.load(std::memory_order_relaxed) *
@@ -1937,7 +1956,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
               float(frontbuffer_width_scaled),
               float(frontbuffer_height_scaled),
               1.0f / float(frontbuffer_width_scaled),
-              1.0f / float(frontbuffer_height_scaled)};
+              1.0f / float(frontbuffer_height_scaled),
+              bflook::brightness.load(std::memory_order_relaxed),
+              bflook::gamma.load(std::memory_order_relaxed), 0.0f, 0.0f};
           deferred_command_buffer_.CmdVkPushConstants(
               swap_apply_gamma_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
               0, sizeof(look), look);
@@ -3090,10 +3111,40 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // the world draws get the game's (c7) as zero.
   {
     bool flash_off = scenefx::TakeOverFlash(pixel_shader, regs);
+    // FSR 3: no jitter from the game's tone mapping pass on (it and the HUD).
+    if (bffsr::enabled && pixel_shader && !bffsr::past_tonemap) {
+      const pbr::ShaderConfig* tm = pbr::Find(pixel_shader->ucode_data_hash());
+      if (tm && tm->tonemap.valid()) bffsr::past_tonemap = true;
+    }
     if (flash_off != bf_flash_off_) {
       bf_flash_off_ = flash_off;
       current_constant_buffers_up_to_date_ &=
           ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel);
+    }
+  }
+  // bf1943 (BF_PARTICLE_LOG): the game's particle draws (blended, no depth
+  // write, after the world's depth copy), each shader pair once: blend state
+  // and each texture's key and content hash (texpack's guest_hash).
+  static const bool particle_log = std::getenv("BF_PARTICLE_LOG") != nullptr;
+  if (particle_log && pixel_shader && vertex_shader && scenefx::AfterDepthCopy() &&
+      !regs.Get<reg::RB_DEPTHCONTROL>().z_write_enable &&
+      regs[XE_GPU_REG_RB_BLENDCONTROL0] != 0x00010001) {
+    static std::set<std::pair<uint64_t, uint64_t>> seen;
+    if (seen.insert({vertex_shader->ucode_data_hash(), pixel_shader->ucode_data_hash()}).second &&
+        seen.size() < 400) {
+      XELOGI("particle: vs {:016X} ps {:016X} blend {:08X} z {} alpha test {}",
+             vertex_shader->ucode_data_hash(), pixel_shader->ucode_data_hash(),
+             regs[XE_GPU_REG_RB_BLENDCONTROL0], uint32_t(regs.Get<reg::RB_DEPTHCONTROL>().z_enable),
+             uint32_t(regs.Get<reg::RB_COLORCONTROL>().alpha_test_enable));
+      for (const auto& binding : pixel_shader->texture_bindings()) {
+        std::string desc = texture_cache_->DescribeActive(binding.fetch_constant);
+        if (desc.empty()) continue;
+        uint32_t base = 0;
+        std::sscanf(desc.c_str(), "base %X", &base);
+        const uint8_t* guest = memory_->TranslatePhysical<const uint8_t*>(base);
+        XELOGI("particle:   tf{} {} hash {:016X}", binding.fetch_constant, desc,
+               guest ? texrep::Hash(guest, texrep::kHashBytes) : 0);
+      }
     }
   }
   // bf1943 (--trace-texture): which shaders draw with a given replacement.
@@ -3119,6 +3170,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       XELOGI("textures: {} (fetch {}) drawn by vs {:016X} ps {:016X}",
              r->file.filename().string(), binding.fetch_constant,
              vertex_shader->ucode_data_hash(), pixel_shader->ucode_data_hash());
+      // Its depth, offset, blend and alpha state.
+      {
+        auto depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
+        auto mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+        auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+        XELOGI("textures:   z enable {} write {} func {}, poly offset {} scale {} offset {}, "
+               "blend {:08X}, alpha test {} func {} ref {}, alpha to mask {}",
+               uint32_t(depthcontrol.z_enable), uint32_t(depthcontrol.z_write_enable),
+               uint32_t(depthcontrol.zfunc), uint32_t(mode.poly_offset_front_enable),
+               regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
+               regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
+               regs[XE_GPU_REG_RB_BLENDCONTROL0], uint32_t(colorcontrol.alpha_test_enable),
+               uint32_t(colorcontrol.alpha_func), regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF),
+               uint32_t(colorcontrol.alpha_to_mask_enable));
+      }
       // The shaders' float constants (vertex c0-c255, pixel c0-c255).
       for (uint32_t i = 0; i < 512; ++i) {
         const float* c = reinterpret_cast<const float*>(
@@ -4780,7 +4846,28 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
       is_opening_frame
           ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight]
           : 0;
+  // bf: BF_SUBMIT_LOG=1 logs, every 5 s, frames, submissions and the time
+  // spent awaiting earlier ones here.
+  static const bool submit_log = std::getenv("BF_SUBMIT_LOG") != nullptr;
+  static uint64_t log_frames = 0, log_submissions = 0, log_awaits = 0;
+  static double log_wait_ms = 0, log_frame_wait_ms = 0;
+  static auto log_at = std::chrono::steady_clock::now();
+  auto await_start = std::chrono::steady_clock::now();
   CheckSubmissionCompletionAndDeviceLoss(await_submission);
+  if (submit_log) {
+    auto now = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - await_start).count();
+    log_wait_ms += ms;
+    if (is_opening_frame) ++log_frames, log_frame_wait_ms += ms;
+    if (!submission_open_) ++log_submissions;
+    if (ms > 0.05) ++log_awaits;
+    if (now - log_at > std::chrono::seconds(5)) {
+      XELOGI("bf submit: {} frames, {} submissions, {} waits, {:.0f} ms waiting ({:.0f} at frame starts) in {:.1f} s",
+             log_frames, log_submissions, log_awaits, log_wait_ms, log_frame_wait_ms,
+             std::chrono::duration<double>(now - log_at).count());
+      log_frames = log_submissions = log_awaits = 0, log_wait_ms = log_frame_wait_ms = 0, log_at = now;
+    }
+  }
   const uint64_t completed_submission = GetCompletedSubmission();
   if (device_lost_ || completed_submission < await_submission) {
     return false;
@@ -5280,6 +5367,13 @@ void VulkanCommandProcessor::UpdateDynamicState(
   }
   viewport.minDepth = viewport_info.z_min;
   viewport.maxDepth = viewport_info.z_max;
+  // bf1943 FSR 3: the 3D draws (depth tested, writing colour) moved by this
+  // frame's jitter, until the tone mapping pass (bloom, the HUD stay put).
+  if (bffsr::enabled && !bffsr::past_tonemap && regs.Get<reg::RB_DEPTHCONTROL>().z_enable &&
+      (regs[XE_GPU_REG_RB_COLOR_MASK] & 0xF)) {
+    viewport.x += bffsr::jitter_x;
+    viewport.y += bffsr::jitter_y;
+  }
   SetViewport(viewport);
 
   // Scissor.

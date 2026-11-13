@@ -737,6 +737,33 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
                 : register_file_->values[poll_reg_addr];
 
   bool matched = false;
+  // bf: BF_WAIT_LOG=1 logs, every 5 s, what was waited on and for how long.
+  static const bool wait_log = std::getenv("BF_WAIT_LOG") != nullptr;
+  auto wait_start = std::chrono::steady_clock::now();
+  struct WaitLogScope {
+    bool on;
+    uint32_t addr, ref, wait;
+    bool is_memory;
+    std::chrono::steady_clock::time_point start;
+    ~WaitLogScope() {
+      if (!on) return;
+      static std::mutex m;
+      static std::map<uint64_t, std::pair<uint64_t, double>> stats;
+      static auto last = std::chrono::steady_clock::now();
+      auto now = std::chrono::steady_clock::now();
+      std::lock_guard<std::mutex> lock(m);
+      auto& s = stats[(uint64_t(is_memory) << 63) | (uint64_t(addr) << 16) | (wait & 0xFFFF)];
+      ++s.first;
+      s.second += std::chrono::duration<double, std::milli>(now - start).count();
+      if (now - last > std::chrono::seconds(5)) {
+        last = now;
+        for (auto& [k, v] : stats)
+          XELOGI("bf wait: {} {:08X} wait {:04X}: {} times, {:.1f} ms", (k >> 63) ? "mem" : "reg",
+                 uint32_t(k >> 16) & 0xFFFFFFFF, uint32_t(k & 0xFFFF), v.first, v.second);
+        stats.clear();
+      }
+    }
+  } wait_log_scope{wait_log, poll_reg_addr, ref, wait, is_memory, wait_start};
 
   do {
     uint32_t value = value_ref;
@@ -760,6 +787,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
         if (!cvars::vsync) {
           // User wants it fast and dangerous.
           // do nothing
+        } else if (std::chrono::steady_clock::now() - wait_start < std::chrono::milliseconds(2)) {
+          // bf: the value (often a fence the CPU writes) mostly comes well
+          // within a millisecond; a 1 ms sleep, really a timer tick, cost
+          // Bad Company about an eighth of its frame time. Poll with a yield
+          // for the first 2 ms, then sleep as before.
+          xe::threading::MaybeYield();
+          ReturnFromWait();
         } else {
           xe::threading::Sleep(std::chrono::milliseconds(wait / 0x100));
           ReturnFromWait();

@@ -6,6 +6,7 @@
 #include "texture_replacement.h"  // xenia_shims
 #include "pbr_shaders.h"          // xenia_shims
 #include "xenia_bridge.h"
+#include "bot_llm.h"
 namespace xe::gpu::scenefx { void Configure(const char* settings); }  // xenia gpu/vulkan/scene_fx.h
 
 #include "../tools/msvc_compat/crash_diag.h"  // symbolised stack on crash
@@ -114,6 +115,10 @@ static void ParsePresses(const std::string& spec) {
 
 // --bots N: N bot players on the host's own server (bot_players.cpp).
 int rt::g_bot_count = 0;
+bool rt::g_training = false;
+double rt::g_time_speed = 1.0, rt::g_time_speed_target = 1.0;
+std::atomic<int64_t> rt::g_level_open_ms{0}, rt::g_file_open_ms{0};
+extern "C" double g_bf_timebase_scale;  // memory.cpp: the mftb rate (ppc_overrides.h)
 bool rt::g_no_audio = false;  // --no-audio (the Linux server decodes XMA too; it has no sound device)
 
 int main(int argc, char** argv) {
@@ -131,13 +136,17 @@ int main(int argc, char** argv) {
   uint32_t texture_mb = 0;
   std::string shader_dump;  // --dump-shaders <dir>
   int res_scale = 2, present_effect = 2, window_w = 0, window_h = 0;  // --res-scale, --sharpen, --window
+  bool fullscreen = false;                                            // --display
+  std::string upscale_quality = "off";                                // --upscale-quality
+  std::string bot_llm;                                                // --bot-llm
+  int train_minutes = 0;                                              // --train-minutes
   bool hdr = false;                                                   // --hdr, --hdr-white, --hdr-peak
   float hdr_white = 200.0f, hdr_peak = 1000.0f;
-  // --preset stock|enhanced|toon|noir|ww2: the graphics options it stands for go
+  // --preset stock|enhanced|vivid|toon|noir|ww2: the graphics options it stands for go
   // first, so the other options can still change them. stock: the game's own
   // rendering; enhanced: PBR materials, scene effects (sun shafts, haze,
   // screen-space and ray-traced shadows), the 1600 shadowmap at 300 m and 4x
-  // vegetation detail; toon, noir and ww2: enhanced with that look.
+  // vegetation detail; vivid, toon, noir and ww2: enhanced with that look.
   std::vector<std::string> preset_args;
   std::vector<char*> expanded_argv;
   for (int i = 1; i + 1 < argc; ++i) {
@@ -146,8 +155,10 @@ int main(int argc, char** argv) {
     if (preset == "stock") {
       preset_args = {"--shadowmap", "0", "--shadow-distance", "0", "--lod", "1"};
     } else {
-      preset_args = {"--pbr", "--scene-fx"};
-      if (preset == "toon" || preset == "noir" || preset == "ww2") {
+      // Particles at full resolution with the game's "Nice" shading (the
+      // 360 drew them at half resolution, simply shaded).
+      preset_args = {"--pbr", "--scene-fx", "--emitter", "QuadHalfResEnable=0,QuadSimpleRenderingEnable=0"};
+      if (preset == "vivid" || preset == "toon" || preset == "noir" || preset == "ww2") {
         preset_args.push_back("--look");
         preset_args.push_back(preset);
       }
@@ -192,7 +203,7 @@ int main(int argc, char** argv) {
     else if (a == "--capture-burst" && i + 1 < argc) g_capture_burst = uint32_t(atoi(argv[++i]));
     else if (a == "--look" && i + 1 < argc) {
       std::string l = argv[++i];
-      xgpu::SetLook(l == "toon" ? 1 : l == "noir" ? 2 : l == "ww2" ? 3 : 0);
+      xgpu::SetLook(l == "toon" ? 1 : l == "noir" ? 2 : l == "ww2" ? 3 : l == "vivid" ? 4 : 0);
     }
     else if (a == "--blood") g_blood = true;
     else if (a == "--vblank-hz" && i + 1 < argc) g_vblank_hz = std::max(1, atoi(argv[++i]));
@@ -222,6 +233,8 @@ int main(int argc, char** argv) {
     else if (a == "--test-mouse" && i + 1 < argc) g_test_mouse_at = atof(argv[++i]);
     else if (a == "--worldrender" && i + 1 < argc) g_worldrender = argv[++i];
     else if (a == "--overgrowth" && i + 1 < argc) g_overgrowth = argv[++i];
+    else if (a == "--emitter" && i + 1 < argc) g_emitter = argv[++i];
+    else if (a == "--fov" && i + 1 < argc) g_fov = float(atof(argv[++i]));
     else if (a == "--lod" && i + 1 < argc) g_lod = float(atof(argv[++i]));
     else if (a == "--watch-write" && i + 1 < argc) {  // DEBUG: addr,size,seconds
       uint32_t addr = 0, size = 4;
@@ -283,14 +296,68 @@ int main(int argc, char** argv) {
     else if (a == "--res-scale" && i + 1 < argc) res_scale = atoi(argv[++i]);
     else if (a == "--sharpen" && i + 1 < argc) {
       std::string e = argv[++i];
-      present_effect = e == "fsr" ? 2 : e == "cas" ? 1 : 0;
+      present_effect = e == "auto" ? 5 : e == "dlss" ? 4 : e == "fsr3" ? 3 : e == "fsr" ? 2 : e == "cas" ? 1 : 0;
     }
     else if (a == "--window" && i + 1 < argc) sscanf(argv[++i], "%dx%d", &window_w, &window_h);
+    else if (a == "--display" && i + 1 < argc) {
+      fullscreen = std::string(argv[++i]) == "fullscreen";
+      xgpu::SetFullscreen(fullscreen);
+    }
+    else if (a == "--fullscreen") xgpu::SetFullscreen(fullscreen = true);
+    else if (a == "--upscale-quality" && i + 1 < argc) upscale_quality = argv[++i];
+    else if (a == "--master" && i + 1 < argc) rt::lan::SetMaster(argv[++i]);  // "" for none
+    else if (a == "--publish") rt::lan::SetPublish(true);  // a host: on the master server's list
+    else if (a == "--present-vsync") g_present_vsync = true;  // the swapchain waits for the refresh
     else if (a == "--trace-texture" && i + 1 < argc) xe::gpu::texrep::SetTrace(argv[++i]);
     else if (a == "--log-textures") xe::gpu::texrep::SetLogMisses(true);
     else if (a == "--hdr") hdr = true;
     else if (a == "--hdr-white" && i + 1 < argc) hdr_white = float(atof(argv[++i]));
     else if (a == "--hdr-peak" && i + 1 < argc) hdr_peak = float(atof(argv[++i]));
+    // The bots' advisor (bot_llm.h): [the folder with bot_llm.ini | http://host:port], default llm.
+    else if (a == "--bot-llm") bot_llm = i + 1 < argc && argv[i + 1][0] != '-' ? argv[++i] : "llm";
+    // Training: a dedicated server nobody joins, 16 bots; --speed N: N times as fast.
+    else if (a == "--train") g_training = true;
+    else if (a == "--train-minutes" && i + 1 < argc) train_minutes = std::max(0, atoi(argv[++i]));
+    else if (a == "--speed" && i + 1 < argc) g_time_speed_target = std::clamp(atof(argv[++i]), 0.25, 10.0);
+  }
+  if (g_training) {
+    g_dedicated = true, g_present = false, g_use_xenia_gpu = false, g_lan_host = true;
+    if (!g_bot_count) g_bot_count = 16;
+  }
+  // --train-minutes N: the training ends after N minutes (real time): its
+  // record written (botllm::FinishRun: the viewer), then the server exits.
+  if (g_training && train_minutes)
+    std::thread([train_minutes] {
+      std::this_thread::sleep_for(std::chrono::minutes(train_minutes));
+      botllm::FinishRun();
+      botllm::StopServer();
+      RT_INFO("training: %d minutes are up", train_minutes);
+      fflush(nullptr);
+      ExitProcess(0);
+    }).detach();
+  if (!bot_llm.empty()) botllm::Configure(bot_llm);  // (after --port-offset)
+  // --upscale-quality (with FSR 3, DLSS or AUTO): the resolution scale picked
+  // for the output height, the one whose upscale is nearest the mode's
+  // (QUALITY 1.5x, BALANCED 1.7x, PERFORMANCE 2x; never below 1x).
+  if (present_effect >= 3 && present_effect <= 5 &&
+      (upscale_quality == "quality" || upscale_quality == "balanced" || upscale_quality == "performance")) {
+#ifdef _WIN32
+    int out_h = fullscreen ? GetSystemMetrics(SM_CYSCREEN) : (window_h > 0 ? window_h : 1080);
+#else
+    int out_h = window_h > 0 ? window_h : 1080;  // (Linux: the desktop's height isn't known yet)
+#endif
+    double target = upscale_quality == "quality" ? 1.5 : upscale_quality == "balanced" ? 1.7 : 2.0;
+    int best = 1;
+    double best_error = 1e9;
+    for (int r = 1; r <= 3; ++r) {
+      double ratio = double(out_h) / (720.0 * r);
+      if (ratio < 0.999) break;
+      double error = std::abs(ratio - target);
+      if (error <= best_error + 1e-6) best = r, best_error = error;  // a tie: the sharper (higher) scale
+    }
+    RT_INFO("upscaling: %s for %d lines: resolution scale %dx (upscale %.2fx)", upscale_quality.c_str(), out_h,
+            best, double(out_h) / (720.0 * best));
+    res_scale = best;
   }
   xgpu::SetHdr(hdr, hdr_white, hdr_peak);
   xgpu::SetOptions(aniso, texture_mb, shader_dump.c_str());
@@ -303,11 +370,17 @@ int main(int argc, char** argv) {
   if (g_dedicated) {
     if (g_host_map.empty()) g_host_map = g_map_rotation.empty() ? "Wake_island_s" : g_map_rotation[0];
     if (g_gamertag.empty() || g_gamertag == "Player") g_gamertag = "Dedicated";
-    rt::lan::StartBeacon();
+    if (!g_training) rt::lan::StartBeacon();  // (training: in nobody's server browser)
     RT_INFO("dedicated server '%s': hosting %s on UDP %d (browsers: UDP 19430)%s", g_gamertag.c_str(),
             g_host_map.c_str(), 1003 + g_port_offset, g_bot_count ? ", with bots" : "");
   }
-  if (g_lan_host && join_address.empty()) rt::lan::StartBeacon();  // --host: shown in server browsers
+  if (g_lan_host && join_address.empty() && !g_training) rt::lan::StartBeacon();  // --host: shown in server browsers
+  // --publish: on the master server's list once the level runs.
+  if ((g_dedicated || g_lan_host) && join_address.empty() && !g_training) rt::lan::StartPublishing();
+  // A dedicated server plays no sound: the game's sound system off (its mixer
+  // still runs, silent). At --speed the sound kept real time and crashed.
+  if (g_dedicated && g_guest_args.find("IsSoundEnabled") == std::string::npos)
+    g_guest_args += std::string(g_guest_args.empty() ? "" : " ") + "-Client.IsSoundEnabled false";
   if (shadowmap && g_guest_args.find("Shadowmap") == std::string::npos)
     g_guest_args = "-WorldRender.ShadowmapWidth " + std::to_string(shadowmap) + " -WorldRender.ShadowmapHeight " +
                    std::to_string(shadowmap) + (g_guest_args.empty() ? "" : " ") + g_guest_args;
@@ -329,6 +402,8 @@ int main(int argc, char** argv) {
   if (!MemoryInit()) Fatal("could not reserve the 4 GB guest address space");
   RT_INFO("guest memory at %p, game root %s", g_base, g_game_root.string().c_str());
   RT_INFO("host timebase %.1f MHz", HostTicksPerSecond() / 1e6);
+  if (g_time_speed_target != 1.0) RT_INFO("game speed %.2fx once a level has loaded", g_time_speed_target);
+  if (g_training) RT_INFO("training: %d bots, nobody joins", g_bot_count);
   if (!LoadExecutable(g_game_root / "default.xex")) Fatal("could not load default.xex");
   timeBeginPeriod(1);  // 1 ms sleeps and timers, as on the console
   InstallPcUi();

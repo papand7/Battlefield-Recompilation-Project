@@ -9,6 +9,10 @@
 
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 
+#include <filesystem>
+
+#include "pbr_shaders.h"
+
 #include <cstdint>
 #include <cstring>
 #include <set>
@@ -3246,6 +3250,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   VkPipeline pipeline;
   VkResult result = dfn.vkCreateGraphicsPipelines(
       device, vk_pipeline_cache_, 1, &pipeline_create_info, nullptr, &pipeline);
+  if (result == VK_SUCCESS) ++bf_pipelines_created_;
   if (result != VK_SUCCESS) {
     if (creation_arguments.pixel_shader) {
       XELOGE(
@@ -3411,9 +3416,26 @@ void VulkanPipelineCache::InitializeShaderStorage(
     std::error_code ec;
     std::filesystem::create_directories(shader_storage_local_root, ec);
   }
+  // bf1943: one file per translation key (pbr::TranslationKey: the shader
+  // table and the switches that change the translated shaders). The driver's
+  // cache never drops entries, so with one file every table edit added more
+  // (600 MB for 1100 pipelines); the other keys' files are removed.
   vk_pipeline_cache_path_ =
       shader_storage_local_root /
-      fmt::format("{:08X}.vk.bin", shader_storage_title_id_);
+      fmt::format("{:08X}.{:016X}.vk.bin", shader_storage_title_id_, pbr::TranslationKey());
+  {
+    std::error_code ec;
+    std::string prefix = fmt::format("{:08X}.", shader_storage_title_id_);
+    for (const auto& entry : std::filesystem::directory_iterator(shader_storage_local_root, ec)) {
+      std::string name = entry.path().filename().string();
+      if (name.rfind(prefix, 0) == 0 && name.size() > 7 &&
+          (name.compare(name.size() - 7, 7, ".vk.bin") == 0 || name.compare(name.size() - 4, 4, ".tmp") == 0) &&
+          entry.path() != vk_pipeline_cache_path_) {
+        std::filesystem::remove(entry.path(), ec);
+        XELOGI("VkPipelineCache: removed {} (another shader setup)", name);
+      }
+    }
+  }
 
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
@@ -3686,6 +3708,8 @@ void VulkanPipelineCache::InitializeShaderStorage(
            pipeline_stored_descriptions.size(),
            (xe::Clock::QueryHostTickCount() - pipeline_creation_start) * 1000 /
                xe::Clock::QueryHostTickFrequency());
+    // bf1943: from a loaded cache these were already in it: nothing to save.
+    if (!pipeline_cache_data.empty()) bf_pipelines_saved_ = bf_pipelines_created_.load();
 
     if (pipelines_vs_not_found || pipelines_vs_translation_missing ||
         pipelines_ps_not_found || pipelines_ps_translation_missing ||
@@ -3717,6 +3741,11 @@ void VulkanPipelineCache::SaveVkPipelineCache() {
   if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) {
     return;
   }
+  // bf1943: only when pipelines were made since the last save (it copies and
+  // writes the whole cache).
+  uint64_t created = bf_pipelines_created_.load();
+  if (created == bf_pipelines_saved_) return;
+  bf_pipelines_saved_ = created;
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();

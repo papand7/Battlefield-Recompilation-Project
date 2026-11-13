@@ -24,11 +24,15 @@ namespace {
 struct Event {
   float feet[3];
   float damage;
-  int type;  // 0 hit, 1 death, 2 death with gibs
+  int type;  // 0 hit, 1 death, 2 death with gibs, 3 explosion
   float push[3];
 };
 
-enum Kind { kPuff = 0, kChunk = 1, kSplat = 2, kDrop = 3, kGroundChunk = 4 };
+enum Kind {
+  kPuff = 0, kChunk = 1, kSplat = 2, kDrop = 3, kGroundChunk = 4,
+  // Not blood (AddEffect): gun smoke, an explosion's dust and its debris.
+  kSmoke = 5, kDust = 6, kDebris = 7
+};
 
 struct Particle {
   float pos[3], vel[3];
@@ -283,6 +287,11 @@ void StepCorpses(float dt) {
 
 }  // namespace
 
+void AddExplosion(const float pos[3]) {
+  std::lock_guard<std::mutex> lock(event_lock);
+  events.push_back({{pos[0], pos[1], pos[2]}, 0.0f, 3, {0, 0, 0}});
+}
+
 void AddHit(const float feet[3], float damage) {
   std::lock_guard<std::mutex> lock(event_lock);
   events.push_back({{feet[0], feet[1], feet[2]}, damage, 0, {0, 0, 0}});
@@ -297,6 +306,29 @@ void SetCamera(const float vs[19][4]) {
   std::memcpy(camera_vs, vs, sizeof(camera_vs));
   have_camera = true;
   camera_time = std::chrono::steady_clock::now();
+}
+
+void AddEffect(int kind, const float pos[3]) {
+  if (kind == 0) {
+    Particle& p = Add(kSmoke, pos, Rand(0.22f, 0.35f), Rand(1.8f, 2.8f), pos[1] - 100.0f);
+    p.vel[0] = Rand(-0.25f, 0.25f), p.vel[1] = Rand(0.25f, 0.55f), p.vel[2] = Rand(-0.25f, 0.25f);
+    return;
+  }
+  // Smoke: puffs (radius in metres, growing in the shader) that rise, slow
+  // down, drift with the wind and linger.
+  for (int i = 0; i < 7; ++i) {
+    float at[3] = {pos[0] + Rand(-1.2f, 1.2f), pos[1] + Rand(0.3f, 1.4f), pos[2] + Rand(-1.2f, 1.2f)};
+    Particle& p = Add(kDust, at, Rand(1.0f, 1.8f), Rand(12.0f, 18.0f), pos[1] - 100.0f);
+    p.vel[0] = Rand(-0.7f, 0.7f), p.vel[1] = Rand(0.6f, 1.6f), p.vel[2] = Rand(-0.7f, 0.7f);
+  }
+  // Debris: chunks thrown out that bounce and settle.
+  for (int i = 0; i < 16; ++i) {
+    Particle& p = Add(kDebris, pos, Rand(0.05f, 0.15f), Rand(5.0f, 8.0f), pos[1] - 0.05f);
+    float a = Rand(0.0f, 6.2831853f), speed = Rand(4.0f, 11.0f), up = Rand(0.4f, 1.0f);
+    p.vel[0] = std::cos(a) * speed * (1.0f - up * 0.5f);
+    p.vel[1] = speed * up;
+    p.vel[2] = std::sin(a) * speed * (1.0f - up * 0.5f);
+  }
 }
 
 uint32_t BuildGore(float (*out)[4], uint32_t max) {
@@ -340,6 +372,11 @@ uint32_t BuildGore(float (*out)[4], uint32_t max) {
 
   static const bool self = std::getenv("BF_GORE_SELF") != nullptr;
   for (const Event& e : new_events) {
+    if (e.type == 3) {
+      if (effects) AddEffect(1, e.feet);
+      continue;
+    }
+    if (!gore) continue;
     // The player's own soldier stands under the eye: its hits are the game's
     // red vignette.
     double dx = e.feet[0] - eye[0], dz = e.feet[2] - eye[2];
@@ -355,7 +392,31 @@ uint32_t BuildGore(float (*out)[4], uint32_t max) {
   for (Particle& p : particles) {
     p.age += dt;
     if (p.kind == kSplat) p.vel[0] = std::min(1.0f, p.vel[0] + dt * 2.0f);  // spreading
-    if (p.kind != kChunk && p.kind != kDrop) continue;
+    if (p.kind == kSmoke || p.kind == kDust) {
+      // Rising and slowing, then carried by the wind (the size grows in the
+      // shader).
+      for (int i = 0; i < 3; ++i) p.pos[i] += p.vel[i] * dt, p.vel[i] *= std::exp(-0.5f * dt);
+      float w = std::min(p.age / 3.0f, 1.0f) * 1.3f;
+      p.pos[0] += 0.9f * w * dt, p.pos[2] += 0.44f * w * dt;
+      p.pos[1] += 0.12f * dt;  // warm air
+      continue;
+    }
+    if (p.kind == kDebris) {
+      p.vel[1] -= 9.8f * dt;
+      for (int i = 0; i < 3; ++i) p.pos[i] += p.vel[i] * dt;
+      if (p.pos[1] <= p.floor_y && p.vel[1] < 0.0f) {
+        p.pos[1] = p.floor_y;
+        // A bounce, losing most of its speed; then it lies still.
+        if (-p.vel[1] > 1.2f) {
+          p.vel[1] = -p.vel[1] * 0.35f;
+          p.vel[0] *= 0.55f, p.vel[2] *= 0.55f;
+        } else {
+          p.vel[0] = p.vel[1] = p.vel[2] = 0.0f;
+        }
+      }
+      continue;
+    }
+    if (p.kind != kChunk && p.kind != kDrop && p.kind != kDebris) continue;
     p.vel[1] -= 9.8f * dt;
     for (int i = 0; i < 3; ++i) p.pos[i] += p.vel[i] * dt;
     if (p.pos[1] <= p.floor_y + p.size * 0.5f && p.vel[1] < 0.0f) {
@@ -364,7 +425,9 @@ uint32_t BuildGore(float (*out)[4], uint32_t max) {
       s.age = 0.0f;
       s.life = 0.0f;
       s.vel[0] = 0.0f;
-      if (p.kind == kChunk) {
+      if (p.kind == kDebris) {
+        // Lands and is gone among the stones.
+      } else if (p.kind == kChunk) {
         s.kind = kGroundChunk;
         landed.push_back(s);
         s.kind = kSplat;

@@ -21,6 +21,7 @@
 //     craft's crane).
 // A soldier object exists while its player is alive.
 #include "bot_knowledge.h"
+#include "bot_llm.h"
 #include "bot_players.h"
 #include "bots/bot_api.h"
 #include "bots/nav.h"
@@ -120,6 +121,8 @@ bool ReadSoldier(uint32_t o, Soldier& s) {
   s.yaw = LdF(aim + 0x134);
   s.pitch = LdF(aim + 0x138);
   s.vehicle = (Ld32(o + kSoldierOnFoot) >> 24) == 0 ? kSeated : 0;
+  float health = LdF(o + 0x3C);
+  s.health = std::isfinite(health) && health >= 0 && health <= 1000 ? health : 100;
   return std::isfinite(s.pos.x) && std::isfinite(s.yaw) && (s.team == 1 || s.team == 2);
 }
 
@@ -322,6 +325,130 @@ struct Director {
   }
 };
 
+// The advisor for the brain (World::ask, World::answer; bot_llm.h): the bot's
+// surroundings, 80 m across, with up to 6 places 6 to 25 m off to pick from.
+// (The director's thread only.)
+// A place it learned (botllm::Recall) is answered at once, without asking;
+// each answer taken is judged (JudgeAdvice) and learned from.
+const Director* g_advised = nullptr;
+struct Advice {
+  std::vector<Vec> places;  // offered
+  uint32_t soldier = 0;
+  int kind = 0;
+  float at[3] = {}, dir = 0;
+  bool recalled = false;  // an answer ready: `place`
+  Vec place;
+  // Judging the one taken: until when (0: none), the case.
+  double judge_until = 0;
+  int64_t judge_case = 0;
+  float judge_place[3] = {};
+} g_advice[kMaxBots];
+bool BrainAsk(int slot, int kind, const char* situation) {
+  if (!g_advised || slot < 0 || slot >= kMaxBots || slot >= int(g_advised->bots.size())) return false;
+  const Soldier* me = g_advised->Find(g_advised->bots[size_t(slot)].soldier);
+  if (!me) return false;
+  Advice& a = g_advice[slot];
+  if (a.judge_until || a.recalled) return false;  // (one piece of advice at a time)
+  // Which way: where it faces (stuck), or the nearest enemy (cover).
+  float dir = me->yaw, nearest = 1e9f;
+  if (kind == 2 || kind == 5)
+    for (const Soldier& s : g_advised->soldiers)
+      if (s.team != me->team && s.health > 0 && botapi::Dist2D(s.pos, me->pos) < nearest)
+        nearest = botapi::Dist2D(s.pos, me->pos), dir = std::atan2(s.pos.x - me->pos.x, s.pos.z - me->pos.z);
+  float at[3] = {me->pos.x, me->pos.y, me->pos.z}, learned[3];
+  if (botllm::Recall(kind, at, dir, learned) && std::hypot(learned[0] - at[0], learned[2] - at[2]) > 3.0f) {
+    a.kind = kind, a.soldier = me->obj, a.dir = dir, a.recalled = true, a.place = Vec{learned[0], learned[1], learned[2]};
+    memcpy(a.at, at, sizeof(at));
+    return true;
+  }
+  if (!botllm::CanAsk(slot)) return false;
+  float found[6 * 3];
+  int n = nav::Places(at, 6.0f, 25.0f, found, 6);
+  if (n < 2) return false;
+  using botllm::Marker;
+  botllm::MapView m;
+  m.cx = me->pos.x, m.cz = me->pos.z, m.y = me->pos.y, m.half = 40, m.kind = kind;
+  m.ground = [](float x, float z) {
+    float h = TerrainHeight(x, z);
+    return h < -1e8f ? NAN : h;
+  };
+  m.walkable = [](float x, float y, float z) { return nav::Walkable(x, y, z); };
+  // The eye view: from its eyes, toward the enemy when it is about a fight.
+  m.sight = [](const float* a, const float* b) { return InSight(a, b); };
+  m.eye[0] = me->pos.x, m.eye[1] = me->pos.y + 1.6f, m.eye[2] = me->pos.z;
+  m.eye_yaw = kind == 2 || kind == 5 ? dir : me->yaw;
+  m.markers.push_back({Marker::kSelf, me->pos.x, me->pos.z, me->yaw});
+  for (const Soldier& s : g_advised->soldiers)
+    if (s.obj != me->obj && s.health > 0 && std::fabs(s.pos.x - m.cx) < m.half && std::fabs(s.pos.z - m.cz) < m.half)
+      m.markers.push_back({s.team == me->team ? Marker::kFriend : Marker::kEnemy, s.pos.x, s.pos.z});
+  for (const Vehicle& v : g_advised->vehicles)
+    if (std::fabs(v.pos.x - m.cx) < m.half && std::fabs(v.pos.z - m.cz) < m.half)
+      m.markers.push_back({Marker::kVehicle, v.pos.x, v.pos.z});
+  for (const Point& p : g_advised->points)  // (flags: the enemy's orange, the rest yellow)
+    m.markers.push_back({p.owner != 0 && p.owner != me->team ? Marker::kObjectiveEnemy : Marker::kObjective, p.pos.x, p.pos.z});
+  std::vector<Vec> places;
+  for (int k = 0; k < n; ++k) {
+    const float* p = &found[3 * k];
+    places.push_back(Vec{p[0], p[1], p[2]});
+    // Cover: the nearest enemy, and whether one of the (up to 4) within 70 m sees it.
+    char note[96] = {};
+    if (kind == 2 || kind == 5) {
+      float nearest = 1e9f;
+      bool seen = false;
+      int looked = 0;
+      for (const Soldier& s : g_advised->soldiers) {
+        if (s.team == me->team || s.health <= 0) continue;
+        float d = std::hypot(s.pos.x - p[0], s.pos.z - p[2]);
+        nearest = std::min(nearest, d);
+        float eye[3] = {s.pos.x, s.pos.y + 1.6f, s.pos.z}, chest[3] = {p[0], p[1] + 1.2f, p[2]};
+        if (d < 70.0f && looked < 4) ++looked, seen |= InSight(eye, chest);
+      }
+      if (nearest < 1e8f)
+        snprintf(note, sizeof(note), "%.0f m from the nearest enemy, %s", nearest, seen ? "an enemy can see it" : "no enemy sees it");
+    }
+    m.markers.push_back({Marker::kPlace, p[0], p[2], 0, k + 1, note});
+  }
+  if (!botllm::Ask(slot, situation, m, n)) return false;
+  a.places = places, a.soldier = me->obj, a.kind = kind, a.dir = dir, a.recalled = false;
+  memcpy(a.at, at, sizeof(at));
+  return true;
+}
+bool BrainAnswer(int slot, Vec* place) {
+  if (slot < 0 || slot >= kMaxBots || !g_advised || slot >= int(g_advised->bots.size())) return false;
+  Advice& a = g_advice[slot];
+  int k = 0;
+  int64_t id = 0;
+  if (a.recalled) {
+    a.recalled = false, *place = a.place;
+  } else if (botllm::Answer(slot, &k, nullptr, &id) && k >= 1 && k <= int(a.places.size())) {
+    *place = a.places[size_t(k - 1)];
+  } else {
+    return false;
+  }
+  if (g_advised->bots[size_t(slot)].soldier != a.soldier) return false;
+  a.judge_until = g_advised->now + (a.kind == 2 ? 12.0 : a.kind == 5 ? 15.0 : 20.0), a.judge_case = id;
+  a.judge_place[0] = place->x, a.judge_place[1] = place->y, a.judge_place[2] = place->z;
+  return true;
+}
+// What came of it: a way round worked if the bot got over 12 m from where it
+// was stuck within 20 s; cover, if it was still alive 12 s later; moving on
+// from standing idle, if it was over 5 m on and alive 20 s later.
+void JudgeAdvice(const Director& d) {
+  for (int slot = 0; slot < kMaxBots && slot < int(d.bots.size()); ++slot) {
+    Advice& a = g_advice[slot];
+    if (!a.judge_until) continue;
+    const Soldier* me = d.bots[size_t(slot)].soldier == a.soldier ? d.Find(a.soldier) : nullptr;
+    bool died = !me || me->health <= 0;
+    bool moved = me && std::hypot(me->pos.x - a.at[0], me->pos.z - a.at[2]) > (a.kind == 4 ? 5.0f : 12.0f);
+    bool fight = a.kind == 2 || a.kind == 5;  // (judged by surviving)
+    if (died && !fight) a.judge_until = 0;  // (no telling)
+    else if (died || d.now >= a.judge_until || (a.kind == 1 && moved)) {
+      botllm::Learn(a.kind, a.at, a.dir, a.judge_place, fight ? !died : moved, a.judge_case);
+      a.judge_until = 0;
+    }
+  }
+}
+
 // BF_BOT_LOG=<file.csv>: every bot's track twice a second, with the flags and
 // vehicles now and then (tools/bot_paths.py draws it).
 struct TraceLog {
@@ -505,11 +632,12 @@ void StartBotDirector() {
     int result = 0;
     char result_text[160] = {};
     double result_at = 0;
-    auto t0 = std::chrono::steady_clock::now();
+    const double g0 = GuestSeconds();  // (the guest's time: --speed)
     double last_scan = -10, last_log = 0;
     while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(33));
-      d.now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      // (--speed: thinking as often in the game's time, its clock as fast)
+      std::this_thread::sleep_for(std::chrono::milliseconds(std::max(5, int(33 / g_time_speed))));
+      d.now = GuestSeconds() - g0;
       brain.Poll(d.now);
       if (brain.reloaded) {
         brain.reloaded = false;
@@ -564,6 +692,35 @@ void StartBotDirector() {
       w.sight = BrainSight;
       w.ground = BrainGround;
       w.learned = BrainLearned;
+      // The advisor (or what it taught on this map).
+      g_advised = &d;
+      botllm::UseMap(map);
+      JudgeAdvice(d);
+      w.ask = have_mesh ? BrainAsk : nullptr;
+      w.answer = have_mesh ? BrainAnswer : nullptr;
+      w.training = g_training;
+      // Training: the run's record (bot_llm.h): the whole level drawn once a
+      // map (the flags' extent and 150 m round), and every bot's track.
+      static std::string recorded;
+      if (g_training && have_mesh && recorded != map) {
+        recorded = map;
+        float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f, ys = 0;
+        for (const Point& p : d.points)
+          x0 = std::min(x0, p.pos.x), x1 = std::max(x1, p.pos.x), z0 = std::min(z0, p.pos.z), z1 = std::max(z1, p.pos.z),
+          ys += p.pos.y;
+        botllm::MapView level;
+        level.cx = (x0 + x1) / 2, level.cz = (z0 + z1) / 2, level.half = std::max(x1 - x0, z1 - z0) / 2 + 350.0f;
+        level.y = ys / float(d.points.size());
+        level.ground = [](float x, float z) {
+          float h = TerrainHeight(x, z);
+          return h < -1e8f ? NAN : h;
+        };
+        level.walkable = [](float x, float y, float z) { return nav::Walkable(x, y, z); };
+        for (const Point& p : d.points) level.markers.push_back({botllm::Marker::kObjective, p.pos.x, p.pos.z});
+        botllm::SetLevelMap(map, level);
+      }
+      for (const botapi::BotIO& b : d.bots)
+        if (const Soldier* s = b.soldier ? d.Find(b.soldier) : nullptr) botllm::Track(b.slot, s->team, s->pos.x, s->pos.z);
       // Learning (bot_knowledge.h): where the real players go, once a second
       // (not the bots: what they do is what is being improved); saved each minute.
       knowledge::UseMap(map);

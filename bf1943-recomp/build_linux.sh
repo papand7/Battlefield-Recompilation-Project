@@ -5,6 +5,7 @@
 #
 #   ./build_linux.sh --game <game folder | default.xex | STFS package>
 #                    [--out <build dir>] [--server] [--jobs N] [--recompile]
+#                    [--bfbc1 [--bc-tree <dir>]]
 #
 #   --game       the game files: a folder with the v1.06 default.xex in it (and
 #                the rest of the game), that default.xex, or the Xbox 360
@@ -13,6 +14,9 @@
 #   --server     the dedicated server instead of the game
 #   --jobs N     parallel compile jobs (default: from cores and free memory)
 #   --recompile  run XenonRecomp again even if generated/ppc is there
+#   --bfbc1      Battlefield: Bad Company instead (bfbc1 / bfbc1_server; the
+#                game files: its folder, default.xex or the disc image .iso)
+#   --bc-tree    Bad Company's tree (default: ../src-bfbc1 or ../bfbc1-recomp)
 #
 # Steps: check the packages (prints the install command, never runs sudo),
 # check the game files, build XenonRecomp (thirdparty/XenonRecomp), make the
@@ -32,8 +36,8 @@ TREE=$(cd "$(dirname "$0")" && pwd -P)
 XEX_SHA1=b5aaa325ff358d66a116000931b7204da3f14534    # default.xex v1.06
 XEX_SHA1_105=1c1f22606fa1eff15bf0409214279118dc805c28 # v1.05
 
-GAME= OUT= SERVER=0 JOBS= RECOMPILE=0
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+GAME= OUT= SERVER=0 JOBS= RECOMPILE=0 BC=0 BC_TREE=
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { printf 'error: %s\n' "$*"; exit 1; }
 need_arg() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"; }
 while [ $# -gt 0 ]; do
@@ -43,15 +47,32 @@ while [ $# -gt 0 ]; do
     --server) SERVER=1; shift ;;
     --jobs) need_arg "$@"; JOBS=$2; shift 2 ;;
     --recompile) RECOMPILE=1; shift ;;
+    --bfbc1) BC=1; shift ;;
+    --bc-tree) need_arg "$@"; BC_TREE=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "unknown option: $1" ;;
   esac
 done
 [ -n "$GAME" ] || { usage; die "--game <folder with the game files> is required"; }
 [ -e "$GAME" ] || die "no such game folder or file: $GAME"
-if [ $SERVER = 1 ]; then TARGET=bf1943_server; else TARGET=bf1943; fi
+# The game's own tree (Bad Company: its sources and recompiler config; the
+# shared code is this tree's) and its name.
+GTREE=$TREE NAME=bf1943 TITLE="Battlefield 1943 1.06"
+if [ $BC = 1 ]; then
+  if [ -z "$BC_TREE" ]; then
+    for d in "$TREE/../src-bfbc1" "$TREE/../bfbc1-recomp"; do
+      [ -f "$d/game/linux/CMakeLists.txt" ] && { BC_TREE=$d; break; }
+    done
+  fi
+  [ -n "$BC_TREE" ] && [ -f "$BC_TREE/game/linux/CMakeLists.txt" ] ||
+    die "Bad Company's tree (src-bfbc1 or bfbc1-recomp) is missing"
+  GTREE=$(cd "$BC_TREE" && pwd -P) NAME=bfbc1 TITLE="Battlefield: Bad Company (USA disc)"
+  XEX_SHA1=c1ad8ac5c18b1b0b23a4c3476721462852af1a93 XEX_SHA1_105=
+fi
+if [ $SERVER = 1 ]; then TARGET=${NAME}_server; else TARGET=$NAME; fi
 if [ -z "$OUT" ]; then
-  if [ $SERVER = 1 ]; then OUT=$TREE/build/linux-server; else OUT=$TREE/build/linux-client; fi
+  if [ $BC = 1 ]; then OUT=$TREE/build/linux-bfbc1; [ $SERVER = 1 ] && OUT=$OUT-server
+  elif [ $SERVER = 1 ]; then OUT=$TREE/build/linux-server; else OUT=$TREE/build/linux-client; fi
 fi
 mkdir -p "$OUT/logs" || die "cannot create $OUT"
 OUT=$(cd "$OUT" && pwd -P)
@@ -198,16 +219,19 @@ else
   if [ ! -f "$GAME_DIR/default.xex" ] || [ "$(sha1 "$GAME_DIR/default.xex")" != $XEX_SHA1 ]; then
     echo "unpacking $GAME"
     rm -rf "$GAME_DIR"
-    run_log "$LOGS/unpack.log" python3 -I "$TREE/tools/stfs_extract.py" "$GAME" "$GAME_DIR" ||
-      fail "$LOGS/unpack.log" "could not unpack $GAME (an Xbox 360 package of Battlefield 1943 1.06 is expected)"
+    unpacker=stfs_extract.py what="an Xbox 360 package of Battlefield 1943 1.06"
+    [ $BC = 1 ] && unpacker=xiso_extract.py what="a disc image (.iso) of Battlefield: Bad Company"
+    run_log "$LOGS/unpack.log" python3 -I "$TREE/tools/$unpacker" "$GAME" "$GAME_DIR" ||
+      fail "$LOGS/unpack.log" "could not unpack $GAME ($what is expected)"
   fi
   [ -f "$GAME_DIR/default.xex" ] || die "no default.xex in the package $GAME"
 fi
 XEX=$GAME_DIR/default.xex
 h=$(sha1 "$XEX")
-[ "$h" != $XEX_SHA1_105 ] || die "this is version 1.05 of the game: use the 1.06 package (the game updated on the console)"
-[ "$h" = $XEX_SHA1 ] || die "$XEX is not Battlefield 1943 version 1.06 (SHA-1 $h)"
-echo "Battlefield 1943 1.06: $GAME_DIR"
+[ -z "$XEX_SHA1_105" ] || [ "$h" != $XEX_SHA1_105 ] ||
+  die "this is version 1.05 of the game: use the 1.06 package (the game updated on the console)"
+[ "$h" = $XEX_SHA1 ] || die "$XEX is not $TITLE (SHA-1 $h)"
+echo "$TITLE: $GAME_DIR"
 finish
 
 # ---- 3. XenonRecomp ----------------------------------------------------------------
@@ -226,14 +250,16 @@ finish
 
 # ---- 4. the recompiler config ------------------------------------------------------
 begin config "The recompiler config"
-GEN=$TREE/generated
-CFG=$GEN/bf1943_config.toml
+GEN=$GTREE/generated
+CFG=$GEN/${NAME}_config.toml
 PPC_CONTEXT=$TREE/thirdparty/XenonRecomp/XenonUtils/ppc_context.h
 mkdir -p "$GEN" || die "cannot create $GEN"
 if [ -f "$CFG" ]; then
   tables=$(sed -n 's/^switch_table_file_path *= *"\([^"]*\)".*/\1/p' "$CFG")
   [ -z "$tables" ] || [ -f "$GEN/$tables" ] || die "$CFG names $tables, which is missing in $GEN"
   echo "using $CFG"
+elif [ $BC = 1 ]; then
+  die "$CFG is missing (Bad Company's recompiler config comes with its tree)"
 else
   # A fresh clone has none (generated/ is not in the repo): made from default.xex.
   echo "making $CFG from your default.xex (tools/make_recomp_config.py)"
@@ -247,7 +273,7 @@ finish
 
 # ---- 5. XenonRecomp -> generated/ppc -----------------------------------------------
 begin recompile "Recompiling the game code (XenonRecomp)"
-LOCAL=$GEN/bf1943_config.linux.toml
+LOCAL=$GEN/${NAME}_config.linux.toml
 xex_toml=$(printf '%s' "$XEX" | sed 's/[\\"]/\\&/g')
 sed "s|^file_path = .*|file_path = \"$(printf '%s' "$xex_toml" | sed 's/[|&\\]/\\&/g')\"|" "$CFG" > "$LOCAL" ||
   die "cannot write $LOCAL"
@@ -283,8 +309,9 @@ fi
 begin configure "Configuring the game build (CMake; downloads SDL3 the first time)"
 BUILD=$OUT/cmake
 CLIENT=ON; [ $SERVER = 1 ] && CLIENT=OFF
-run_log "$LOGS/configure.log" cmake -S "$TREE/game/linux" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBF1943_CLIENT=$CLIENT ||
+if [ $BC = 1 ]; then GAME_OPTS=(-DBFBC1_CLIENT=$CLIENT "-DROOT=$TREE"); else GAME_OPTS=(-DBF1943_CLIENT=$CLIENT); fi
+run_log "$LOGS/configure.log" cmake -S "$GTREE/game/linux" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ "${GAME_OPTS[@]}" ||
   fail "$LOGS/configure.log" "CMake configure failed"
 finish
 
@@ -310,23 +337,27 @@ mkdir -p "$DEST" || die "cannot create $DEST"
 cp -f "$BUILD/$TARGET" "$DEST/$TARGET" || die "cannot copy $TARGET to $DEST"
 # Next to the exe: the bots' shipped knowledge (both), the PC menus' fonts and
 # the PBR shader table (the game).
-rm -rf "$DEST/bot_knowledge" && cp -R "$TREE/data/bot_knowledge" "$DEST/" || die "cannot copy data/bot_knowledge"
+# (Bad Company: its own PBR table; its bots learn in nav/, no shipped knowledge.)
+if [ $BC = 0 ]; then
+  rm -rf "$DEST/bot_knowledge" && cp -R "$TREE/data/bot_knowledge" "$DEST/" || die "cannot copy data/bot_knowledge"
+fi
 if [ $SERVER = 0 ]; then
   rm -rf "$DEST/fonts" && cp -R "$TREE/data/fonts" "$DEST/" || die "cannot copy data/fonts"
-  cp -f "$TREE/data/pbr_shaders.txt" "$DEST/" || die "cannot copy data/pbr_shaders.txt"
+  cp -f "$GTREE/data/pbr_shaders.txt" "$DEST/" || die "cannot copy data/pbr_shaders.txt"
 fi
-printf 'tree %s\ncommit %s\ngame %s\n' "$TREE" \
-  "$(git -C "$TREE" rev-parse --short HEAD 2>/dev/null || echo unknown)" "$GAME_DIR" > "$DEST/.build-info"
+printf 'tree %s\ncommit %s\ngame %s\n' "$GTREE" \
+  "$(git -C "$GTREE" rev-parse --short HEAD 2>/dev/null || echo unknown)" "$GAME_DIR" > "$DEST/.build-info"
 finish
 
 echo
 echo "Built $DEST/$TARGET ($(du -h "$DEST/$TARGET" | cut -f1))."
 if [ $SERVER = 1 ]; then
   echo "Run the server:"
-  echo "  \"$DEST/bf1943_server\" --game \"$GAME_DIR\" --user \"$OUT/server_data\" --dedicated --name \"My Server\" --maps Wake_island_s"
+  maps=" --maps Wake_island_s"; [ $BC = 1 ] && maps=  # (Bad Company: its own rotation)
+  echo "  \"$DEST/$TARGET\" --game \"$GAME_DIR\" --user \"$OUT/server_data\" --dedicated --name \"My Server\"$maps"
 else
   echo "Run the game (needs a Vulkan 1.3 driver; settings and saves go in --user):"
-  echo "  \"$DEST/bf1943\" --game \"$GAME_DIR\" --user \"$OUT/userdata\""
+  echo "  \"$DEST/$TARGET\" --game \"$GAME_DIR\" --user \"$OUT/userdata\""
 fi
 case $GAME_DIR in /mnt/*) echo "(The game files are on a Windows drive: copied to the Linux disk they load much faster.)" ;; esac
 echo "ok $DEST/$TARGET"

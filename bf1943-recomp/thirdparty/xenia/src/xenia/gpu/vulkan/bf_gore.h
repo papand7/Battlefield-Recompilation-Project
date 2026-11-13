@@ -18,6 +18,14 @@ namespace gpu {
 namespace bflook {
 
 inline std::atomic<bool> gore{false};
+// Smoke, dust and debris with or without blood, at the game's explosions
+// (runtime: ClientExplosionEntity, AddExplosion); on with BF_PARTICLES=1.
+inline std::atomic<bool> effects{false};
+// Any thread: an explosion at pos (world).
+void AddExplosion(const float pos[3]);
+// GPU thread: kind 0 a puff of gun smoke at pos, 1 an explosion there (a
+// dust cloud and flying debris).
+void AddEffect(int kind, const float pos[3]);
 // Guest physical memory for the index lists of bodies that came apart (set
 // before the GPU starts).
 inline uint32_t scratch_physical = 0, scratch_size = 0;

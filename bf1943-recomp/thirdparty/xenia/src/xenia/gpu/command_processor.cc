@@ -10,6 +10,10 @@
 #include "xenia/gpu/command_processor.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <map>
+#include <mutex>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/byte_stream.h"

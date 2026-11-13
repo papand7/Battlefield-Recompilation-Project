@@ -165,7 +165,22 @@ std::atomic<uint16_t> g_auto_buttons{0};  // held by the game-side automation (b
 float g_mouse_sensitivity = 1.0f;  // --mouse-sens
 bool g_mouse_invert = false;       // --invert-mouse
 float g_plane_mouse_sensitivity = 1.0f;
+float g_aim_mouse_sensitivity = 1.0f;
 bool g_plane_mouse_invert = false;
+bool g_aim_toggle = false, g_sprint_toggle = false;
+float g_camera_shake = 1.0f;
+bool g_smooth_players = std::getenv("BF_SMOOTH_PLAYERS") != nullptr;  // off: see game_patches.cpp
+bool g_skip_intro = true;
+std::atomic<int> g_disconnect_reason{-1};
+std::atomic<int64_t> g_disconnect_ms{0};
+std::atomic<int64_t> g_press_a_until{0};
+bool g_present_vsync = false;
+int g_prompt_style = 0;
+bool g_motion_blur = true;
+uint32_t g_background_fps = 30;
+bool g_background_mute = true;
+std::atomic<bool> g_window_focused{true};
+float g_master_volume = 1.0f, g_music_volume = 1.0f, g_voice_volume = 1.0f;
 double g_test_mouse_at = 0;        // --test-mouse <s>: synthetic look input for tests
 }
 
@@ -183,6 +198,8 @@ HWND OurForegroundWindow() {
   return rt::linput::FocusedWindow();
 #endif
 }
+std::mutex g_mouse_mutex;
+long g_mouse_dx = 0, g_mouse_dy = 0, g_mouse_wheel = 0;
 // Tests: BF_TEST_KEY="<seconds>:<virtual key>[,...]" holds those keys for
 // 0.2 s at those times, whatever window has focus.
 bool TestKeyDown(int vk) {
@@ -204,11 +221,13 @@ bool TestKeyDown(int vk) {
   }();
   double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   // BF_TEST_KEY_FILE: a file a test appends virtual keys to (one per line),
-  // each held 0.2 s from when it is read (checked every 50 ms).
+  // each held 0.4 s from when it is read (checked every 50 ms), or mouse
+  // movements ("m <dx> <dy>", counts).
   static const char* file = std::getenv("BF_TEST_KEY_FILE");
   if (file) {
     static std::mutex m;
-    static std::vector<std::pair<double, int>> live;
+    struct Held { double at; int key; double seconds; };
+    static std::vector<Held> live;
     static size_t offset = 0;
     static double next_read = 0;
     std::lock_guard l(m);
@@ -220,13 +239,24 @@ bool TestKeyDown(int vk) {
         while (std::fgets(line, sizeof line, f)) {
           if (!std::strchr(line, 10)) break;  // not written out yet (no newline)
           offset += std::strlen(line);
-          if (int key = std::atoi(line)) live.emplace_back(now, key);
+          long mdx, mdy;
+          for (char* c = line; *c; ++c) if (*c == ':') *c = ' ';  // "m:dx:dy" too
+          if (line[0] == 'm' && std::sscanf(line + 1, "%ld %ld", &mdx, &mdy) == 2) {
+            // Mouse movement (counts), for tests without a usable mouse (RDP).
+            std::lock_guard ml(g_mouse_mutex);
+            g_mouse_dx += mdx, g_mouse_dy += mdy;
+          } else if (int key = std::atoi(line)) {
+            // "<vk> [seconds]": held that long (0.4 s if not given).
+            double seconds = 0.4;
+            std::sscanf(line, "%*d %lf", &seconds);
+            live.push_back({now, key, seconds});
+          }
         }
         std::fclose(f);
       }
     }
-    for (const auto& [at, key] : live)
-      if (key == vk && now >= at && now < at + 0.4) return true;
+    for (const auto& h : live)
+      if (h.key == vk && now >= h.at && now < h.at + h.seconds) return true;
   }
   if (keys.empty()) return false;
   for (const auto& [at, key] : keys) {
@@ -235,14 +265,16 @@ bool TestKeyDown(int vk) {
   return false;
 }
 bool TestKeysActive() { return std::getenv("BF_TEST_KEY") != nullptr || std::getenv("BF_TEST_KEY_FILE") != nullptr; }
-bool Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0 || TestKeyDown(vk); }
+bool Down(int vk) {
+  // (Alt+Enter is the fullscreen switch, not Enter.)
+  if (vk == VK_RETURN && (GetAsyncKeyState(VK_MENU) & 0x8000)) return false;
+  return (GetAsyncKeyState(vk) & 0x8000) != 0 || TestKeyDown(vk);
+}
 
-// Raw mouse movement, collected on a hidden message-only window.
-std::mutex g_mouse_mutex;
-long g_mouse_dx = 0, g_mouse_dy = 0, g_mouse_wheel = 0;
+// Raw mouse movement, collected on a hidden message-only window (and the
+// test key file's "m <dx> <dy>" lines). Linux: from the game window's events.
 
 #ifndef _WIN32
-// Linux: from the game window's events.
 void MouseThread() {
   for (;;) {
     long dx, dy, wheel;
@@ -325,6 +357,10 @@ struct MouseLook {
   int wheel_frames = 0;  // RB held while > 0 (one notch = one weapon toggle)
   int wheel_dir = 0;     // +1 = last notch was away from the user (up)
 };
+std::mutex g_vehicle_mouse_mutex;
+double g_vehicle_dx = 0, g_vehicle_dy = 0;  // counts for the turret aiming (rt::TakeVehicleMouse)
+std::chrono::steady_clock::time_point g_vehicle_moved{};
+std::atomic<bool> g_mouse_looks{false};      // the last mouse-look read was live (not Alt, a menu, the background)
 MouseLook SampleMouse() {
   static std::once_flag started;
   std::call_once(started, [] { std::thread(MouseThread).detach(); });
@@ -344,6 +380,11 @@ MouseLook SampleMouse() {
     g_mouse_dx = g_mouse_dy = g_mouse_wheel = 0;
   }
   dt = std::min(dt, 0.05);
+  {
+    std::lock_guard l2(g_vehicle_mouse_mutex);
+    g_vehicle_dx += dx, g_vehicle_dy += dy;
+    if (dx || dy) g_vehicle_moved = now;
+  }
   static const auto t0 = now;
   if (g_test_mouse_at > 0) {
     // Test: 1 s right (1500 counts/s), then 0.3 s up, then one wheel notch.
@@ -372,15 +413,32 @@ MouseLook SampleMouse() {
 
 static std::atomic<bool> g_local_flying{false};
 bool rt::SimulatedKeyDown(int vk) { return TestKeyDown(vk); }
+bool (*rt::g_vehicle_mouse_stick)(float* x, float* y) = nullptr;
+bool rt::TakeVehicleMouse(double& dx, double& dy, double& idle) {
+  std::lock_guard l(g_vehicle_mouse_mutex);
+  dx = g_vehicle_dx, dy = g_vehicle_dy;
+  g_vehicle_dx = g_vehicle_dy = 0;
+  idle = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_vehicle_moved).count();
+  return g_mouse_looks.load();
+}
 float rt::MouseLookAxis(int axis) {
+  g_mouse_looks = false;
   if (Down(VK_MENU) && g_test_mouse_at <= 0) return 0;
   MouseLook look = SampleMouse();
+  g_mouse_looks = !g_in_menus && !g_level_menu;
+  // A vehicle's guns and turrets: the mouse aims them (game_patches.cpp).
+  if (!g_local_flying.load(std::memory_order_relaxed) && rt::g_vehicle_mouse_stick) {
+    float x, y;
+    if (rt::g_vehicle_mouse_stick(&x, &y)) return axis == 0 ? x : y;
+  }
   float v = axis == 0 ? look.rx : look.ry;
   // Planes (the right stick is pitch and roll): their own sensitivity, and
   // optionally mouse forward pulls the nose up.
   if (g_local_flying.load(std::memory_order_relaxed)) {
     if (g_mouse_sensitivity > 0) v *= g_plane_mouse_sensitivity / g_mouse_sensitivity;
     if (axis == 1 && g_plane_mouse_invert) v = -v;
+  } else if (rt::g_aiming.load(std::memory_order_relaxed)) {
+    v *= g_aim_mouse_sensitivity;  // down the sights
   }
   return v;
 }
@@ -391,7 +449,21 @@ namespace rt { std::atomic<bool> g_title_passed{false}; }  // declared in kernel
 using rt::g_title_passed;
 
 static void AddKeyboard(XINPUT_GAMEPAD& g) {
+  // A game dialog dismissed for the player (pc_settings.cpp: the connection
+  // notice): A held a few polls.
+  if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+          .count() < rt::g_press_a_until.load()) {
+    g.wButtons |= XINPUT_GAMEPAD_A;
+    return;
+  }
   HWND w = OurForegroundWindow();
+  // In front (tests count as in front): the background frame cap and mute.
+  rt::g_window_focused = w != nullptr || TestKeysActive();
+  {
+    float volume = rt::g_master_volume * (rt::g_background_mute && !rt::g_window_focused ? 0.0f : 1.0f);
+    static float applied = -1.0f;
+    if (volume != applied) applied = volume, rt::xapu::SetOutputVolume(volume);
+  }
   bool menus = g_in_menus || g_level_menu;
   // A click that closes a menu (spawn, resume) must not fire or zoom: mouse
   // buttons count again once released.
@@ -430,7 +502,23 @@ static void AddKeyboard(XINPUT_GAMEPAD& g) {
       {pcset::kReload, XINPUT_GAMEPAD_X},            {pcset::kGrenade, XINPUT_GAMEPAD_LEFT_SHOULDER},
       {pcset::kNextWeapon, XINPUT_GAMEPAD_RIGHT_SHOULDER},
       {pcset::kSprint, XINPUT_GAMEPAD_LEFT_THUMB},   {pcset::kCrouch, XINPUT_GAMEPAD_RIGHT_THUMB}};
+  // Sprint as a toggle (the CONTROLS page): a press switches it on, the next
+  // off; stopping, a vehicle or a menu ends it.
+  bool sprint_key = false;
+  for (int slot = 0; slot < 2; ++slot)
+    if (int vk = Key(pcset::kSprint, slot); vk && Down(vk) && !menus) sprint_key = true;
+  {
+    static bool on = false, was = false;
+    bool moving = false;
+    for (int slot = 0; slot < 2; ++slot)
+      if (int vk = Key(pcset::kForward, slot); vk && Down(vk)) moving = true;
+    if (sprint_key && !was) on = !on;
+    was = sprint_key;
+    if (menus || !moving || LocalVehicle() != kOnFoot) on = false;
+    if (g_sprint_toggle && on) g.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
+  }
   for (const Bind& b : kBinds) {
+    if (b.action == pcset::kSprint && g_sprint_toggle) continue;  // (above)
     for (int slot = 0; slot < 2; ++slot) {
       int vk = Key(b.action, slot);
       // Mouse buttons in menus are select and back (below).
@@ -483,7 +571,8 @@ static void AddKeyboard(XINPUT_GAMEPAD& g) {
         accept_before = accept_now;
         // The main menu (four rows in the middle): HOST GAME and JOIN GAME
         // open the LAN pages instead of the game's online matchmaking.
-        if (g_in_menus && count == 4 && rows[0][0] > 0.3f && (selected == 0 || selected == 1) && accept &&
+        // (bf1943's menus only: Bad Company's have other rows; CustomMenus is false there)
+        if (CustomMenus() && g_in_menus && count == 4 && rows[0][0] > 0.3f && (selected == 0 || selected == 1) && accept &&
             (Down(VK_RETURN) || Down(VK_SPACE) ||
              (Down(VK_LBUTTON) && mx >= rows[selected][0] && mx <= rows[selected][2] &&
               my >= rows[selected][1] && my <= rows[selected][3]))) {
@@ -494,7 +583,7 @@ static void AddKeyboard(XINPUT_GAMEPAD& g) {
         }
         // Help & Options (five rows on the left): its last, PC SETTINGS,
         // opens the PC settings page instead of the credits.
-        if (g_in_menus && count == 5 && rows[0][0] < 0.2f && selected == 4 && accept &&
+        if (CustomMenus() && g_in_menus && count == 5 && rows[0][0] < 0.2f && selected == 4 && accept &&
             (Down(VK_RETURN) || Down(VK_SPACE) ||
              (Down(VK_LBUTTON) && mx >= rows[4][0] && mx <= rows[4][2] && my >= rows[4][1] &&
               my <= rows[4][3]))) {
@@ -564,9 +653,9 @@ static void AddKeyboard(XINPUT_GAMEPAD& g) {
     if (back && vehicle == kDriving) g.wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
   }
   if (vehicle == kFlying) {
-    // Arrows: pitch (up = stick forward, nose down) and roll.
+    // Arrows: pitch (up = stick back, nose up; down = nose down) and roll.
     SHORT rx = SHORT((Down(VK_RIGHT) ? 32767 : 0) - (Down(VK_LEFT) ? 32767 : 0));
-    SHORT ry = SHORT((Down(VK_UP) ? 32767 : 0) - (Down(VK_DOWN) ? 32767 : 0));
+    SHORT ry = SHORT((Down(VK_DOWN) ? 32767 : 0) - (Down(VK_UP) ? 32767 : 0));
     if (rx) g.sThumbRX = rx;
     if (ry) g.sThumbRY = ry;
   }
@@ -574,7 +663,14 @@ static void AddKeyboard(XINPUT_GAMEPAD& g) {
     // Mouse movement must count as pad activity (the packet number changes).
     if (look.rx || look.ry) g.sThumbRX ^= 1;
     if (held(pcset::kFire) && !buttons_held) g.bRightTrigger = 255;
-    if (held(pcset::kZoom) && !buttons_held && vehicle != kFlying) g.bLeftTrigger = 255;
+    // Aim: held, or (the CONTROLS page) switched on and off with a press;
+    // a vehicle or sprinting ends it.
+    bool aim_key = held(pcset::kZoom) && !buttons_held && vehicle != kFlying;
+    static bool aim_on = false, aim_was = false;
+    if (aim_key && !aim_was) aim_on = !aim_on;
+    aim_was = aim_key;
+    if (vehicle != kOnFoot || sprint_key) aim_on = false;
+    if (g_aim_toggle ? aim_on : aim_key) g.bLeftTrigger = 255;
   }
 }
 #else

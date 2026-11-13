@@ -28,6 +28,8 @@
 // there are, and for the soldiers the words that look like a team (1 or 2) and
 // float triplets that look like a world position, to find the fields to read.
 #include "kernel.h"
+#include "bc_compat.h"
+#include "bot_llm.h"
 #include "DetourNavMesh.h"
 #include "DetourNavMeshQuery.h"
 #include "DetourCommon.h"
@@ -37,6 +39,7 @@
 #include <array>
 #include <chrono>
 #include <deque>
+#include <condition_variable>
 #include <queue>
 #include <filesystem>
 #include <functional>
@@ -50,6 +53,9 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+// The bots' clock: the guest's (--speed: faster), so they keep pace with the game.
+#define GetTickCount64 rt::GuestTickCount64
 
 namespace rt {
 uint32_t g_bot_soldier_for_trails = 0;  // the bot's soldier: its moves aren't learnt from
@@ -82,6 +88,52 @@ std::vector<uint32_t> Scan(uint32_t vtable) {
       if (p[i] == want) out.push_back(uint32_t(page) + i * 4);
   }
   return out;
+}
+
+// The same, from a background scan of every vtable asked for so far, at most
+// 0.4 s old (the first ask of a vtable scans at once): the heap scans took
+// the game's threads tens of milliseconds each. Read with SafeRead
+// (a page can go away under this thread); the objects can have gone since,
+// so callers check their vtable.
+std::vector<uint32_t> QuickScan(uint32_t vtable) {
+  static std::mutex m;
+  static std::map<uint32_t, std::vector<uint32_t>> results;
+  static std::once_flag once;
+  {
+    std::lock_guard<std::mutex> lock(m);
+    auto it = results.find(vtable);
+    if (it != results.end()) return it->second;
+  }
+  std::vector<uint32_t> first = Scan(vtable);
+  {
+    std::lock_guard<std::mutex> lock(m);
+    results[vtable] = first;
+  }
+  std::call_once(once, [] {
+    std::thread([] {
+      static uint32_t page_words[1024];
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        std::vector<uint32_t> wanted;
+        {
+          std::lock_guard<std::mutex> lock(m);
+          for (auto& [vt, list] : results) wanted.push_back(_byteswap_ulong(vt));
+        }
+        std::vector<std::vector<uint32_t>> found(wanted.size());
+        for (uint64_t page = 0x40000000; page < 0xC0000000; page += 0x1000) {
+          if (page >= 0x80000000 && page < 0xA0000000) continue;
+          if (!IsCommitted(uint32_t(page))) continue;
+          if (!SafeRead(page_words, g_base + page, 0x1000)) continue;
+          for (int i = 0; i < 1024; ++i)
+            for (size_t k = 0; k < wanted.size(); ++k)
+              if (page_words[i] == wanted[k]) found[k].push_back(uint32_t(page) + i * 4);
+        }
+        std::lock_guard<std::mutex> lock(m);
+        for (size_t k = 0; k < wanted.size(); ++k) results[_byteswap_ulong(wanted[k])] = std::move(found[k]);
+      }
+    }).detach();
+  });
+  return first;
 }
 
 float LdF(uint32_t a) {
@@ -1540,6 +1592,34 @@ struct Bot {
   bool grenade_live = false;         // thrown, not gone off yet
   bool steer = false;
   int64_t logged = 0;
+  // (bf1943's bot brain) the enemy last seen when (kept 1.5 s out of sight),
+  // the strafe while fighting, the objective it chose, and objectives it gave
+  // up on (stuck 7 times on the way: not for a minute).
+  int64_t enemy_seen = 0, strafe_until = 0;
+  int strafe = 0;
+  uint32_t objective = 0;
+  int objective_stucks = 0;
+  std::map<uint32_t, int64_t> avoid_until;
+  int64_t water_at = 0;  // when it last looked for a way out of water
+  // The advisor (bot_llm.h, --bot-llm): the places it was shown, for which
+  // soldier and what about (1 stuck, 2 losing a fight); a place it chose to
+  // take cover at (walked to while fighting); its health 3 s ago.
+  std::vector<std::array<float, 3>> llm_places;
+  uint32_t llm_soldier = 0;
+  int llm_why = 0;
+  int64_t cover_until = 0, health_at = 0;
+  float health_was = 100;
+  float llm_at[3] = {0, 0, 0}, llm_dir = 0;  // where it asked from, and which way (the goal, the enemy)
+  // Judging the advice taken (botllm::Learn): its kind, from where, which way,
+  // the place, the case, for which soldier, until when.
+  int judge_kind = 0;
+  float judge_at[3] = {0, 0, 0}, judge_dir = 0, judge_place[3] = {0, 0, 0};
+  int64_t judge_until = 0, judge_case = 0;
+  uint32_t judge_soldier = 0;
+  float vdetour[3] = {0, 0, 0};  // driving: the advisor's place, until when
+  int64_t vdetour_until = 0;
+  float idle_at[2] = {0, 0};  // where it has stood since then (within 5 m)
+  int64_t idle_since = 0;
 };
 static std::deque<Bot> g_bots;
 static Bot* BotWithSoldier(uint32_t so) {
@@ -1558,8 +1638,8 @@ static void FindBotInputs() {
   for (Bot& b : g_bots) {
     if (!b.soldier || b.input || now - b.input_looked < 1000) continue;
     b.input_looked = now;
-    for (uint32_t o : Scan(0x82010C98))
-      if (Ld32(o + 4) == b.soldier) b.input = o;
+    for (uint32_t o : QuickScan(0x82010C98))
+      if (Ld32(o) == 0x82010C98 && Ld32(o + 4) == b.soldier) b.input = o;
     if (b.input) RT_INFO("bot %d: input state of soldier %08X: %08X", b.index, b.soldier, b.input);
   }
 }
@@ -2005,6 +2085,31 @@ static uint32_t g_host_record = 0;  // a player's (not a bot's) input record, th
 static std::string VehicleKind(uint32_t v);
 static bool VehiclePlace(uint32_t v, float out[3]);
 static bool Drivable(const std::string& kind);
+// BF_SOLDIER_DUMP=1 (finding the blood's layout): every 5 s the server and
+// client soldiers' words +0x28..+0x48 and their health float at +0x3C.
+const bool g_soldier_dump_started = [] {
+  if (!getenv("BF_SOLDIER_DUMP")) return false;
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      for (uint32_t vt : {0x820118D0u, 0x82008D48u}) {
+        int n = 0;
+        for (uint32_t s : Scan(vt)) {
+          if (n++ >= 3) break;
+          std::string w;
+          for (uint32_t o = 0x28; o <= 0x48; o += 4) {
+            char b[24];
+            snprintf(b, sizeof(b), " +%X:%08X", o, Ld32(s + o));
+            w += b;
+          }
+          RT_INFO("soldier dump %08X (%08X):%s health %.1f", s, vt, w.c_str(), LdF(s + 0x3C));
+        }
+      }
+    }
+  }).detach();
+  return true;
+}();
+
 const bool g_host_pilot_started = [] {
   if (!getenv("BF_BOT_HOST_PILOT")) return false;
   std::thread([] {
@@ -2123,9 +2228,13 @@ const bool g_host_pilot_started = [] {
         if (!at_since) at_since = now;
         int64_t t = now - at_since;
         g_pilot_buttons = t < 400 ? 0x2000 : 0;  // B: in
-        int ph = t < 3000 ? -1 : int((t - 3000) / 2000) % 4;
-        static const char* kPh[] = {"LX right", "LX left", "RT", "LT"};
+        int ph = t < 3000 ? -1 : int((t - 3000) / 2000) % 6;
+        static const char* kPh[] = {"LX right", "LX left", "RT", "LT", "LY up", "LY down", "keys"};
+        // BF_BOT_PILOT_KEYS=1: once in, the keyboard drives (test keys).
+        static const bool keys = getenv("BF_BOT_PILOT_KEYS") != nullptr;
+        if (keys && ph >= 0) ph = 6;
         lx = ph == 0 ? 30000 : ph == 1 ? -30000 : 0;
+        ly = ph == 4 ? 30000 : ph == 5 ? -30000 : 0;
         g_pilot_rt = ph == 2 ? 255 : 0;
         g_pilot_lt = ph == 3 ? 255 : 0;
         static int64_t logged_at = 0;
@@ -2137,7 +2246,7 @@ const bool g_host_pilot_started = [] {
             snprintf(buf, sizeof(buf), " +%X:%.2f", k, LdF(g_host_record + k));
             w += buf;
           }
-          RT_INFO("bot pilot: %s: record%s", kPh[ph], w.c_str());
+          RT_INFO("bot pilot: %s: at %.1f %.1f, record%s", kPh[ph], x, z, w.c_str());
         }
         continue;
       }
@@ -2266,15 +2375,72 @@ const bool g_host_pilot_started = [] {
 // DumpCollision; the terrain heightfield is left out), binned once on a 4 m
 // grid by their extent across, and a segment tested against those in the
 // cells it crosses (Moller-Trumbore).
+// The terrain's heights (nav/<map>.hf: tools/terrain.py --hf from the level's
+// detailed heightfield tile): "BFHF", the box (x0 y0 z0 x1 y1 z1), samples per
+// side, then little-endian 16-bit samples, rows along z: height = y0 + sample
+// / 65535 * (y1 - y0). Empty without the file.
+struct Terrain {
+  float x0 = 0, y0 = 0, z0 = 0, x1 = 0, y1 = 0, z1 = 0, cell = 1;
+  uint32_t n = 0;
+  std::vector<uint16_t> h;
+};
+static Terrain* LoadTerrain() {
+  std::string path = "nav/" + g_host_map + ".hf";
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return nullptr;
+  auto* tt = new Terrain;
+  char magic[4];
+  float box[6];
+  bool ok = fread(magic, 1, 4, f) == 4 && !memcmp(magic, "BFHF", 4) && fread(box, 4, 6, f) == 6 &&
+            fread(&tt->n, 4, 1, f) == 1 && tt->n > 1 && tt->n <= 8192;
+  if (ok) {
+    tt->h.resize(size_t(tt->n) * tt->n);
+    ok = fread(tt->h.data(), 2, tt->h.size(), f) == tt->h.size();
+  }
+  fclose(f);
+  if (!ok) {
+    RT_WARN("bot nav: %s isn't a terrain file", path.c_str());
+    delete tt;
+    return nullptr;
+  }
+  tt->x0 = box[0], tt->y0 = box[1], tt->z0 = box[2], tt->x1 = box[3], tt->y1 = box[4], tt->z1 = box[5];
+  tt->cell = (tt->x1 - tt->x0) / float(tt->n);
+  RT_INFO("bot nav: terrain %s (%u x %u, %.1f m)", path.c_str(), tt->n, tt->n, tt->cell);
+  return tt;
+}
+// The hosted map's (loaded again when the map changes; the old one kept, as
+// another thread can still be reading it).
+static Terrain* TerrainOfMap() {
+  static std::mutex m;
+  static std::string map;
+  static Terrain* t = nullptr;
+  std::lock_guard<std::mutex> lock(m);
+  if (map != g_host_map) map = g_host_map, t = LoadTerrain();
+  return t;
+}
+// The ground's height at x, z (between the four samples around); NAN off it.
+static float TerrainHeight(float x, float z) {
+  Terrain* t = TerrainOfMap();
+  if (!t) return NAN;
+  float fx = (x - t->x0) / t->cell, fz = (z - t->z0) / t->cell;
+  if (fx < 0 || fz < 0 || fx >= t->n - 1 || fz >= t->n - 1) return NAN;
+  int i = int(fx), j = int(fz);
+  float u = fx - i, v = fz - j;
+  auto at = [&](int c, int r) { return float(t->h[size_t(r) * t->n + c]); };
+  float s = (at(i, j) * (1 - u) + at(i + 1, j) * u) * (1 - v) + (at(i, j + 1) * (1 - u) + at(i + 1, j + 1) * u) * v;
+  return t->y0 + s / 65535.0f * (t->y1 - t->y0);
+}
 struct SightGrid {
   float x0 = 0, z0 = 0, cell = 4.0f;
   int nx = 0, nz = 0;
   std::vector<std::array<float, 9>> tris;
   std::vector<std::vector<uint32_t>> cells;
-  std::vector<uint32_t> stamp;
-  uint32_t visit = 0;
 };
-static SightGrid* g_sight = nullptr;
+// Built once the level's bodies stop changing in number (two scans 2 s apart
+// agree, on a thread of its own); until then nothing is in sight. The build
+// itself runs on the game's thread (its objects can't go away under it there).
+static std::atomic<SightGrid*> g_sight{nullptr};
+static std::atomic<bool> g_sight_buildable{false};
 static void BuildSight() {
   auto* g = new SightGrid;
   CollisionOut out{nullptr};
@@ -2286,8 +2452,15 @@ static void BuildSight() {
     for (int j = 0; j < 3; ++j)
       for (int i = 0; i < 3; ++i) m.c[j][i] = LdF(b + 0xB0 + 16 * j + 4 * i);
     for (int i = 0; i < 3; ++i) m.t[i] = LdF(b + 0xE0 + 4 * i);
-    ShapeOut(out, m, Ld32(b + 0x10), 0);
+    uint32_t shape = Ld32(b + 0x10);
+    ShapeOut(out, m, shape, 0);
   }
+  // Over 300 m across (sky boxes, the play area's walls): left out.
+  g->tris.erase(std::remove_if(g->tris.begin(), g->tris.end(), [](const std::array<float, 9>& t) {
+    float a0 = std::min({t[0], t[3], t[6]}), a1 = std::max({t[0], t[3], t[6]});
+    float b0 = std::min({t[2], t[5], t[8]}), b1 = std::max({t[2], t[5], t[8]});
+    return a1 - a0 > 300.0f || b1 - b0 > 300.0f;
+  }), g->tris.end());
   float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f};
   for (auto& t : g->tris)
     for (int v = 0; v < 3; ++v) {
@@ -2308,7 +2481,6 @@ static void BuildSight() {
     for (int j = j0; j <= j1; ++j)
       for (int k = i0; k <= i1; ++k) g->cells[size_t(j) * g->nx + k].push_back(i);
   }
-  g->stamp.assign(g->tris.size(), 0);
   g_sight = g;
   RT_INFO("bot fight: line of sight from %zu triangles, %d x %d cells of %.0f m", g->tris.size(), g->nx, g->nz, g->cell);
 }
@@ -2328,12 +2500,35 @@ static bool SegmentHitsTri(const float o[3], const float d[3], const std::array<
 }
 // From eye to chest (a and b are the soldiers' feet).
 static bool SightReady() { return g_sight != nullptr; }
+static void StartSight() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    std::thread([] {
+      size_t last = size_t(-1);
+      for (;;) {
+        size_t n = Scan(0x820BDE74).size();
+        if (n > 50 && n == last) break;
+        last = n;
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+      }
+      g_sight_buildable = true;
+    }).detach();
+  });
+}
 static bool InSight(float ax, float ay, float az, float bx, float by, float bz) {
-  if (!g_sight) BuildSight();
-  SightGrid& g = *g_sight;
+  SightGrid* gp = g_sight.load();
+  if (!gp) {
+    StartSight();
+    return false;
+  }
+  SightGrid& g = *gp;
+  // Each triangle tested once per segment: visit stamps of this thread's own.
+  thread_local std::vector<uint32_t> stamp;
+  thread_local uint32_t visit = 0;
+  if (stamp.size() != g.tris.size()) stamp.assign(g.tris.size(), 0), visit = 0;
   float o[3] = {ax, ay + 1.6f, az}, d[3] = {bx - ax, by + 1.2f - (ay + 1.6f), bz - az};
   float len = std::hypot(d[0], d[2]);
-  ++g.visit;
+  ++visit;
   int steps = int(len / (g.cell * 0.25f)) + 1;
   int last = -1;
   for (int k = 0; k <= steps; ++k) {
@@ -2344,20 +2539,85 @@ static bool InSight(float ax, float ay, float az, float bx, float by, float bz) 
     if (c == last) continue;
     last = c;
     for (uint32_t ti : g.cells[size_t(c)]) {
-      if (g.stamp[ti] == g.visit) continue;
-      g.stamp[ti] = g.visit;
+      if (stamp[ti] == visit) continue;
+      stamp[ti] = visit;
       if (SegmentHitsTri(o, d, g.tris[ti])) return false;
+    }
+  }
+  // The ground (a hill between): above the line anywhere from 5 % to 95 %
+  // of the way, every 2 m.
+  if (TerrainOfMap()) {
+    int n = std::max(2, int(len / 2.0f));
+    for (int k = 1; k < n; ++k) {
+      float f = float(k) / n;
+      if (f < 0.05f || f > 0.95f) continue;
+      float h = TerrainHeight(o[0] + d[0] * f, o[2] + d[2] * f);
+      if (std::isfinite(h) && h > o[1] + d[1] * f + 0.1f) return false;
     }
   }
   return true;
 }
+// Sight for the bots' brains, off the game's threads: the answer for a
+// (bot soldier, enemy soldier) pair as last worked out on the sight thread,
+// asked again when over 200 ms old (out of sight until first answered).
+struct SightAsk {
+  uint64_t key;
+  float a[3], b[3];
+};
+static std::mutex g_sight_mutex;
+static std::condition_variable g_sight_wake;
+static std::deque<SightAsk> g_sight_asks;
+static std::unordered_map<uint64_t, std::pair<bool, int64_t>> g_sight_answers;  // seen, when
+static std::set<uint64_t> g_sight_pending;
+static bool InSightCached(uint32_t from, uint32_t to, const float a[3], const float b[3]) {
+  if (!g_sight.load()) {
+    StartSight();
+    if (!g_sight_buildable.load()) return false;
+    BuildSight();  // the game's thread
+  }
+  static std::once_flag once;
+  std::call_once(once, [] {
+    std::thread([] {
+      for (;;) {
+        SightAsk ask;
+        {
+          std::unique_lock<std::mutex> lock(g_sight_mutex);
+          g_sight_wake.wait(lock, [] { return !g_sight_asks.empty(); });
+          ask = g_sight_asks.front();
+          g_sight_asks.pop_front();
+        }
+        bool seen = InSight(ask.a[0], ask.a[1], ask.a[2], ask.b[0], ask.b[1], ask.b[2]);
+        std::lock_guard<std::mutex> lock(g_sight_mutex);
+        g_sight_answers[ask.key] = {seen, int64_t(GetTickCount64())};
+        g_sight_pending.erase(ask.key);
+      }
+    }).detach();
+  });
+  uint64_t key = uint64_t(from) << 32 | to;
+  int64_t now = int64_t(GetTickCount64());
+  std::lock_guard<std::mutex> lock(g_sight_mutex);
+  auto it = g_sight_answers.find(key);
+  bool seen = it != g_sight_answers.end() && it->second.first && now - it->second.second < 1000;
+  if ((it == g_sight_answers.end() || now - it->second.second > 200) && g_sight_pending.insert(key).second) {
+    SightAsk ask{key, {a[0], a[1], a[2]}, {b[0], b[1], b[2]}};
+    g_sight_asks.push_back(ask);
+    g_sight_wake.notify_one();
+  }
+  if (g_sight_answers.size() > 4096) g_sight_answers.clear();
+  return seen;
+}
+
 // The crates' interaction entities (a heap scan, far too slow for every
 // frame: once every 2 s).
 static const std::vector<uint32_t>& CrateEntities() {
   static std::vector<uint32_t> list;
   static int64_t at = 0;
   int64_t now = int64_t(GetTickCount64());
-  if (now - at > 2000) at = now, list = Scan(0x82011680);
+  if (now - at > 2000) {
+    at = now, list.clear();
+    for (uint32_t ie : QuickScan(0x82011680))
+      if (Ld32(ie) == 0x82011680) list.push_back(ie);  // (the scan can be 0.4 s old)
+  }
   return list;
 }
 // Interactions: a crate has two ServerInteractionEntity (vtable 82011680,
@@ -2428,7 +2688,11 @@ static const std::vector<uint32_t>& ServerVehicles() {
   static std::vector<uint32_t> list;
   static int64_t at = 0;
   int64_t now = int64_t(GetTickCount64());
-  if (now - at > 3000) at = now, list = Scan(0x82011AA8);
+  if (now - at > 3000) {
+    at = now, list.clear();
+    for (uint32_t v : QuickScan(0x82011AA8))
+      if (Ld32(v) == 0x82011AA8) list.push_back(v);  // (the scan can be 0.4 s old)
+  }
   return list;
 }
 extern "C" PPC_FUNC(__imp__sub_823458B0);
@@ -2534,6 +2798,158 @@ static void VehicleUpdate(PPCContext& ctx, uint8_t* base, Bot& b) {
 //   object and +90/+94) and fired at (+28); X (reload) tapped after a fight.
 //   Walking: the soldier moves relative to its aim object (vtable 820264A8),
 //   which the aim setter turns toward the next corner.
+// ---- the advisor (bot_llm.h) ----------------------------------------------------
+// Up to n places to walk to r0 to r1 m around a spot, one in each of n
+// directions, on the mesh's main piece; clockwise from the north. vehicle:
+// places to drive to, on the vehicles' mesh.
+static std::vector<std::array<float, 3>> PlacesAround(float x, float y, float z, float r0, float r1, int n,
+                                                      bool vehicle = false) {
+  std::vector<std::array<float, 3>> out;
+  dtNavMeshQuery* query = vehicle ? g_vnavquery : g_navquery;
+  if (!query) return out;
+  dtQueryFilter filter;
+  const float ext[3] = {3, 6, 3};
+  float at[3] = {x, y, z}, onmesh[3];
+  dtPolyRef start = 0;
+  query->findNearestPoly(at, ext, &filter, &start, onmesh);
+  std::vector<bool> taken(size_t(n), false);
+  for (int tries = 0; start && tries < 24 * n && int(out.size()) < n; ++tries) {
+    dtPolyRef ref = 0;
+    float pt[3];
+    if (dtStatusFailed(query->findRandomPointAroundCircle(start, onmesh, r1, &filter,
+                                                          [] { return float(rand()) / RAND_MAX; }, &ref, pt)))
+      break;
+    float d = std::hypot(pt[0] - x, pt[2] - z);
+    if (d < r0 || d > r1 || (!vehicle && !InMainPiece(ref))) continue;
+    int sector = int((std::atan2(pt[0] - x, pt[2] - z) + 3.14159265f) / 6.2831853f * n) % n;
+    if (taken[size_t(sector)]) continue;
+    taken[size_t(sector)] = true;
+    out.push_back({pt[0], pt[1], pt[2]});
+  }
+  auto angle = [&](const std::array<float, 3>& p) {
+    float a = std::atan2(p[0] - x, p[2] - z);
+    return a < 0 ? a + 6.2831853f : a;
+  };
+  std::sort(out.begin(), out.end(), [&](const auto& a, const auto& c) { return angle(a) < angle(c); });
+  return out;
+}
+// A place to go (the advisor's, or one learned before) taken: a detour (to
+// cover: walked to while fighting; in a vehicle: driven to), judged later
+// (JudgeAdvice).
+static void TakeAdvice(Bot& b, int kind, const float at[3], float dir, const float place[3], int64_t case_id, float x,
+                       float z, int64_t now) {
+  float d = std::hypot(place[0] - x, place[2] - z);
+  if (kind == 3) {
+    memcpy(b.vdetour, place, sizeof(b.vdetour));
+    b.vdetour_until = now + 6000 + int64_t(d * 400.0f), b.reverses = 0;
+  } else {
+    memcpy(b.detour, place, sizeof(b.detour));
+    b.detour_until = now + 4000 + int64_t(d * 700.0f), b.planned = 0;
+    b.cover_until = kind == 2 || kind == 5 ? b.detour_until : 0;
+  }
+  b.judge_kind = kind, b.judge_dir = dir, b.judge_case = case_id, b.judge_soldier = b.soldier;
+  memcpy(b.judge_at, at, sizeof(b.judge_at));
+  memcpy(b.judge_place, place, sizeof(b.judge_place));
+  b.judge_until = now + (kind == 2 ? 12000 : kind == 5 ? 15000 : kind == 3 ? 25000 : 20000);
+}
+// What came of it: a way round worked if it got over 12 m from where it was
+// stuck within 20 s (driving: 15 m in 25 s); cover, if it was still alive 12 s
+// later; moving on from standing idle, if it was over 5 m on and alive 20 s
+// later.
+static void JudgeAdvice(Bot& b, uint32_t so, float x, float z, int64_t now) {
+  if (!b.judge_until) return;
+  int kind = b.judge_kind;
+  bool died = so != b.judge_soldier || LdF(so + 0x3C) <= 0;
+  bool moved = std::hypot(x - b.judge_at[0], z - b.judge_at[2]) > (kind == 3 ? 15.0f : kind == 4 ? 5.0f : 12.0f);
+  bool way = kind == 1 || kind == 3;
+  bool fight = kind == 2 || kind == 5;  // (judged by surviving)
+  if (died && !fight) b.judge_until = 0;  // (no telling)
+  else if (died || now >= b.judge_until || (way && moved)) {
+    botllm::Learn(kind, b.judge_at, b.judge_dir, b.judge_place, fight ? !died : moved, b.judge_case);
+    b.judge_until = 0;
+  }
+}
+
+// Shows the advisor the bot's surroundings (80 m across, 100 m driving: the
+// ground, where nobody walks or drives, its teammates, the enemies, its
+// objective) with places 6 to 25 m off (driving: 10 to 40 m) to choose from;
+// the answer comes back in BotBrain. why: 1 stuck, 2 cover, 3 a vehicle stuck,
+// 4 standing idle, 5 where to fight an enemy from (training).
+
+static void AskAdvisor(Bot& b, int why, const std::string& situation, float x, float y, float z, float dir,
+                       uint32_t goal, const std::vector<uint32_t>& soldiers) {
+  // A place that worked here before (and isn't where it stands): no question.
+  int64_t now = int64_t(GetTickCount64());
+  float at[3] = {x, y, z}, learned[3];
+  if (b.judge_until) return;  // (one piece of advice at a time: the last one is still being judged)
+  botllm::UseMap(g_host_map);
+  if (botllm::Recall(why, at, dir, learned) && std::hypot(learned[0] - x, learned[2] - z) > 3.0f) {
+    TakeAdvice(b, why, at, dir, learned, 0, x, z, now);
+    RT_INFO("bot %d: a learned place %.0f m off", b.index, std::hypot(learned[0] - x, learned[2] - z));
+    return;
+  }
+  if (!botllm::CanAsk(b.index)) return;
+  const bool driving = why == 3;
+  std::vector<std::array<float, 3>> places =
+      driving ? PlacesAround(x, y, z, 10.0f, 40.0f, 6, true) : PlacesAround(x, y, z, 6.0f, 25.0f, 6);
+  if (places.size() < 2) return;
+  using botllm::Marker;
+  botllm::MapView m;
+  m.cx = x, m.cz = z, m.y = y, m.half = driving ? 50.0f : 40.0f, m.kind = why;
+  m.ground = [](float gx, float gz) { return TerrainHeight(gx, gz); };
+  m.walkable = [driving](float wx, float wy, float wz) {
+    dtQueryFilter filter;
+    const float ext[3] = {1.5f, 4.0f, 1.5f};
+    float p[3] = {wx, wy, wz}, q[3];
+    dtPolyRef r = 0;
+    (driving ? g_vnavquery : g_navquery)->findNearestPoly(p, ext, &filter, &r, q);
+    return r && (driving || InMainPiece(r)) && std::hypot(q[0] - wx, q[2] - wz) < 1.5f;
+  };
+  m.markers.push_back({Marker::kSelf, x, z, b.face});
+  // The eye view: from its eyes (a driver's from the vehicle, its heading),
+  // toward the enemy when it is about a fight.
+  m.sight = [](const float* a, const float* c) { return InSight(a[0], a[1], a[2], c[0], c[1], c[2]); };
+  m.eye[0] = x, m.eye[1] = y + 1.6f, m.eye[2] = z;
+  m.eye_yaw = driving ? b.vehicle_heading : (why == 2 || why == 5) && b.enemy ? std::atan2(b.ex - x, b.ez - z) : b.face;
+  for (uint32_t o : soldiers) {
+    if (o == b.soldier || !IsCommitted(o + 0x20C) || Ld32(o) != 0x820118D0 || LdF(o + 0x3C) <= 0) continue;
+    uint32_t team = Ld32(o + 0x48);
+    float ox = LdF(o + 0x200), oz = LdF(o + 0x208);
+    if ((team != 1 && team != 2) || std::fabs(ox - x) > m.half || std::fabs(oz - z) > m.half) continue;
+    m.markers.push_back({team == b.team ? Marker::kFriend : Marker::kEnemy, ox, oz});
+  }
+  if (goal) m.markers.push_back({Marker::kObjective, LdF(goal + 0xD0), LdF(goal + 0xD8)});
+  // What its code knows of each place, in words: how far the objective is
+  // from there (a way round); the nearest enemy, and whether one of the
+  // (up to 4) within 70 m sees it (cover).
+  for (size_t k = 0; k < places.size(); ++k) {
+    const std::array<float, 3>& p = places[k];
+    char note[96] = {};
+    if (why != 2 && why != 5 && goal)
+      snprintf(note, sizeof(note), "%.0f m from the objective", std::hypot(LdF(goal + 0xD0) - p[0], LdF(goal + 0xD8) - p[2]));
+    if (why == 2 || why == 5) {
+      float nearest = 1e9f;
+      bool seen = false;
+      int looked = 0;
+      for (uint32_t o : soldiers) {
+        if (!IsCommitted(o + 0x20C) || Ld32(o) != 0x820118D0 || LdF(o + 0x3C) <= 0) continue;
+        uint32_t team = Ld32(o + 0x48);
+        if ((team != 1 && team != 2) || team == b.team) continue;
+        float ox = LdF(o + 0x200), oy = LdF(o + 0x204), oz = LdF(o + 0x208), d = std::hypot(ox - p[0], oz - p[2]);
+        nearest = std::min(nearest, d);
+        if (d < 70.0f && looked < 4) ++looked, seen |= InSight(ox, oy + 1.6f, oz, p[0], p[1] + 1.2f, p[2]);
+      }
+      if (nearest < 1e8f)
+        snprintf(note, sizeof(note), "%.0f m from the nearest enemy, %s", nearest, seen ? "an enemy can see it" : "no enemy sees it");
+    }
+    m.markers.push_back({Marker::kPlace, p[0], p[2], 0, int(k + 1), note});
+  }
+  if (botllm::Ask(b.index, situation, m, int(places.size()))) {
+    b.llm_places = places, b.llm_why = why, b.llm_soldier = b.soldier, b.llm_dir = dir;
+    memcpy(b.llm_at, at, sizeof(at));
+  }
+}
+
 static void BotBrain(Bot& b, uint32_t in) {
   auto set = [in](uint32_t off, float f) {
     uint32_t u;
@@ -2549,15 +2965,25 @@ static void BotBrain(Bot& b, uint32_t in) {
   uint32_t goal = 0;
   float best = 1e9f;
   bool guard = false;
+  // Each objective scored as bf1943's ChoosePoint: nearer is better, 12 m
+  // worse for each teammate already going there (the bots spread out), 15 m
+  // better for the one it is on already (no flip-flopping), and none it gave
+  // up on lately.
+  float best_score = 1e9f;
   auto consider = [&](uint32_t ie, bool as_guard) {
+    if (b.avoid_until.count(ie) && now < b.avoid_until[ie]) return;
     float d = std::hypot(LdF(ie + 0xD0) - x, LdF(ie + 0xD8) - z);
-    if (d < best) best = d, goal = ie, guard = as_guard;
+    int going = 0;
+    for (const Bot& o : g_bots) going += &o != &b && o.team == b.team && o.objective == ie;
+    float score = d + 12.0f * going - (ie == b.objective ? 15.0f : 0.0f);
+    if (score < best_score) best_score = score, best = d, goal = ie, guard = as_guard;
   };
   for (uint32_t ie : CrateEntities())
     if (b.team == 1 ? CanArmNow(ie) : CanDefuseNow(ie)) consider(ie, false);
   if (!goal)
     for (uint32_t ie : CrateEntities())
       if (b.team == 1 ? CanDefuseNow(ie) : CanArmNow(ie)) consider(ie, true);
+  if (goal != b.objective) b.objective = goal, b.objective_stucks = 0, b.planned = 0;
   float tx = x, ty = y, tz = z;
   if (goal) tx = LdF(goal + 0xD0), ty = LdF(goal + 0xD4), tz = LdF(goal + 0xD8);
   // Taking a vehicle (BF_BOT_NO_VEHICLES=1: never): on foot, no enemy, the
@@ -2614,9 +3040,53 @@ static void BotBrain(Bot& b, uint32_t in) {
   float px = tx, pz = tz;
   if (b.step < b.route.size()) px = b.route[b.step][0], pz = b.route[b.step][2];
   bool arrived = !goal || (guard ? best < 6.0f : best < 1.0f && b.step >= b.route.size());
+  // The advisor's answer: the place it picked, as a detour (to cover: walked
+  // to while fighting). Not for a soldier since dead, nor once far from there.
+  JudgeAdvice(b, so, x, z, now);
+  // Training: the run's record (bot_llm.h): the whole level drawn once a map
+  // (the crates' extent and 150 m round), and every bot's track.
+  static std::string recorded;
+  if (g_training && recorded != g_host_map && g_navquery) {
+    std::vector<uint32_t> crates = CrateEntities();
+    if (!crates.empty()) {
+      recorded = g_host_map;
+      float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f, ys = 0;
+      for (uint32_t c : crates) {
+        float cx = LdF(c + 0xD0), cz = LdF(c + 0xD8);
+        x0 = std::min(x0, cx), x1 = std::max(x1, cx), z0 = std::min(z0, cz), z1 = std::max(z1, cz), ys += LdF(c + 0xD4);
+      }
+      botllm::MapView level;
+      level.cx = (x0 + x1) / 2, level.cz = (z0 + z1) / 2, level.half = std::max(x1 - x0, z1 - z0) / 2 + 350.0f;
+      level.y = ys / float(crates.size());
+      level.ground = [](float gx, float gz) { return TerrainHeight(gx, gz); };
+      level.walkable = [](float wx, float wy, float wz) {
+        dtQueryFilter filter;
+        const float ext[3] = {2.0f, 4.0f, 2.0f};
+        float p[3] = {wx, wy, wz}, q[3];
+        dtPolyRef r = 0;
+        g_navquery->findNearestPoly(p, ext, &filter, &r, q);
+        return r && InMainPiece(r);
+      };
+      for (uint32_t c : crates) level.markers.push_back({botllm::Marker::kObjective, LdF(c + 0xD0), LdF(c + 0xD8)});
+      botllm::SetLevelMap(g_host_map, level);
+    }
+  }
+  botllm::Track(b.index, int(b.team), x, z);
+  int pick = 0;
+  int64_t pick_case = 0;
+  std::string pick_why;
+  if (botllm::Answer(b.index, &pick, &pick_why, &pick_case) && pick >= 1 && pick <= int(b.llm_places.size()) &&
+      b.llm_soldier == so) {
+    const std::array<float, 3>& p = b.llm_places[size_t(pick - 1)];
+    float d = std::hypot(p[0] - x, p[2] - z);
+    if (d < 60.0f) {
+      TakeAdvice(b, b.llm_why, b.llm_at, b.llm_dir, p.data(), pick_case, x, z, now);
+      RT_INFO("bot %d: the advisor's place %d, %.0f m off (%s)", b.index, pick, d, pick_why.c_str());
+    }
+  }
   // Out of a spot it keeps getting stuck in: to the detour first.
   if (now < b.detour_until) {
-    if (std::hypot(b.detour[0] - x, b.detour[2] - z) < 1.5f) b.detour_until = 0, b.planned = 0;
+    if (std::hypot(b.detour[0] - x, b.detour[2] - z) < 1.5f) b.detour_until = 0, b.cover_until = 0, b.planned = 0;
     else px = b.detour[0], pz = b.detour[2], arrived = false;
   }
   float forward = arrived ? 0.0f : 1.0f, strafe = 0.0f;
@@ -2624,10 +3094,14 @@ static void BotBrain(Bot& b, uint32_t in) {
   // Fighting.
   static std::vector<uint32_t> soldiers;
   static int64_t soldiers_at = 0;
-  if (now - soldiers_at > 1000) soldiers_at = now, soldiers = Scan(0x820118D0);
+  if (now - soldiers_at > 1000) soldiers_at = now, soldiers = QuickScan(0x820118D0);
   if (b.enemy && (!IsCommitted(b.enemy + 0x20C) || Ld32(b.enemy) != 0x820118D0 || LdF(b.enemy + 0x3C) <= 0)) b.enemy = 0;
+  // Enemies (bf1943's): the three nearest within 70 m, the first of them in
+  // sight; one out of sight is kept for 1.5 s (fired at where it was).
+  bool enemy_visible = false;
   if (now - b.looked_at > 250) {
-    b.looked_at = now, b.enemy = 0, b.edist = 30.0f;
+    b.looked_at = now;
+    std::vector<std::pair<float, uint32_t>> close_by;
     for (uint32_t e : soldiers) {
       if (e == so || !IsCommitted(e + 0x20C) || Ld32(e) != 0x820118D0) continue;
       uint32_t team = Ld32(e + 0x48);
@@ -2635,18 +3109,62 @@ static void BotBrain(Bot& b, uint32_t in) {
       float ex = LdF(e + 0x200), ey = LdF(e + 0x204), ez = LdF(e + 0x208);
       if (!std::isfinite(ex) || !std::isfinite(ez) || std::fabs(ex) + std::fabs(ez) < 1.0f) continue;
       float d = std::hypot(ex - x, ez - z);
-      if (d >= b.edist || std::fabs(ey - y) > 15.0f || !InSight(x, y, z, ex, ey, ez)) continue;
-      b.enemy = e, b.edist = d;
+      if (d < 70.0f && std::fabs(ey - y) < 20.0f) close_by.push_back({d, e});
     }
+    std::sort(close_by.begin(), close_by.end());
+    uint32_t seen = 0;
+    float seen_d = 0;
+    for (size_t k = 0; k < close_by.size() && k < 3 && !seen; ++k) {
+      uint32_t e = close_by[k].second;
+      float from[3] = {x, y, z}, to[3] = {LdF(e + 0x200), LdF(e + 0x204), LdF(e + 0x208)};
+      if (InSightCached(so, e, from, to)) seen = e, seen_d = close_by[k].first;
+    }
+    if (seen) b.enemy = seen, b.edist = seen_d, b.enemy_seen = now;
+    else if (b.enemy && now - b.enemy_seen > 1500) b.enemy = 0;
   }
+  enemy_visible = b.enemy && now - b.enemy_seen < 300;
+  if (b.enemy) b.edist = std::hypot(LdF(b.enemy + 0x200) - x, LdF(b.enemy + 0x208) - z);
   if (b.enemy) b.ex = LdF(b.enemy + 0x200), b.ey = LdF(b.enemy + 0x204), b.ez = LdF(b.enemy + 0x208);
   if (b.enemy != b.engaged) {
     b.engaged = b.enemy, b.engaged_at = now;
     if (b.enemy)
       RT_INFO("bot %d: enemy %08X (team %u, health %.0f) at %.1f m", b.index, b.enemy, Ld32(b.enemy + 0x48),
               LdF(b.enemy + 0x3C), b.edist);
+    // Training: a medium question too, where to fight a new enemy from.
+    if (b.enemy && g_training && b.edist > 20.0f && !b.in_vehicle) {
+      char what[160];
+      snprintf(what, sizeof(what), "An enemy has come into sight %.0f m away. Pick a place to fight it from (cover "
+               "with a view of it), or 0 to fight from where it stands.", b.edist);
+      AskAdvisor(b, 5, what, x, y, z, std::atan2(b.ex - x, b.ez - z), goal, soldiers);
+    }
     else if (b.fired)
       b.fired = false, b.reload_until = now + 300;  // the fight is over: reload
+  }
+  // Losing a fight (under 45 health), or shot by someone it can't see (25 or
+  // more lost in 3 s): the advisor picks cover.
+  float health = LdF(so + 0x3C);
+  if (now - b.health_at > 3000) b.health_was = health, b.health_at = now;
+  if (botllm::Enabled() && now >= b.cover_until && health > 0) {
+    char what[160];
+    if (enemy_visible && health < (g_training ? 70.0f : 45.0f))
+      snprintf(what, sizeof(what), "It is losing a fight (health %.0f of 100) against the enemy %.0f m away. "
+               "Pick a place out of the enemies' sight.", health, b.edist);
+    else if (!b.enemy && b.health_was - health >= (g_training ? 15.0f : 25.0f))
+      snprintf(what, sizeof(what), "It is being shot (health %.0f of 100) and cannot see who shoots. "
+               "Pick a place with cover.", health);
+    else
+      what[0] = 0;
+    if (what[0]) AskAdvisor(b, 2, what, x, y, z, b.enemy ? std::atan2(b.ex - x, b.ez - z) : b.face, goal, soldiers);
+  }
+  // Standing about (30 s within 5 m, no enemy, on foot, nothing being
+  // judged): the advisor picks where to go.
+  if (std::hypot(x - b.idle_at[0], z - b.idle_at[1]) > 5.0f || b.enemy || b.in_vehicle || !b.idle_since)
+    b.idle_at[0] = x, b.idle_at[1] = z, b.idle_since = now;
+  else if (now - b.idle_since > (g_training ? 10000 : 30000)) {
+    b.idle_since = now;
+    AskAdvisor(b, 4, "It has stood about here for 30 s with no enemy in sight. Pick the place it should go to: on towards "
+                 "its objective, or a better spot to hold it from.", x, y, z,
+               goal ? std::atan2(tx - x, tz - z) : b.face, goal, soldiers);
   }
 
   // Stuck (not while standing on purpose).
@@ -2659,6 +3177,11 @@ static void BotBrain(Bot& b, uint32_t in) {
     // toward the next corner) is somewhere it can't get to.
     bool same_place = std::hypot(x - b.last_sx, z - b.last_sz) < 5.0f;
     b.stucks = same_place ? b.stucks + 1 : 1;
+    // Stuck 7 times on the way to one objective: another one for a minute.
+    if (b.objective && ++b.objective_stucks >= 7) {
+      b.avoid_until[b.objective] = now + 60000, b.objective_stucks = 0, b.planned = 0;
+      RT_INFO("bot %d: stuck too often on the way: another objective for a minute", b.index);
+    }
     if (same_place && b.step < b.route.size() && g_navquery) {
       float dx = b.route[b.step][0] - x, dz = b.route[b.step][2] - z, l = std::max(std::hypot(dx, dz), 0.001f);
       float ahead[3] = {x + 1.5f * dx / l, y, z + 1.5f * dz / l};
@@ -2688,8 +3211,48 @@ static void BotBrain(Bot& b, uint32_t in) {
         RT_INFO("bot %d: stuck here again; out by %.1f %.1f first", b.index, pt[0], pt[2]);
         break;
       }
+      // (and the advisor asked for a better way: its answer replaces that)
+      AskAdvisor(b, 1, "It keeps getting stuck here on its way to its objective (the yellow square, if shown). "
+                 "Pick the place that gets it around what blocks the way.", x, y, z, std::atan2(tx - x, tz - z), goal,
+                 soldiers);
     }
+    // Training: asked at the first time stuck already.
+    if (g_training && now >= b.detour_until)
+      AskAdvisor(b, 1, "It keeps getting stuck here on its way to its objective (the yellow square, if shown). "
+                 "Pick the place that gets it around what blocks the way.", x, y, z, std::atan2(tx - x, tz - z), goal,
+                 soldiers);
     b.last_sx = x, b.last_sz = z;
+  }
+  // In the water (bf1943's LandExit): off the navigation mesh with the ground
+  // over a metre below it. Every 5 s, a way out: the nearest place on the
+  // mesh's main piece on rings 10 to 200 m out (24 directions), on ground no
+  // lower than where it swims; swum to as a detour.
+  if (!b.in_vehicle && g_navquery && now - b.water_at > 5000 && now >= b.detour_until) {
+    b.water_at = now;
+    float ground = TerrainHeight(x, z);
+    dtQueryFilter filter;
+    const float ext[3] = {2, 3, 2};
+    float at[3] = {x, y, z}, onmesh[3];
+    dtPolyRef ref = 0;
+    // (Off every polygon: on a roof or a crate it is on a piece of its own.)
+    dtPolyRef any = 0;
+    float near_pt[3];
+    g_navquery->findNearestPoly(at, ext, &filter, &any, near_pt);
+    if (std::isfinite(ground) && ground < y - 1.0f && !any) {
+      bool found = false;
+      for (float r = 10.0f; r <= 200.0f && !found; r += 10.0f) {
+        for (int k = 0; k < 24 && !found; ++k) {
+          float a = k * 6.2831853f / 24.0f, cx = x + r * std::sin(a), cz = z + r * std::cos(a);
+          float h = TerrainHeight(cx, cz);
+          if (!std::isfinite(h) || h < y - 0.5f) continue;
+          float c[3] = {cx, h, cz}, cext[3] = {3, 6, 3}, p[3];
+          if (!NearestMain(c, cext, filter, &ref, p)) continue;
+          memcpy(b.detour, p, sizeof(p));
+          b.detour_until = now + int64_t(r * 1200.0f), b.planned = 0, found = true;
+          RT_INFO("bot %d: in the water at %.1f %.1f: out by %.1f %.1f (%.0f m)", b.index, x, z, p[0], p[2], r);
+        }
+      }
+    }
   }
   if (now < b.unstick_until && !b.enemy) forward = 0.3f, strafe = float(b.side);
 
@@ -2718,7 +3281,8 @@ static void BotBrain(Bot& b, uint32_t in) {
   }
   // Crouching (bit 16, a toggle: heights of 1.38 fell to 1.00, BF_BOT_POSE_TEST)
   // while fighting an enemy over 8 m off; standing again to move on.
-  bool want_crouch = b.enemy && b.edist > 8.0f;
+  // (Not beyond 30 m, where it closes in, nor while strafing.)
+  bool want_crouch = b.enemy && b.edist > 8.0f && b.edist <= 30.0f && b.strafe == 0 && now >= b.cover_until;
   bool toggle = want_crouch != b.crouched && now - b.pose_at > 800;
   if (toggle) b.crouched = want_crouch, b.pose_at = now;
   if (now - b.pose_at < 200) extra_bits |= 1u << 16;
@@ -2729,6 +3293,7 @@ static void BotBrain(Bot& b, uint32_t in) {
   bool sprint = forward > 0.9f && !b.enemy && best > 20.0f && now >= b.unstick_until && !sprint_test;
   if (vehicle_press) extra_bits |= (1u << 14) | (1u << 17);
   St32(in + 0x84, (jump ? 0x2000u : 0u) | (reload ? 0x200000u : 0u) | (sprint ? 0x800000u : 0u) | extra_bits);
+  if (!b.in_vehicle) St32(in + 0x80, Ld32(in + 0x80) & ~0x900u);  // the seated bits (below), not on foot
   St32(in + 0x44, jump ? 0x00003C00u : 0u);
   St32(in + 0x54, reload ? 0x00003C00u : 0u);
   // A grenade every 15 s at an enemy 12 to 35 m off. A fake player's throw
@@ -2742,7 +3307,18 @@ static void BotBrain(Bot& b, uint32_t in) {
     RT_INFO("bot %d: grenade at %08X, %.1f m", b.index, b.enemy, b.edist);
   }
   if (b.enemy) {
-    forward = 0, strafe = 0;
+    // Moving while fighting (bf1943's): a strafe left, right or none, changed
+    // every 0.6 to 1.8 s; closing in on an enemy over 30 m off.
+    if (now >= b.strafe_until) b.strafe = rand() % 3 - 1, b.strafe_until = now + 600 + rand() % 1200;
+    forward = b.edist > 30.0f && !b.crouched ? 1.0f : 0.0f;
+    strafe = b.crouched ? 0.0f : float(b.strafe);
+    // To the cover the advisor picked, facing the enemy: the way there split
+    // along its forward row (+320/+328) and minus its right row (+300/+308).
+    if (now < b.cover_until && !b.crouched) {
+      float dx = px - x, dz = pz - z, l = std::max(std::hypot(dx, dz), 0.01f);
+      forward = (dx * LdF(so + 0x320) + dz * LdF(so + 0x328)) / l;
+      strafe = -(dx * LdF(so + 0x300) + dz * LdF(so + 0x308)) / l;
+    }
     // The shot's direction: the record's aim (+90 yaw: atan2(dx, dz) + pi, as
     // the aim object's +134 negated; +94 pitch, up +), eye to chest.
     // BF_BOT_YAW_FLIP=1 (testing): the old half-turn (bullets went behind?).
@@ -2761,7 +3337,7 @@ static void BotBrain(Bot& b, uint32_t in) {
       float ox = LdF(o + 0x200) - x, oz = LdF(o + 0x208) - z, t = (ox * lx + oz * lz) / ll;
       if (t > 0 && t < 1 && std::hypot(ox - t * lx, oz - t * lz) < 1.0f) clear = false;
     }
-    if (now - b.engaged_at > 400 && clear) {
+    if (now - b.engaged_at > 400 && clear && enemy_visible) {
       set(0x28, 1.0f), St32(in + 0x3C, 0x3C000000u | (Ld32(in + 0x3C) & 0xFFFFu));
       b.fired = true;
       // Its own bullets hit (12 a hit through 822D1AA0, credited to it) now that
@@ -2980,6 +3556,11 @@ static void BotBrain(Bot& b, uint32_t in) {
       }
       while (b.vstep < b.vroute.size() && std::hypot(b.vroute[b.vstep][0] - x, b.vroute[b.vstep][2] - z) < 8.0f) ++b.vstep;
       if (b.vstep < b.vroute.size()) px = b.vroute[b.vstep][0], pz = b.vroute[b.vstep][2];
+      // The advisor's way round (or a learned one) first.
+      if (now < b.vdetour_until) {
+        if (std::hypot(b.vdetour[0] - x, b.vdetour[2] - z) < 6.0f) b.vdetour_until = 0, b.vplanned = 0;
+        else px = b.vdetour[0], pz = b.vdetour[2];
+      }
       float d = std::atan2(px - x, pz - z) - b.vehicle_heading;
       while (d > 3.14159265f) d -= 6.2831853f;
       while (d < -3.14159265f) d += 6.2831853f;
@@ -2996,6 +3577,13 @@ static void BotBrain(Bot& b, uint32_t in) {
         if (b.reverses < 3) {
           ++b.reverses, b.reverse_until = now + 1500, b.vehicle_moved_at = now + 1500;
           RT_INFO("bot %d: stuck in the %s: backing up (%d)", b.index, kind.c_str(), b.reverses);
+          // Stuck twice: the advisor asked for a way round (it backs up a
+          // third time meanwhile; an answer gives it three more tries).
+          if (b.reverses == (g_training ? 1 : 2))
+            AskAdvisor(b, 3, "It drives a " + kind + " (a vehicle: it only goes where the map is not dark grey) and keeps "
+                       "getting stuck here on its way to its objective (the yellow square, if shown). Pick the place to "
+                       "drive to that gets the vehicle around what blocks the way.", x, y, z, std::atan2(tx - x, tz - z),
+                       goal, soldiers);
         }
       }
       if (b.enemy && IsTank(kind)) throttle = 0, steer = 0, fire = true;
@@ -3041,7 +3629,11 @@ static void BotBrain(Bot& b, uint32_t in) {
     // found bits 40 and 43 too, +80 bits 8 and 11): without them the steering
     // read nothing.
     St32(in + 0x84, 0x163u);
-    St32(in + 0x80, Ld32(in + 0x80) | 0x900u);
+    // Seated, bf1943's bot players found a real player's record with bit 43
+    // and not 40 (40 makes the aim heading count, over the steering).
+    // BF_BOT_SEAT_BIT40=1: both, as before.
+    static const bool bit40 = getenv("BF_BOT_SEAT_BIT40") != nullptr;
+    St32(in + 0x80, (Ld32(in + 0x80) & ~(bit40 ? 0u : 0x100u)) | (bit40 ? 0x900u : 0x800u));
     if (fire) {
       float yaw = std::atan2(b.ex - x, b.ez - z);
       set(0x90, yaw);
@@ -3080,6 +3672,8 @@ static void BotBrain(Bot& b, uint32_t in) {
   b.face = want, b.facing = !b.in_vehicle;
   // Looking up or down: at the enemy's chest from the eye, else level.
   b.want_pitch = b.enemy ? std::atan2(b.ey + 1.2f - (y + 1.6f), std::max(b.edist, 0.5f)) : 0.0f;
+  static const bool terrain_check = getenv("BF_TERRAIN_CHECK") != nullptr;
+  if (terrain_check && now - b.logged > 3000) RT_INFO("bot %d terrain check: y %.2f, ground %.2f", b.index, y, TerrainHeight(x, z));
   if (now - b.logged > 3000) {
     b.logged = now;
     RT_INFO("bot %d (team %u): at %.1f %.1f %.1f, health %.0f; %s %.1f m%s", b.index, b.team, x, y, z, LdF(so + 0x3C),
@@ -3339,6 +3933,13 @@ static uint32_t BotKit(Bot& b, uint32_t host_kit) {
   std::string side;
   for (uint32_t so : Scan(0x820118D0))
     if (Ld32(so + 0x48) == b.team && Ptr(Ld32(so + 0x14)) && !(side = KitSide(Ld32(so + 0x14))).empty()) break;
+  if (side.empty() && !host_kit) {
+    // No host (a dedicated server): team 1 the US, team 2 the level's other side.
+    std::string other;
+    for (auto& k : g_kits)
+      if (k.side != "US") other = k.side;
+    side = b.team == 1 ? "US" : other;
+  }
   if (side.empty()) {
     std::string host_side = KitSide(host_kit);
     uint32_t host_team = 0;
@@ -3409,15 +4010,17 @@ PPC_FUNC(sub_823D1DD0) {
   int64_t now = int64_t(GetTickCount64());
   if (now - last_check < 1000) return;
   last_check = now;
+  // The host's soldier in the level (a dedicated server has none: the level
+  // loaded is enough).
   if (!host_seen_ms) {
-    if (!Scan(0x820118D0).empty()) host_seen_ms = now;
+    if (!QuickScan(0x820118D0).empty() || (g_dedicated && !g_in_menus)) host_seen_ms = now;
     return;
   }
   if (now - host_seen_ms < 5000) return;
   uint32_t kit = 0, kit2 = 0;
-  for (uint32_t o : Scan(0x82019490))
-    if (!BotWithSpawner(o) && Ld32(o + 0x1D4)) kit = Ld32(o + 0x1D4), kit2 = Ld32(o + 0x1D8);
-  if (!kit) return;
+  for (uint32_t o : QuickScan(0x82019490))
+    if (Ld32(o) == 0x82019490 && !BotWithSpawner(o) && Ld32(o + 0x1D4)) kit = Ld32(o + 0x1D4), kit2 = Ld32(o + 0x1D8);
+  if (!kit && !g_dedicated) return;  // (a dedicated server's bots take kits of their own)
   // BF_BC_KITS=1 (testing): the kits (SoldierEntityData, vtable 8206E890) once:
   // each one's words that point at a SoldierWeaponData (82074ACC) or at an
   // array of them, its text, and the host's choice.
@@ -3483,16 +4086,20 @@ PPC_FUNC(sub_823D1DD0) {
     if (b.died_at && now - b.died_at < 8000) continue;
     St32(b.spawner + 0x30, b.team);
     uint32_t bot_kit = BotKit(b, kit), bot_weapon = bot_kit == kit ? kit2 : 0;
+    if (!bot_kit) continue;  // (no kit found yet)
     St32(b.spawner + 0x1D4, bot_kit), St32(b.spawner + 0x1D8, bot_weapon);
-    std::vector<uint32_t> before = Scan(0x820118D0);
+
     PPCContext c = ctx;
     c.r3.u64 = b.spawner;
     c.r4.u64 = 0;
     c.r5.u64 = 0x800;
     c.r6.u64 = 0x20;
     __imp__sub_82332350(c, base);
-    for (uint32_t o : Scan(0x820118D0))
-      if (std::find(before.begin(), before.end(), o) == before.end()) b.soldier = o;
+    // The new one: the spawn object's soldier (+104), a live one on its team.
+    uint32_t made = Ld32(b.spawner + 0x104);
+    if (Ptr(made) && IsCommitted(made + 0x400) && Ld32(made) == 0x820118D0 && Ld32(made + 0x48) == b.team &&
+        LdF(made + 0x3C) > 0 && !BotWithSoldier(made))
+      b.soldier = made;
     b.died_at = b.soldier ? 0 : now - 6000;  // refused (the game's respawn wait): again in 2 s
     if (b.soldier) g_bot_soldier_for_trails = b.soldier;
     RT_INFO("bot %d: deployed on team %u: soldier %08X (team %u) at %.1f %.1f", b.index, b.team, b.soldier,
@@ -3549,7 +4156,8 @@ PPC_FUNC(sub_82364C78) {
   // peer manager (the player manager + 8) with the player's index (7 + i), 1
   // and its connection object (vtable 8201B140), linked at the connection's
   // +14 and +28.
-  static const int fake_count = getenv("BF_BOT_FAKE") ? std::clamp(atoi(getenv("BF_BOT_FAKE")), 1, 16) : 0;
+  static const int fake_count = getenv("BF_BOT_FAKE") ? std::clamp(atoi(getenv("BF_BOT_FAKE")), 1, 16)
+                                                        : std::clamp(g_bot_count, 0, 16);  // (--bots, --train)
   static bool done = false;
   if (fake_count && !done) {
     done = true;
@@ -3971,16 +4579,29 @@ PPC_FUNC(sub_82303C20) {
 // connection: out of its list at +520, then the peer's disconnect 826FF630).
 // A bot's connection has no traffic, so the network layer drops it after a
 // few minutes, and the disconnect reads what only a real client's peer has
-// (a fault at 00000096 in 82700480): a bot's is kept instead.
+// (a fault at 00000096 in 82700480): a bot's is kept instead. Training
+// (--train), nobody's is: only the bots and the server's own client are on
+// it (at --speed the own client's timed out 130 game seconds in). A kept one
+// has its drop mark (+2300) cleared: 82364B78 drops every marked connection
+// and starts over until none is marked (spinning for ever on one kept).
 extern "C" PPC_FUNC(__imp__sub_8235FD80);
 PPC_FUNC(sub_8235FD80) {
+  auto keep = [&] {
+    if (Ptr(ctx.r4.u32) && IsCommitted(ctx.r4.u32 + 2300)) St8(ctx.r4.u32 + 2300, 0);
+  };
   for (const Bot& b : g_bots)
     if (b.conn && (ctx.r4.u32 == b.conn || ctx.r4.u32 == b.conn + 4 || ctx.r4.u32 == Ld32(b.conn + 0x14))) {
       static int said = 0;
       if (said++ < 8) RT_INFO("bot %d: its connection %08X kept (the network would drop it)", b.index, ctx.r4.u32);
+      keep();
       return;
     }
   static int seen = 0;
+  if (g_training) {
+    if (seen++ < 8) RT_INFO("net: player connection %08X kept (training)", ctx.r4.u32);
+    keep();
+    return;
+  }
   if (seen++ < 8) RT_INFO("net: player connection %08X (vt %08X) dropped", ctx.r4.u32, Ptr(ctx.r4.u32) ? Ld32(ctx.r4.u32) : 0);
   __imp__sub_8235FD80(ctx, base);
 }

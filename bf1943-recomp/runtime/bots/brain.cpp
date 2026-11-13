@@ -119,6 +119,16 @@ struct Bot {
   float drive_from = -1;  // distance to the flag when it started driving
   bool released_once = false;  // this ride's landing craft is already in the water
   double off_since = 0;        // driving, but not seated since then
+  // The advisor (World::ask): the place it picked and until when; asked about
+  // what (1 stuck, 2 cover: walked to while fighting); its health a moment ago.
+  Vec advice;
+  double advice_until = 0, health_t = 0;
+  int asked = 0;
+  bool advice_cover = false;
+  float health_was = 100;
+  Vec idle_pos;  // where it has stood since idle_t (within 5 m)
+  double idle_t = 0;
+  uint32_t fight_asked = 0;  // the enemy it last asked where to fight from (training)
 };
 constexpr uint32_t kTag = 0xB7A10000u + sizeof(Bot);
 static_assert(sizeof(Bot) <= kMemSize, "Bot state too big for BotIO::mem");
@@ -821,6 +831,14 @@ struct Brain {
     if (!b.alive) b.last_pos = me->pos, b.last_moved = w.now, b.spawned_at = me->pos;
     b.alive = true;
     b.team = me->team;
+    // The advisor's answer: a way round what blocks it, or cover.
+    if (Vec p; w.answer && w.answer(io.slot, &p) && Dist2D(p, me->pos) < 40) {
+      b.advice = p, b.advice_cover = b.asked == 2 || b.asked == 5;
+      b.advice_until = w.now + 4 + 0.7 * Dist2D(p, me->pos);
+      if (!b.advice_cover) b.detour_until = 0;
+      Log("bots: bot%d: the advisor's place %.0f,%.0f (%s)", io.slot + 1, p.x, p.z, b.advice_cover ? "cover" : "a way round");
+    }
+    if (w.now < b.advice_until && Dist2D(b.advice, me->pos) < 1.5f) b.advice_until = 0;
     if (sc.kind != Scenario::kNone) Judge(io, b, *me);
     if (sc.near && b.hold_until && w.now < b.hold_until + 0.5) {  // holding still for the teleport
       snprintf(io.state, sizeof(io.state), "teleport");
@@ -857,6 +875,37 @@ struct Brain {
       }
     }
     float w_engage = enemy && enemy_d < 70 && (sc.kind == Scenario::kNone || sc.kind == Scenario::kFight) ? 100 - enemy_d : 0;
+    // Losing a fight (under 45 health), or shot by someone it can't see (25
+    // or more lost in 3 s): the advisor picks cover.
+    if (w.now - b.health_t > 3) b.health_was = me->health, b.health_t = w.now;
+    if (w.ask && w.now >= b.advice_until && !me->vehicle && me->health > 0) {
+      char what[160] = {};
+      if (w_engage > 0 && me->health < (w.training ? 70 : 45))
+        snprintf(what, sizeof(what), "It is losing a fight (health %.0f of 100) against the enemy %.0f m away. "
+                 "Pick a place out of the enemies' sight.", me->health, enemy_d);
+      else if (!enemy && b.health_was - me->health >= (w.training ? 15 : 25))
+        snprintf(what, sizeof(what), "It is being shot (health %.0f of 100) and cannot see who shoots. "
+                 "Pick a place with cover.", me->health);
+      if (what[0] && w.ask(io.slot, 2, what)) b.asked = 2;
+    }
+    // Training: a medium question too, where to fight a new enemy from.
+    if (w.ask && w.training && enemy && enemy->obj != b.fight_asked && enemy_d > 20 && !me->vehicle &&
+        w.now >= b.advice_until) {
+      b.fight_asked = enemy->obj;
+      char what[160];
+      snprintf(what, sizeof(what), "An enemy has come into sight %.0f m away. Pick a place to fight it from (cover "
+               "with a view of it), or 0 to fight from where it stands.", enemy_d);
+      if (w.ask(io.slot, 5, what)) b.asked = 5;
+    }
+    // Standing about (30 s within 5 m, no enemy, on foot): the advisor picks
+    // where to go.
+    if (Dist2D(me->pos, b.idle_pos) > 5 || enemy || me->vehicle || !b.idle_t) b.idle_pos = me->pos, b.idle_t = w.now;
+    else if (w.now - b.idle_t > (w.training ? 10 : 30) && w.ask) {
+      b.idle_t = w.now;
+      if (w.ask(io.slot, 4, "It has stood about here for 30 s with no enemy in sight. Pick the place it should go to: "
+                            "on towards its flag, or a better spot to hold it from."))
+        b.asked = 4;
+    }
     if (b.target_point < 0 || b.target_point >= w.point_count ||
         (sc.point < 0 && w.points[b.target_point].owner == me->team && Rand(0, 1) < 0.01f)) {
       if (sc.point >= 0) b.target_point = std::min(sc.point, w.point_count - 1);
@@ -926,6 +975,12 @@ struct Brain {
       b.back_until = w.now + 0.7;
       b.detour_until = w.now + 0.7 + std::min(3.0 + 1.0 * b.stuck_level, 8.0);
       b.detour_angle = b.detour_side * std::min(1.2f + 0.2f * b.stuck_level, 1.9f);
+      // Stuck three times or more: the advisor asked for a better way round
+      // (its answer, when it comes, takes over from the detour).
+      if (w.ask && b.stuck_level >= (w.training ? 1 : 3) && !me->vehicle &&
+          w.ask(io.slot, 1, "It keeps getting stuck here on its way to its flag. "
+                         "Pick the place that gets it around what blocks the way."))
+        b.asked = 1;
       // At the water's edge: along the shore, longer (a way up is somewhere).
       if (me->pos.y < g_shore.sea + 4.0f) {
         b.detour_angle = b.detour_side * 1.57f;
@@ -943,7 +998,14 @@ struct Brain {
       if (w.now > b.next_strafe) b.strafe = Rand(-1, 1), b.next_strafe = w.now + Rand(0.6f, 1.8f);
       cmd.lx = b.strafe;
       cmd.ly = enemy_d > 30 ? 0.6f : 0.0f;
+      if (w.now < b.advice_until && b.advice_cover) Walk(cmd, *me, b.advice, 1.0f);  // (to cover, firing)
       snprintf(io.state, sizeof(io.state), "engage");
+    } else if (w.now < b.advice_until) {
+      // To the advisor's place.
+      Steer(cmd, *me, std::atan2(b.advice.x - me->pos.x, b.advice.z - me->pos.z), 0.0f);
+      Walk(cmd, *me, b.advice, 1.0f);
+      if (!b.advice_cover && std::fmod(w.now, 1.0) < 0.15) cmd.buttons |= kA;  // hop over small things
+      snprintf(io.state, sizeof(io.state), b.advice_cover ? "to cover" : "advised");
     } else if (bool wet = b.target_point >= 0 && me->pos.y < g_shore.sea + 1.5f && w.ground &&
                           me->pos.y - w.ground(me->pos.x, me->pos.z) < 4.0f;  // (near a shore: not a carrier's deck)
                wet && (w.now - b.land_exit_t < 8.0 ||

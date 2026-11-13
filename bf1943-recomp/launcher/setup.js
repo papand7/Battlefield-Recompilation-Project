@@ -345,11 +345,32 @@ async function setup(launcherDir, game, gamePath, send) {
     const built = path.join(p.tree, 'build', 'game');
     fs.mkdirSync(p.gameDir, { recursive: true });
     fs.copyFileSync(path.join(built, p.game.exe), path.join(p.gameDir, p.game.exe));
-    for (const f of ['pbr_shaders.txt']) {
+    // The launcher version it was built for (main.js: an older one asks for UPDATE).
+    if (module.exports.version) fs.writeFileSync(path.join(p.gameDir, '.built-version'), module.exports.version);
+    // FSR 3 (AMD's signed DLLs, loaded at run time) and DLSS (NVIDIA's).
+    for (const f of ['pbr_shaders.txt', 'amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll',
+                     'nvngx_dlss.dll']) {
       if (fs.existsSync(path.join(built, f))) fs.copyFileSync(path.join(built, f), path.join(p.gameDir, f));
     }
     if (fs.existsSync(path.join(built, 'fonts'))) fs.cpSync(path.join(built, 'fonts'), path.join(p.gameDir, 'fonts'), { recursive: true });
   });
 }
 
-module.exports = { paths, findGameFiles, status, setup, findTools, kToolNames, kGames };
+// Bad Company's main menu with the PC SETTINGS row (tools/bc_menu_patch.py,
+// on the player's own game files): written once into <userDir>/override.
+// Resolves to an error message, or null when it is there or was made.
+function patchMenu(launcherDir, gameData, userDir) {
+  const out = path.join(userDir, 'override', 'dist', 'xenon', 'menu', 'main', 'mainmenu-00.fbrb');
+  if (fs.existsSync(out)) return Promise.resolve(null);
+  const p = paths(launcherDir, 'bfbc1');
+  const script = p && path.join(p.tree, 'tools', 'bc_menu_patch.py');
+  const python = findTools().python;
+  if (!script || !fs.existsSync(script) || !python) return Promise.resolve('The PC SETTINGS menu patch needs Python and bc_menu_patch.py.');
+  return new Promise((resolve) => {
+    const r = spawn(python, ['-I', script, '--game', gameData, '--user', userDir], { windowsHide: true, stdio: 'ignore' });
+    r.once('error', (e) => resolve(e.message));
+    r.once('exit', (code) => resolve(code === 0 ? null : `bc_menu_patch.py failed (${code}).`));
+  });
+}
+
+module.exports = { paths, findGameFiles, status, setup, patchMenu, findTools, kToolNames, kGames };

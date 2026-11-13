@@ -550,6 +550,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void ProcessInstructionEnd(uint32_t address) override;
   void StorePbrTaps(uint32_t address);
   void EmitPbrLighting();
+  // The game's tone mapping pass (pbr::ShaderConfig::tonemap): a filmic curve.
+  void EmitTonemap();
+  // A particle shader (pbr::ShaderConfig::soft): its colour output faded
+  // where the particle is close to the scene behind it.
+  void EmitSoftParticle();
+  // The game's tone mapping pass (FSR 3): its output into the buffer.
+  void EmitFsrCapture();
   spv::Id LoadExtraRegister(uint32_t index);
   spv::Id PbrScalar(const pbr::Scalar& s);
   spv::Id PbrRoughness();
@@ -561,6 +568,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id pbr_pom_var_ = spv::NoResult;
   bool pbr_pom_internal_ = false;
   const pbr::ShaderConfig* pbr_ = nullptr;
+  bool pbr_tonemap_only_ = false;  // pbr_ is the tone mapping pass, not a lit shader
   spv::Id pbr_tap_vars_[8] = {};
   bool pbr_started_ = false;
   bool pbr_env_blurred_ = false;
