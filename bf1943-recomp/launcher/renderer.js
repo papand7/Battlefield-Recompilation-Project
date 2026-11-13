@@ -58,7 +58,9 @@ function selectGame(key) {
   $('bloodrow').hidden = key === 'bfbc1';  // BF1943 only
   $('textures').checked = settings.textures && g.hasTextures;
   $('textures').disabled = !g.hasTextures;
-  $('texhint').textContent = g.hasTextures ? 'AI-upscaled texture pack' : 'Texture pack not found';
+  if (!texBusy) $('texhint').textContent = g.hasTextures ? 'AI-upscaled texture pack' : 'Texture pack not found';
+  $('texmake').hidden = key !== 'bf1943';  // (Bad Company's pack isn't made here yet)
+  $('texmake').textContent = texBusy ? 'STOP' : g.hasTextures ? 'REMAKE' : 'MAKE';
   document.title = g.title;
   setStatus(g.error || '', !!g.error);
   $('play').disabled = !!g.error;
@@ -198,6 +200,33 @@ $('play').onclick = async () => {
 };
 
 window.launcher.onGameExited(() => { setStatus(''); $('play').disabled = false; });
+
+// The HD texture pack, made here (texpack.py make, through the main process).
+let texBusy = false;
+const texSteps = { fetch: 'Getting the upscaler', extract: 'Reading the game\'s textures', build: 'Upscaling',
+  install: 'Installing the pack' };
+$('texmake').onclick = async () => {
+  if (texBusy) { await window.launcher.texturesCancel(); return; }
+  const r = await window.launcher.texturesMake();
+  if (r.error) { $('texhint').textContent = r.error; return; }
+  texBusy = true;
+  $('texmake').textContent = 'STOP';
+  $('texhint').textContent = 'Starting…';
+};
+window.launcher.onTexturesEvent(async (ev) => {
+  if (ev.step) {
+    const pct = ev.total ? ` ${Math.floor((100 * ev.done) / ev.total)}%` : '';
+    $('texhint').textContent = `${texSteps[ev.step] || ev.step}${pct}`;
+  } else if (ev.finished) {
+    texBusy = false;
+    const s = await window.launcher.state();
+    games = s.games;
+    selectGame(settings.game);
+    $('texhint').textContent = ev.code === 0 ? 'Texture pack made' : 'Texture pack stopped: MAKE carries on';
+  } else if (ev.line && /^(Could not|Real-ESRGAN|Python|texpack)/.test(ev.line)) {
+    $('texhint').textContent = ev.line;
+  }
+});
 // Back to the launcher: game files may have been put next to it meanwhile.
 window.addEventListener('focus', () => {
   if (!$('setupcard').hidden && setupGame) showSetup(setupGame, true);

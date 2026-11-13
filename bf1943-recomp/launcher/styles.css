@@ -252,6 +252,8 @@ h2 {
   justify-content: space-between;
   padding: 6px 0;
 }
+/* (the HD textures row's MAKE / STOP, beside its switch) */
+.toggle-row .ghost { margin-left: auto; margin-right: 12px; padding: 4px 10px; font-size: 12px; flex: none; }
 
 /* Toggle switch */
 .switch { position: relative; width: 40px; height: 22px; flex: none; cursor: pointer; }

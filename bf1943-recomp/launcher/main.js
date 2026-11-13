@@ -2,6 +2,7 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const setup = require('./setup');
 const { spawn } = require('child_process');
+const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
@@ -67,7 +68,8 @@ const scanGames = () => ({
     title: 'Battlefield 1943',
     exe: find('bf1943.exe', 'build/game/bf1943.exe', 'game/bf1943.exe'),
     data: findDir('original/v106/default.xex'),
-    textures: findDir('texpack_work/install/replacements.txt', 'texpack/replacements.txt'),
+    textures: findDir('texpack/install/replacements.txt', 'texpack_work/install/replacements.txt',
+      'texpack/replacements.txt'),
     dataHint: 'original\v106',
   },
   bfbc1: {
@@ -82,6 +84,33 @@ let games = scanGames();
 // setup.js finds the build trees next to this folder (<root>/src, <root>/src-bfbc1).
 const launcherDir = installRoot ? path.join(installRoot, 'Launcher')
   : app.isPackaged ? path.dirname(process.execPath) : __dirname;
+// The HD texture pack, made on this PC from the player's own game files
+// (tools/texpack/texpack.py make: Real-ESRGAN, fetched for this system, and
+// the PBR maps; a stopped run carries on). Battlefield 1943's only.
+const texWork = installRoot ? path.join(installRoot, 'texpack') : path.resolve(__dirname, '..', '..', 'texpack_work');
+const texScript = installRoot ? path.join(installRoot, 'src', 'tools', 'texpack', 'texpack.py')
+  : path.resolve(__dirname, '..', 'tools', 'texpack', 'texpack.py');
+let texJob = null;
+ipcMain.handle('textures-make', () => {
+  if (texJob) return { error: 'The texture pack is being made already.' };
+  const g = games.bf1943;
+  if (!g.data) return { error: 'Set up Battlefield 1943 first: the pack is made from its game files.' };
+  const python = process.platform === 'win32' ? setup.findTools().python : 'python3';
+  if (!python) return { error: 'Python is needed: set up the game first (it installs Python).' };
+  if (!fs.existsSync(texScript)) return { error: 'texpack.py not found.' };
+  texJob = spawn(python, [texScript, 'make', '--game', g.data, '--work', texWork], { windowsHide: true });
+  const send = (ev) => { if (win) win.webContents.send('textures-event', ev); };
+  for (const stream of [texJob.stdout, texJob.stderr])
+    readline.createInterface({ input: stream }).on('line', (line) => {
+      const m = /^progress (\w+) (\d+) (\d+)/.exec(line);
+      send(m ? { step: m[1], done: +m[2], total: +m[3] } : { line });
+    });
+  texJob.on('exit', (code) => { texJob = null; send({ finished: true, code }); });
+  texJob.on('error', (e) => { texJob = null; send({ finished: true, code: -1, line: e.message }); });
+  return { ok: true };
+});
+ipcMain.handle('textures-cancel', () => { if (texJob) texJob.kill(); });
+
 function problem(g) {
   return !g.exe ? `${g.title}: exe not found next to the launcher.`
        : !g.data ? `${g.title}: game files (${g.dataHint}) not found.` : null;
