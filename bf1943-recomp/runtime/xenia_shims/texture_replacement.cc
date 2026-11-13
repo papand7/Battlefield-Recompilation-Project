@@ -20,9 +20,13 @@
 #include <tuple>
 #include <unordered_map>
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 namespace xe::gpu::texrep {
 namespace {
@@ -78,8 +82,12 @@ void Keep(const Replacement* r, std::shared_ptr<const Pixels> p) {
 }
 
 void PrefetchThread(std::vector<const Replacement*> entries) {
+#ifdef _WIN32
   SetThreadDescription(GetCurrentThread(), L"texture prefetch");
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#else
+  pthread_setname_np(pthread_self(), "tex prefetch");
+#endif
   size_t n = 0;
   for (const Replacement* r : entries) {
     {
@@ -117,7 +125,11 @@ size_t SetDirectory(const std::filesystem::path& dir) {
     k.hash = std::stoull(hash, nullptr, 16);
     Replacement r{};
     r.file = dir / file;
+#ifdef _WIN32
     FILE* f = _wfopen(r.file.c_str(), L"rb");
+#else
+    FILE* f = fopen(r.file.c_str(), "rb");
+#endif
     uint32_t hdr[4] = {};
     if (!f) continue;
     bool ok = fread(hdr, 4, 4, f) == 4 && !memcmp(hdr, "RTX1", 4);

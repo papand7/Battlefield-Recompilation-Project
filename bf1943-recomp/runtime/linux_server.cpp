@@ -2,7 +2,7 @@
 // (the toy GPU path only counts command packets), no audio device, no PC menus
 // or key icons.
 // Built only on Linux; empty on Windows.
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(BF1943_CLIENT)  // (the Linux game: linux_client.cpp)
 
 #include <filesystem>
 #include <string>
@@ -82,4 +82,4 @@ bool ControlsPad() { return false; }
 uint16_t PuppetButtons() { return 0; }
 }  // namespace rt::pcset
 
-#endif  // !_WIN32
+#endif  // !_WIN32 && !BF1943_CLIENT

@@ -42,8 +42,8 @@ target_include_directories(bf1943_xexload PUBLIC ${XU} ${XT}/simde
 # The runtime minus what needs Windows (window, Vulkan presenter, XAudio2,
 # GDI menus).
 file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS ${ROOT}/runtime/*.cpp)
-list(REMOVE_ITEM RUNTIME_SOURCES
-  ${ROOT}/runtime/pc_settings.cpp ${ROOT}/runtime/pc_menu.cpp ${ROOT}/runtime/pc_ui.cpp)
+list(REMOVE_ITEM RUNTIME_SOURCES  # (Windows GDI / GDI+: linux_client.cpp has their stand-ins)
+  ${ROOT}/runtime/pc_settings.cpp ${ROOT}/runtime/pc_menu.cpp ${ROOT}/runtime/pc_ui.cpp ${ROOT}/runtime/fps_overlay.cpp)
 set(STUBS ${CMAKE_CURRENT_BINARY_DIR}/import_stubs.cpp)
 add_custom_command(OUTPUT ${STUBS}
   COMMAND Python3::Interpreter ${ROOT}/tools/gen_import_stubs.py
@@ -78,3 +78,49 @@ target_include_directories(bf1943_server PRIVATE ${ROOT}/runtime ${ROOT}/runtime
 target_compile_options(bf1943_server PRIVATE -march=x86-64-v3 -fno-strict-aliasing)
 target_link_libraries(bf1943_server PRIVATE bf1943_ppc bf1943_xexload xenia_apu Threads::Threads ${CMAKE_DL_LIBS})
 target_link_options(bf1943_server PRIVATE -rdynamic)  # symbol names in crash stacks
+
+# ---- The game (BF1943_CLIENT=ON): bf1943 with Xenia's Vulkan GPU and an SDL3
+# window, sound and input (runtime/xenia_shims/window_sdl.cc,
+# runtime/linux_client.cpp). Needs the X11 and Vulkan headers (Debian/Ubuntu:
+# libx11-dev libx11-xcb-dev libvulkan-dev) and the shaders made by
+# tools/build_xenia_shaders.py (build/xenia_shaders).
+#   cmake -S game/linux -B build/linux-client -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBF1943_CLIENT=ON
+#   cmake --build build/linux-client --target bf1943
+option(BF1943_CLIENT "Build the game (bf1943) too" OFF)
+if(BF1943_CLIENT)
+  include(FetchContent)
+  set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+  set(SDL_STATIC ON CACHE BOOL "" FORCE)
+  set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(sdl3 URL https://github.com/libsdl-org/SDL/releases/download/release-3.2.20/SDL3-3.2.20.tar.gz
+                       URL_HASH SHA256=467600ae090dd28616fa37369faf4e3143198ff1da37729b552137e47f751a67)
+  FetchContent_MakeAvailable(sdl3)
+  find_package(X11 REQUIRED)
+
+  file(GLOB XENIA_GPU_SOURCES CONFIGURE_DEPENDS
+    ${XE}/src/xenia/base/*.cc ${XE}/src/xenia/gpu/*.cc ${XE}/src/xenia/gpu/vulkan/*.cc
+    ${XE}/src/xenia/ui/*.cc ${XE}/src/xenia/ui/vulkan/*.cc ${XE}/src/xenia/apu/*.cc
+    ${XE}/third_party/glslang/SPIRV/*.cpp ${ROOT}/runtime/xenia_shims/*.cc)
+  # Windows' halves, and FSR 3 / DLSS (Windows libraries: linux_upscalers.cc).
+  list(FILTER XENIA_GPU_SOURCES EXCLUDE REGEX
+       "_win\.cc$|system_gnulinux\.cc$|png_utils\.cc$|base/assert\.cc$|bf_fsr3\.cc$|bf_dlss\.cc$")
+  add_library(xenia_gpu STATIC ${XENIA_GPU_SOURCES})
+  target_include_directories(xenia_gpu PUBLIC ${ROOT}/runtime/xenia_shims ${XE}/src ${XE}
+    ${XE}/third_party/fmt/include ${ROOT}/build/xenia_shaders
+    ${ROOT}/thirdparty/VulkanMemoryAllocator/include ${ROOT}/thirdparty/fidelityfx/include
+    ${ROOT}/thirdparty/dlss/include)
+  target_compile_definitions(xenia_gpu PUBLIC FMT_HEADER_ONLY XXH_INLINE_ALL VK_NO_PROTOTYPES BF1943_CLIENT)
+  target_compile_options(xenia_gpu PRIVATE -march=x86-64-v3 -w)
+  target_link_libraries(xenia_gpu PUBLIC bf1943_ffmpeg SDL3::SDL3-static X11::X11 X11::X11_xcb X11::xcb)
+
+  set(CLIENT_SOURCES ${RUNTIME_SOURCES})
+  add_executable(bf1943 ${CLIENT_SOURCES} ${ROOT}/runtime/bots/brain.cpp ${ROOT}/runtime/bots/nav.cpp
+                 ${DETOUR_SOURCES} ${STUBS})
+  target_include_directories(bf1943 PRIVATE ${ROOT}/thirdparty/recastnavigation/Detour/Include
+                             ${ROOT}/runtime ${ROOT}/runtime/xenia_shims)
+  target_compile_definitions(bf1943 PRIVATE BF1943_CLIENT)
+  target_compile_options(bf1943 PRIVATE -march=x86-64-v3 -fno-strict-aliasing)
+  target_link_libraries(bf1943 PRIVATE bf1943_ppc bf1943_xexload xenia_gpu Threads::Threads ${CMAKE_DL_LIBS})
+  target_link_options(bf1943 PRIVATE -rdynamic)
+endif()

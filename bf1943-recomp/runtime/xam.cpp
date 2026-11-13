@@ -169,13 +169,19 @@ bool g_plane_mouse_invert = false;
 double g_test_mouse_at = 0;        // --test-mouse <s>: synthetic look input for tests
 }
 
-#ifdef _WIN32
+// The PC controls: Windows, and the Linux game (BF1943_CLIENT: the same code,
+// the few Windows calls it makes answered through SDL3, linux_input.cpp).
+#if defined(_WIN32) || defined(BF1943_CLIENT)
 namespace {
 HWND OurForegroundWindow() {
+#ifdef _WIN32
   HWND w = GetForegroundWindow();
   DWORD pid = 0;
   GetWindowThreadProcessId(w, &pid);
   return pid == GetCurrentProcessId() ? w : nullptr;
+#else
+  return rt::linput::FocusedWindow();
+#endif
 }
 // Tests: BF_TEST_KEY="<seconds>:<virtual key>[,...]" holds those keys for
 // 0.2 s at those times, whatever window has focus.
@@ -235,6 +241,21 @@ bool Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0 || TestKeyDown(v
 std::mutex g_mouse_mutex;
 long g_mouse_dx = 0, g_mouse_dy = 0, g_mouse_wheel = 0;
 
+#ifndef _WIN32
+// Linux: from the game window's events.
+void MouseThread() {
+  for (;;) {
+    long dx, dy, wheel;
+    rt::linput::TakeMouse(dx, dy, wheel);
+    if (dx || dy || wheel) {
+      std::lock_guard lock(g_mouse_mutex);
+      g_mouse_dx += dx, g_mouse_dy += dy, g_mouse_wheel += wheel;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+void CaptureCursor(HWND, bool capture) { rt::linput::CaptureMouse(capture); }
+#else
 void MouseThread() {
   WNDCLASSW wc{};
   wc.lpfnWndProc = [](HWND h, UINT m, WPARAM w, LPARAM l) -> LRESULT {
@@ -289,6 +310,7 @@ void CaptureCursor(HWND w, bool capture) {
     captured = nullptr;
   }
 }
+#endif  // _WIN32
 
 // Mouse speed -> right-stick units, unclamped: the pad's axis read
 // (sub_821C7FD8, patched in game_patches.cpp) takes these instead of the

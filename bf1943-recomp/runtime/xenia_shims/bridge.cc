@@ -39,7 +39,13 @@ DECLARE_int32(draw_resolution_scale_y);
 #include "xenia/memory.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/window_listener.h"
+#ifdef _WIN32
 #include "xenia/ui/windowed_app_context_win.h"
+#else
+#include <pthread.h>
+
+#include "window_sdl.h"  // (Linux: an SDL3 window, an X11 one for the presenter)
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -59,7 +65,11 @@ class CloseListener : public xe::ui::WindowListener {
   void OnClosing(xe::ui::UIEvent&) override {
     fprintf(stderr, "[xgpu] window closed, exiting\n");
     fflush(nullptr);
+#ifdef _WIN32
     ExitProcess(0);
+#else
+    std::_Exit(0);
+#endif
   }
 };
 
@@ -120,10 +130,16 @@ OverlayDrawer g_overlay;
 int g_present_effect = 2;
 int g_window_width = 1280, g_window_height = 720;
 
-// UI thread: Win32 app context, the game window and its message loop.
+// UI thread: the app context (Win32, or SDL3 on Linux), the game window and
+// its message loop.
 void UiThread() {
+#ifdef _WIN32
   SetThreadDescription(GetCurrentThread(), L"ui");
   xe::ui::Win32WindowedAppContext app_context(GetModuleHandleW(nullptr), SW_SHOWNORMAL);
+#else
+  pthread_setname_np(pthread_self(), "ui");
+  xe::ui::SdlWindowedAppContext app_context;
+#endif
   if (!app_context.Initialize()) {
     fprintf(stderr, "[xgpu] UI context initialisation failed\n");
     return;

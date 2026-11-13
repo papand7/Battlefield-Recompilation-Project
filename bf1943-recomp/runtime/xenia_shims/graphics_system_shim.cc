@@ -4,6 +4,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/gpu/command_processor.h"
 
+#ifdef _WIN32  // (Linux: linux_shim.cc)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -20,6 +21,10 @@ void XHostThread::Create() {
   while (id_ == std::thread::id()) std::this_thread::yield();
 }
 }  // namespace kernel
+}  // namespace xe
+#endif  // _WIN32
+
+namespace xe {
 
 namespace gpu {
 
