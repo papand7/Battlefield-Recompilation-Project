@@ -547,7 +547,10 @@ void StartBotDirector() {
       w.scenario = scenario;
       w.result = result;
       w.log = BrainLog;
-      const std::string nav = (g_user_root / ("bot_nav_" + map + ".txt")).string();
+      // (UTF-8, as the brain opens it: path::string() throws on Windows for a
+      // folder name outside the ANSI code page)
+      const auto nav_u8 = (g_user_root / ("bot_nav_" + map + ".txt")).u8string();
+      const std::string nav(nav_u8.begin(), nav_u8.end());
       w.nav_path = nav.c_str();
       bool have_mesh = nav::Ready(map);  // (loads a new map's once)
       if (have_mesh) {  // its main piece: the one the flags are on

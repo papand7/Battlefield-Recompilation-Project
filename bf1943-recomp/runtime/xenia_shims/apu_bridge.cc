@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 
 #ifdef _WIN32
 #include "xenia/apu/xaudio2/xaudio2_audio_driver.h"
@@ -33,6 +34,9 @@ xe::Memory* g_mem = nullptr;
 constexpr int kMaxClients = 8;
 constexpr int kQueuedFrames = 64;  // Xenia's kMaximumQueuedFrames
 struct Client {
+  // Opening and closing (the guest's render driver calls) against the pump
+  // thread's TakeFrameSlot / SubmitFrame: no frame for an output being closed.
+  std::mutex lock;
   std::unique_ptr<xe::threading::Semaphore> semaphore;
 #ifdef _WIN32
   std::unique_ptr<xe::apu::xaudio2::XAudio2AudioDriver> driver;
@@ -185,6 +189,7 @@ int OpenClient() {
 #endif
   for (int i = 0; i < kMaxClients; ++i) {
     Client& cl = g_clients[i];
+    std::lock_guard l(cl.lock);
     if (cl.driver) continue;
     cl.semaphore = xe::threading::Semaphore::Create(kQueuedFrames, kQueuedFrames);
 #ifdef _WIN32
@@ -216,7 +221,9 @@ int OpenClient() {
   return -1;
 }
 void CloseClient(int index) {
-  if (index < 0 || index >= kMaxClients || !g_clients[index].driver) return;
+  if (index < 0 || index >= kMaxClients) return;
+  std::lock_guard l(g_clients[index].lock);
+  if (!g_clients[index].driver) return;
 #ifdef _WIN32
   g_clients[index].driver->Shutdown();
 #endif
@@ -224,6 +231,8 @@ void CloseClient(int index) {
   g_clients[index].semaphore.reset();
 }
 bool TakeFrameSlot(int index) {
+  if (index < 0 || index >= kMaxClients) return false;
+  std::lock_guard l(g_clients[index].lock);
 #if !defined(_WIN32) && defined(BF1943_CLIENT)
   // Room while under kQueuedFrames' worth... kept to 8 frames (43 ms): the
   // stream's queue is the device's latency.
@@ -236,12 +245,14 @@ bool TakeFrameSlot(int index) {
                     xe::threading::WaitResult::kSuccess;
 }
 void SubmitFrame(int index, uint32_t samples) {
+  if (index < 0 || index >= kMaxClients) return;
+  Client& cl = g_clients[index];
+  std::lock_guard l(cl.lock);
 #ifdef _WIN32
-  if (index >= 0 && index < kMaxClients && g_clients[index].driver)
-    g_clients[index].driver->SubmitFrame(reinterpret_cast<float*>(Ptr(samples)));
+  if (cl.driver) cl.driver->SubmitFrame(reinterpret_cast<float*>(Ptr(samples)));
 #elif defined(BF1943_CLIENT)
-  if (index >= 0 && index < kMaxClients && g_clients[index].driver) {
-    SDL_AudioStream* stream = g_clients[index].driver->s;
+  if (cl.driver) {
+    SDL_AudioStream* stream = cl.driver->s;
     // The guest's frame: 6 channels one after another, 256 big-endian floats
     // each -> interleaved, host order.
     const uint32_t* in = reinterpret_cast<const uint32_t*>(Ptr(samples));

@@ -38,6 +38,22 @@
 namespace rt::nav {
 namespace {
 
+// Paths under the user folder: opened by their wide name on Windows and
+// logged in UTF-8 (path::string() throws for a folder name outside the ANSI
+// code page there).
+FILE* Open(const std::filesystem::path& p, const char* mode) {
+#ifdef _WIN32
+  std::wstring wmode(mode, mode + std::strlen(mode));
+  return _wfopen(p.c_str(), wmode.c_str());
+#else
+  return fopen(p.c_str(), mode);
+#endif
+}
+std::string Utf8(const std::filesystem::path& p) {
+  const auto s = p.u8string();
+  return std::string(s.begin(), s.end());
+}
+
 std::mutex g_mutex;  // Detour's query isn't thread safe; routes come from the director's thread
 dtNavMesh* g_navmesh = nullptr;
 dtNavMeshQuery* g_navquery = nullptr;
@@ -109,7 +125,7 @@ bool NearestMain(const float p[3], const float ext[3], const dtQueryFilter& filt
 }
 
 void LoadBlocked() {
-  FILE* f = fopen(g_blocked_path.string().c_str(), "r");
+  FILE* f = Open(g_blocked_path, "r");
   if (!f) return;
   unsigned long long ref;
   int n = 0;
@@ -157,7 +173,7 @@ bool Load(const std::string& map) {
     RT_INFO("bot nav: no navigation mesh for %s (nav/%s.nav)", map.c_str(), map.c_str());
     return false;
   }
-  FILE* f = fopen(path.string().c_str(), "rb");
+  FILE* f = Open(path, "rb");
   if (!f) return false;
   char magic[4];
   int version = 0, size = 0, tiles = 0;
@@ -177,13 +193,13 @@ bool Load(const std::string& map) {
   }
   fclose(f);
   if (!ok) {
-    RT_WARN("bot nav: %s isn't a navigation mesh Detour can read", path.string().c_str());
+    RT_WARN("bot nav: %s isn't a navigation mesh Detour can read", Utf8(path).c_str());
     Unload();
     return false;
   }
   g_navquery = dtAllocNavMeshQuery();
   g_navquery->init(g_navmesh, 4096);
-  RT_INFO("bot nav: navigation mesh %s (%d bytes, %d tiles)", path.string().c_str(), size, tiles);
+  RT_INFO("bot nav: navigation mesh %s (%d bytes, %d tiles)", Utf8(path).c_str(), size, tiles);
   FindPieces();
   if (getenv("BF_BOT_NAV_KEEP_BLOCKS")) LoadBlocked();
   return true;
@@ -239,7 +255,7 @@ void Block(const float at[3]) {
   }
   std::error_code ec;
   std::filesystem::create_directories(g_blocked_path.parent_path(), ec);
-  if (FILE* f = fopen(g_blocked_path.string().c_str(), "a")) {
+  if (FILE* f = Open(g_blocked_path, "a")) {
     fprintf(f, "%llx\n", (unsigned long long)ref);
     fclose(f);
   }

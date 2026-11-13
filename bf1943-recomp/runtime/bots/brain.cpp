@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <new>
 #include <random>
 #include <string>
@@ -27,6 +28,18 @@
 using namespace botapi;
 
 namespace {
+
+// A file named in UTF-8 (World::nav_path): on Windows through its wide name,
+// for folder names outside the ANSI code page.
+FILE* OpenUtf8(const char* name, const char* mode) {
+#ifdef _WIN32
+  std::filesystem::path p(reinterpret_cast<const char8_t*>(name));
+  std::wstring wmode(mode, mode + std::strlen(mode));
+  return _wfopen(p.c_str(), wmode.c_str());
+#else
+  return fopen(name, mode);
+#endif
+}
 
 // ---- per-bot state (kept in BotIO::mem) ------------------------------------
 
@@ -157,7 +170,7 @@ struct Shore {
     path = p;
     exits.clear();
     sea = 1e9f;  // (another map)
-    if (FILE* f = fopen(p, "r")) {
+    if (FILE* f = OpenUtf8(p, "r")) {
       char line[160];
       while (fgets(line, sizeof(line), f)) {
         Exit e;
@@ -171,7 +184,7 @@ struct Shore {
     for (const Exit& x : exits)
       if (Dist2D(x.wet, e.wet) < 15.0f) return false;
     exits.push_back(e);
-    if (FILE* f = fopen(path.c_str(), "a")) {
+    if (FILE* f = OpenUtf8(path.c_str(), "a")) {
       fprintf(f, "exit %.1f %.1f %.1f %.1f %.1f %.1f\n", e.wet.x, e.wet.y, e.wet.z, e.up.x, e.up.y, e.up.z);
       fclose(f);
     }
